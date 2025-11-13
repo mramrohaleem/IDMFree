@@ -26,5 +26,6 @@ public interface INetworkClient
         long? to,
         Stream destination,
         IProgress<long>? progress = null,
-        CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken = default,
+        bool allowHtmlFallback = true);
 }
