@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS Downloads (
             var createChunks = @"
 CREATE TABLE IF NOT EXISTS Chunks (
     DownloadId TEXT NOT NULL,
-    Index INTEGER NOT NULL,
+    ChunkIndex INTEGER NOT NULL,
     StartByte INTEGER NOT NULL,
     EndByte INTEGER NOT NULL,
     DownloadedBytes INTEGER NOT NULL,
@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS Chunks (
     RetryCount INTEGER NOT NULL,
     LastErrorCode INTEGER NULL,
     LastErrorMessage TEXT NULL,
-    PRIMARY KEY (DownloadId, Index),
+    PRIMARY KEY (DownloadId, ChunkIndex),
     FOREIGN KEY (DownloadId) REFERENCES Downloads(Id) ON DELETE CASCADE
 );";
 
@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS Downloads (
                 cmd.CommandText = @"
 CREATE TABLE IF NOT EXISTS Chunks (
     DownloadId TEXT NOT NULL,
-    Index INTEGER NOT NULL,
+    ChunkIndex INTEGER NOT NULL,
     StartByte INTEGER NOT NULL,
     EndByte INTEGER NOT NULL,
     DownloadedBytes INTEGER NOT NULL,
@@ -134,7 +134,7 @@ CREATE TABLE IF NOT EXISTS Chunks (
     RetryCount INTEGER NOT NULL,
     LastErrorCode INTEGER NULL,
     LastErrorMessage TEXT NULL,
-    PRIMARY KEY (DownloadId, Index),
+    PRIMARY KEY (DownloadId, ChunkIndex),
     FOREIGN KEY (DownloadId) REFERENCES Downloads(Id) ON DELETE CASCADE
 );";
                 await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
@@ -233,7 +233,7 @@ ON CONFLICT(Id) DO UPDATE SET
                     insertChunk.Transaction = transaction;
                     insertChunk.CommandText = @"
 INSERT INTO Chunks (
-    DownloadId, Index, StartByte, EndByte,
+    DownloadId, ChunkIndex, StartByte, EndByte,
     DownloadedBytes, Status, RetryCount,
     LastErrorCode, LastErrorMessage
 ) VALUES (
@@ -336,7 +336,7 @@ INSERT INTO Chunks (
             // Load chunks
             using (var cmd = connection.CreateCommand())
             {
-                cmd.CommandText = "SELECT * FROM Chunks ORDER BY DownloadId, Index;";
+                cmd.CommandText = "SELECT * FROM Chunks ORDER BY DownloadId, ChunkIndex;";
                 using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
 
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
@@ -350,7 +350,7 @@ INSERT INTO Chunks (
 
                     var chunk = new Chunk
                     {
-                        Index = reader.GetInt32(reader.GetOrdinal("Index")),
+                        Index = reader.GetInt32(reader.GetOrdinal("ChunkIndex")),
                         StartByte = reader.GetInt64(reader.GetOrdinal("StartByte")),
                         EndByte = reader.GetInt64(reader.GetOrdinal("EndByte")),
                         DownloadedBytes = reader.GetInt64(reader.GetOrdinal("DownloadedBytes")),
