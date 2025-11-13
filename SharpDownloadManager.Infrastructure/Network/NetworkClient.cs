@@ -6,23 +6,41 @@ using System.Net.Http.Headers;
 using System.Threading;
 using System.Threading.Tasks;
 using SharpDownloadManager.Core.Abstractions;
+using SharpDownloadManager.Core.Domain;
+using SharpDownloadManager.Infrastructure.Logging;
 
 namespace SharpDownloadManager.Infrastructure.Network;
 
-public class NetworkClient : INetworkClient
+public sealed class NetworkClient : INetworkClient
 {
-    private static readonly HttpClient _httpClient;
     private readonly ILogger _logger;
+    private static readonly HttpClient _client = CreateClient();
 
-    static NetworkClient()
+    private static HttpClient CreateClient()
     {
-        _httpClient = new HttpClient(new HttpClientHandler
+        var handler = new HttpClientHandler
         {
-            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli
-        })
-        {
-            Timeout = TimeSpan.FromSeconds(100)
+            AllowAutoRedirect = true,
+            AutomaticDecompression = DecompressionMethods.GZip |
+                                     DecompressionMethods.Deflate |
+                                     DecompressionMethods.Brotli
         };
+
+        var client = new HttpClient(handler, disposeHandler: true)
+        {
+            Timeout = TimeSpan.FromMinutes(30)
+        };
+
+        // Browser-like defaults
+        client.DefaultRequestHeaders.UserAgent.ParseAdd(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+            "AppleWebKit/537.36 (KHTML, like Gecko) " +
+            "Chrome/120.0.0.0 Safari/537.36");
+
+        client.DefaultRequestHeaders.Accept.ParseAdd("*/*");
+        client.DefaultRequestHeaders.AcceptLanguage.ParseAdd("en-US,en;q=0.9");
+
+        return client;
     }
 
     public NetworkClient(ILogger logger)
@@ -30,94 +48,122 @@ public class NetworkClient : INetworkClient
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
-    public async Task<HttpResourceInfo> ProbeAsync(string url, CancellationToken cancellationToken = default)
+    public async Task<HttpResourceInfo> ProbeAsync(
+        string url,
+        CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(url))
         {
-            throw new ArgumentException("URL must be provided", nameof(url));
+            throw new ArgumentException("URL must not be empty.", nameof(url));
         }
 
-        _logger.Info("Starting probe", eventCode: "PROBE_START", context: new { Url = url });
+        var uri = new Uri(url);
+
+        _logger.Info(
+            "Starting probe",
+            eventCode: "PROBE_START",
+            context: new { Url = url });
+
+        HttpResponseMessage? response = null;
 
         try
         {
-            var uri = new Uri(url, UriKind.Absolute);
+            // Try HEAD first, fall back to GET when servers don't like HEAD.
+            response = await SendWithFallbackAsync(
+                    uri,
+                    HttpMethod.Head,
+                    cancellationToken)
+                .ConfigureAwait(false);
 
-            long? contentLength = null;
-            string? etag = null;
-            DateTimeOffset? lastModified = null;
-            bool isChunkedWithoutLength = false;
+            response.EnsureSuccessStatusCode();
 
-            var headRequest = new HttpRequestMessage(HttpMethod.Head, uri);
-            HttpResponseMessage? headResponse = null;
-            try
-            {
-                headResponse = await _httpClient.SendAsync(headRequest, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
-                    .ConfigureAwait(false);
-                if (headResponse.IsSuccessStatusCode)
-                {
-                    ExtractMetadata(headResponse, out contentLength, out etag, out lastModified, out isChunkedWithoutLength);
-                }
-                else if (headResponse.StatusCode == HttpStatusCode.MethodNotAllowed || headResponse.StatusCode == HttpStatusCode.NotImplemented)
-                {
-                    headResponse.Dispose();
-                    headResponse = null;
-                }
-                else
-                {
-                    headResponse.EnsureSuccessStatusCode();
-                }
-            }
-            catch (HttpRequestException)
-            {
-                headResponse?.Dispose();
-                headResponse = null;
-            }
-            finally
-            {
-                headRequest.Dispose();
-            }
+            var contentLength = response.Content.Headers.ContentLength;
 
-            if (headResponse is null)
-            {
-                using var getRequest = new HttpRequestMessage(HttpMethod.Get, uri);
-                using var getResponse = await _httpClient.SendAsync(getRequest, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
-                getResponse.EnsureSuccessStatusCode();
-                ExtractMetadata(getResponse, out contentLength, out etag, out lastModified, out isChunkedWithoutLength);
-            }
-            else
-            {
-                headResponse.Dispose();
-            }
+            var supportsRange =
+                response.Headers.AcceptRanges.Contains("bytes") ||
+                response.Content.Headers.ContentRange != null;
 
-            bool supportsRange = await CheckRangeSupportAsync(uri, cancellationToken).ConfigureAwait(false);
+            var isChunkedWithoutLength =
+                !contentLength.HasValue &&
+                response.Headers.TransferEncodingChunked == true;
 
-            var result = new HttpResourceInfo
+            var lastModified =
+                response.Content.Headers.LastModified ??
+                response.Headers.LastModified;
+
+            var info = new HttpResourceInfo
             {
                 Url = uri,
                 ContentLength = contentLength,
                 SupportsRange = supportsRange,
-                ETag = etag,
+                ETag = response.Headers.ETag?.Tag,
                 LastModified = lastModified,
                 IsChunkedWithoutLength = isChunkedWithoutLength
             };
 
-            _logger.Info("Probe completed", eventCode: "PROBE_SUCCESS", context: new
-            {
-                Url = uri.ToString(),
-                ContentLength = contentLength,
-                IsChunkedWithoutLength = isChunkedWithoutLength,
-                SupportsRange = supportsRange,
-                ETag = etag,
-                LastModified = lastModified
-            });
+            _logger.Info(
+                "Probe completed",
+                eventCode: "PROBE_SUCCESS",
+                context: new
+                {
+                    Url = url,
+                    info.ContentLength,
+                    info.IsChunkedWithoutLength,
+                    info.SupportsRange,
+                    info.ETag,
+                    info.LastModified
+                });
 
-            return result;
+            return info;
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode.HasValue)
+        {
+            var status = ex.StatusCode.Value;
+            string friendly = status switch
+            {
+                HttpStatusCode.Forbidden =>
+                    "Server returned 403 Forbidden. This usually means the link requires a browser session, login, or an extra confirmation step.",
+                HttpStatusCode.NotFound =>
+                    "Server returned 404 Not Found. The file link is invalid or has expired.",
+                HttpStatusCode.TooManyRequests =>
+                    "Server returned 429 Too Many Requests. You may need to wait or slow down your downloads.",
+                HttpStatusCode.InternalServerError =>
+                    "Server returned 500 Internal Server Error.",
+                _ =>
+                    $"Server returned HTTP {(int)status} ({status})."
+            };
+
+            _logger.Error(
+                "Probe failed with HTTP error",
+                eventCode: "PROBE_HTTP_ERROR",
+                exception: ex,
+                context: new { Url = url, Status = status });
+
+            throw new HttpRequestException(friendly, ex, status);
         }
         catch (HttpRequestException ex)
         {
-            _logger.Error("Probe failed with HTTP error", eventCode: "PROBE_HTTP_ERROR", exception: ex, context: new { Url = url });
+            _logger.Error(
+                "Probe failed with HTTP error",
+                eventCode: "PROBE_HTTP_ERROR",
+                exception: ex,
+                context: new { Url = url });
+
             throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.Error(
+                "Probe failed with unexpected error",
+                eventCode: "PROBE_ERROR",
+                exception: ex,
+                context: new { Url = url });
+
+            throw;
+        }
+        finally
+        {
+            response?.Dispose();
         }
     }
 
@@ -125,105 +171,156 @@ public class NetworkClient : INetworkClient
         Uri url,
         long? from,
         long? to,
-        Stream destination,
-        IProgress<long>? progress = null,
+        Stream target,
+        IProgress<long> progress,
         CancellationToken cancellationToken = default)
     {
-        if (url is null)
-        {
-            throw new ArgumentNullException(nameof(url));
-        }
+        if (url is null) throw new ArgumentNullException(nameof(url));
+        if (target is null) throw new ArgumentNullException(nameof(target));
 
-        if (destination is null)
-        {
-            throw new ArgumentNullException(nameof(destination));
-        }
+        var ctx = new { Url = url.ToString(), From = from, To = to };
 
-        if (from.HasValue && to.HasValue && from.Value > to.Value)
-        {
-            throw new ArgumentException("The 'from' value must be less than or equal to the 'to' value.");
-        }
+        _logger.Info(
+            "Starting range download",
+            eventCode: "DOWNLOAD_RANGE_START",
+            context: ctx);
 
-        _logger.Info("Starting range download", eventCode: "DOWNLOAD_RANGE_START", context: new { Url = url.ToString(), From = from, To = to });
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        ApplyCommonHeaders(request, url);
+
+        if (from.HasValue)
+        {
+            request.Headers.Range = to.HasValue
+                ? new RangeHeaderValue(from, to)
+                : new RangeHeaderValue(from, null);
+        }
 
         try
         {
-            using var request = new HttpRequestMessage(HttpMethod.Get, url);
-            if (from.HasValue || to.HasValue)
+            using var response = await _client
+                .SendAsync(
+                    request,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            response.EnsureSuccessStatusCode();
+
+            var mediaType = response.Content.Headers.ContentType?.MediaType;
+
+            // Guard: if server returns HTML instead of a file for a "file-looking" URL.
+            if (!from.HasValue &&
+                mediaType != null &&
+                mediaType.StartsWith("text/html", StringComparison.OrdinalIgnoreCase) &&
+                !url.AbsolutePath.EndsWith(".htm", StringComparison.OrdinalIgnoreCase) &&
+                !url.AbsolutePath.EndsWith(".html", StringComparison.OrdinalIgnoreCase))
             {
-                request.Headers.Range = new RangeHeaderValue(from, to);
+                var message =
+                    "Server returned an HTML page instead of the requested file. " +
+                    "This usually means the link requires login, a browser session, " +
+                    "or an extra confirmation step.";
+                throw new HttpRequestException(message);
             }
 
-            using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+            using var responseStream = await response.Content
+                .ReadAsStreamAsync(cancellationToken)
+                .ConfigureAwait(false);
 
-            if (!response.IsSuccessStatusCode)
+            var buffer = new byte[81_920];
+
+            while (true)
             {
-                _logger.Error("Range download HTTP error", eventCode: "DOWNLOAD_RANGE_HTTP_ERROR", context: new
+                var read = await responseStream
+                    .ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (read <= 0)
                 {
-                    Url = url.ToString(),
-                    StatusCode = (int)response.StatusCode,
-                    Reason = response.ReasonPhrase
-                });
-                var statusCode = (int)response.StatusCode;
-                var reason = response.ReasonPhrase ?? "Unknown";
-                throw new HttpRequestException($"Failed to download range. Status code: {statusCode} ({reason}).");
+                    break;
+                }
+
+                await target
+                    .WriteAsync(buffer.AsMemory(0, read), cancellationToken)
+                    .ConfigureAwait(false);
+
+                progress?.Report(read);
             }
 
-            await using var responseStream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-            var buffer = new byte[16 * 1024];
-            int bytesRead;
-            while ((bytesRead = await responseStream.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken).ConfigureAwait(false)) > 0)
-            {
-                await destination.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken).ConfigureAwait(false);
-                progress?.Report(bytesRead);
-            }
-
-            _logger.Info("Completed range download", eventCode: "DOWNLOAD_RANGE_SUCCESS", context: new { Url = url.ToString(), From = from, To = to });
+            _logger.Info(
+                "Completed range download",
+                eventCode: "DOWNLOAD_RANGE_SUCCESS",
+                context: ctx);
         }
         catch (HttpRequestException ex)
         {
-            _logger.Error("Range download failed with HTTP error", eventCode: "DOWNLOAD_RANGE_HTTP_EXCEPTION", exception: ex, context: new { Url = url.ToString(), From = from, To = to });
+            _logger.Error(
+                "Range download HTTP error",
+                eventCode: "DOWNLOAD_RANGE_HTTP_ERROR",
+                exception: ex,
+                context: ctx);
+
             throw;
         }
-        catch (OperationCanceledException ex)
+        catch (Exception ex)
         {
-            _logger.Error("Range download was canceled", eventCode: "DOWNLOAD_RANGE_CANCELED", exception: ex, context: new { Url = url.ToString(), From = from, To = to });
+            _logger.Error(
+                "Range download failed",
+                eventCode: "DOWNLOAD_RANGE_ERROR",
+                exception: ex,
+                context: ctx);
+
             throw;
         }
     }
 
-    private static void ExtractMetadata(
-        HttpResponseMessage response,
-        out long? contentLength,
-        out string? etag,
-        out DateTimeOffset? lastModified,
-        out bool isChunkedWithoutLength)
+    private static void ApplyCommonHeaders(HttpRequestMessage request, Uri uri)
     {
-        contentLength = response.Content.Headers.ContentLength;
-        etag = response.Headers.ETag?.ToString();
-        lastModified = response.Content.Headers.LastModified;
+        if (request is null) throw new ArgumentNullException(nameof(request));
 
-        isChunkedWithoutLength = response.Headers.TransferEncodingChunked == true && contentLength is null;
+        try
+        {
+            var origin = new Uri($"{uri.Scheme}://{uri.Host}/");
+            request.Headers.Referrer = origin;
+        }
+        catch
+        {
+            // ignore invalid referrer
+        }
     }
 
-    private static async Task<bool> CheckRangeSupportAsync(Uri uri, CancellationToken cancellationToken)
+    private static async Task<HttpResponseMessage> SendWithFallbackAsync(
+        Uri uri,
+        HttpMethod primaryMethod,
+        CancellationToken cancellationToken)
     {
-        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
-        request.Headers.Range = new RangeHeaderValue(0, 0);
+        using var request = new HttpRequestMessage(primaryMethod, uri);
+        ApplyCommonHeaders(request, uri);
 
-        using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        var response = await _client
+            .SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                cancellationToken)
+            .ConfigureAwait(false);
 
-        if (response.StatusCode == HttpStatusCode.PartialContent)
+        if (response.StatusCode == HttpStatusCode.MethodNotAllowed ||
+            response.StatusCode == HttpStatusCode.NotImplemented ||
+            response.StatusCode == HttpStatusCode.Forbidden)
         {
-            return true;
+            // Some servers reject HEAD but allow GET – retry with GET.
+            response.Dispose();
+
+            var getRequest = new HttpRequestMessage(HttpMethod.Get, uri);
+            ApplyCommonHeaders(getRequest, uri);
+
+            return await _client
+                .SendAsync(
+                    getRequest,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    cancellationToken)
+                .ConfigureAwait(false);
         }
 
-        if (response.StatusCode == HttpStatusCode.OK)
-        {
-            return false;
-        }
-
-        response.EnsureSuccessStatusCode();
-        return false;
+        return response;
     }
 }

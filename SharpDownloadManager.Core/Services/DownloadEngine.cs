@@ -478,9 +478,27 @@ public class DownloadEngine : IDownloadEngine
             await SaveStateAsync(task, cancellationToken, ignoreCancellation: true).ConfigureAwait(false);
             _logger.Info("Download canceled.", downloadId: task.Id, eventCode: "DOWNLOAD_RUN_CANCELED");
         }
+        catch (HttpRequestException httpEx)
+        {
+            var code = MapHttpErrorCode(httpEx.StatusCode);
+            task.MarkAsError(code, httpEx.Message);
+            await SaveStateAsync(task, CancellationToken.None, ignoreCancellation: true).ConfigureAwait(false);
+            _logger.Error(
+                "Download failed due to HTTP error.",
+                downloadId: task.Id,
+                eventCode: "DOWNLOAD_RUN_HTTP_ERROR",
+                exception: httpEx);
+        }
         catch (Exception ex)
         {
-            task.MarkAsError(DownloadErrorCode.Unknown, ex.Message);
+            var code = ex switch
+            {
+                UnauthorizedAccessException => DownloadErrorCode.DiskPermissionDenied,
+                IOException => DownloadErrorCode.DiskNoSpace,
+                _ => DownloadErrorCode.Unknown
+            };
+
+            task.MarkAsError(code, ex.Message);
             await SaveStateAsync(task, CancellationToken.None, ignoreCancellation: true).ConfigureAwait(false);
             _logger.Error("Download failed.", downloadId: task.Id, eventCode: "DOWNLOAD_RUN_ERROR", exception: ex);
         }
@@ -547,6 +565,33 @@ public class DownloadEngine : IDownloadEngine
     {
         var token = ignoreCancellation ? CancellationToken.None : cancellationToken;
         return _stateStore.SaveDownloadAsync(task, token);
+    }
+
+    private static DownloadErrorCode MapHttpErrorCode(HttpStatusCode? statusCode)
+    {
+        if (!statusCode.HasValue)
+        {
+            return DownloadErrorCode.NetUnreachable;
+        }
+
+        var codeValue = (int)statusCode.Value;
+
+        if (statusCode.Value == HttpStatusCode.RequestedRangeNotSatisfiable)
+        {
+            return DownloadErrorCode.RangeNotSupported;
+        }
+
+        if (codeValue >= 400 && codeValue < 500)
+        {
+            return DownloadErrorCode.Http4xx;
+        }
+
+        if (codeValue >= 500)
+        {
+            return DownloadErrorCode.Http5xx;
+        }
+
+        return DownloadErrorCode.ServerError;
     }
 
     private static int DetermineConnectionsCount(DownloadMode mode, HttpResourceInfo info)

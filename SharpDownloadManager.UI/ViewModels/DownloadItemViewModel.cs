@@ -15,6 +15,7 @@ public class DownloadItemViewModel : INotifyPropertyChanged
     private string _speedText = string.Empty;
     private string _etaText = string.Empty;
     private string _modeText = string.Empty;
+    private string _errorText = string.Empty;
 
     public DownloadItemViewModel()
     {
@@ -73,6 +74,12 @@ public class DownloadItemViewModel : INotifyPropertyChanged
         set => SetProperty(ref _modeText, value);
     }
 
+    public string ErrorText
+    {
+        get => _errorText;
+        set => SetProperty(ref _errorText, value);
+    }
+
     public event PropertyChangedEventHandler? PropertyChanged;
 
     public void UpdateFromTask(DownloadTask task)
@@ -84,7 +91,16 @@ public class DownloadItemViewModel : INotifyPropertyChanged
 
         Id = task.Id;
         Name = string.IsNullOrWhiteSpace(task.FileName) ? task.Url : task.FileName;
-        StatusText = task.Status.ToString();
+        if (task.Status == DownloadStatus.Error && task.LastErrorCode != DownloadErrorCode.None)
+        {
+            StatusText = $"{task.Status} ({task.LastErrorCode})";
+        }
+        else
+        {
+            StatusText = task.Status.ToString();
+        }
+
+        ErrorText = task.LastErrorMessage ?? string.Empty;
 
         double progress = 0d;
         if (task.ContentLength.HasValue && task.ContentLength.Value > 0)

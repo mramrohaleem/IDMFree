@@ -59,6 +59,7 @@
                     <DataGridTextColumn Header="Speed" Binding="{Binding SpeedText}" Width="*" />
                     <DataGridTextColumn Header="ETA" Binding="{Binding EtaText}" Width="*" />
                     <DataGridTextColumn Header="Mode" Binding="{Binding ModeText}" Width="*" />
+                    <DataGridTextColumn Header="Error" Binding="{Binding ErrorText}" Width="2*" />
                     <DataGridTemplateColumn Header="Actions" Width="2*">
                         <DataGridTemplateColumn.CellTemplate>
                             <DataTemplate>
