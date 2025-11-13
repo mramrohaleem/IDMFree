@@ -8,6 +8,7 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Windows;
 using System.Windows.Input;
 using System.Windows.Threading;
 using SharpDownloadManager.Core.Abstractions;
@@ -129,6 +130,12 @@ public class MainViewModel : INotifyPropertyChanged
         catch (Exception ex)
         {
             Debug.WriteLine(ex);
+
+            MessageBox.Show(
+                ex.Message,
+                "Failed to add download",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
         }
     }
 
@@ -147,6 +154,12 @@ public class MainViewModel : INotifyPropertyChanged
         catch (Exception ex)
         {
             Debug.WriteLine(ex);
+
+            MessageBox.Show(
+                ex.Message,
+                "Download operation failed",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
         }
     }
 
@@ -165,6 +178,12 @@ public class MainViewModel : INotifyPropertyChanged
         catch (Exception ex)
         {
             Debug.WriteLine(ex);
+
+            MessageBox.Show(
+                ex.Message,
+                "Download operation failed",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
         }
     }
 
@@ -194,6 +213,12 @@ public class MainViewModel : INotifyPropertyChanged
         catch (Exception ex)
         {
             Debug.WriteLine(ex);
+
+            MessageBox.Show(
+                ex.Message,
+                "Download operation failed",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
         }
     }
 
