@@ -9,13 +9,35 @@
         Width="1000">
     <DockPanel>
         <ToolBar DockPanel.Dock="Top">
-            <Button Content="New Download" Command="{Binding NewDownloadCommand}" Margin="2" />
-            <Button Content="Resume" Command="{Binding ResumeCommand}" Margin="2" />
-            <Button Content="Pause" Command="{Binding PauseCommand}" Margin="2" />
-            <Button Content="Delete" Command="{Binding DeleteCommand}" Margin="2" />
-            <Button Content="Open File" Command="{Binding OpenFileCommand}" Margin="2" />
-            <Button Content="Open Folder" Command="{Binding OpenFolderCommand}" Margin="2" />
-            <Button Content="Settings" Command="{Binding SettingsCommand}" Margin="2" />
+            <TextBlock Text="URL:" VerticalAlignment="Center" Margin="2" />
+            <TextBox Width="320"
+                     Margin="2"
+                     Text="{Binding NewDownloadUrl, UpdateSourceTrigger=PropertyChanged}" />
+            <Button Content="Add Download"
+                    Margin="2"
+                    Command="{Binding AddDownloadCommand}" />
+            <Separator />
+            <TextBlock Text="Save To:" VerticalAlignment="Center" Margin="2" />
+            <TextBox Width="260"
+                     Margin="2"
+                     IsReadOnly="True"
+                     Text="{Binding SaveFolderPath}" />
+            <Separator />
+            <Button Content="Pause"
+                    Margin="2"
+                    Command="{Binding PauseDownloadCommand}"
+                    CommandParameter="{Binding SelectedDownload}" />
+            <Button Content="Resume"
+                    Margin="2"
+                    Command="{Binding ResumeDownloadCommand}"
+                    CommandParameter="{Binding SelectedDownload}" />
+            <Button Content="Delete"
+                    Margin="2"
+                    Command="{Binding DeleteDownloadCommand}"
+                    CommandParameter="{Binding SelectedDownload}" />
+            <Button Content="Open File" Margin="2" IsEnabled="False" Command="{x:Null}" />
+            <Button Content="Open Folder" Margin="2" IsEnabled="False" Command="{x:Null}" />
+            <Button Content="Settings" Margin="2" IsEnabled="False" Command="{x:Null}" />
         </ToolBar>
         <Grid>
             <Grid.RowDefinitions>
@@ -27,7 +49,8 @@
                       ItemsSource="{Binding Downloads}"
                       Margin="8"
                       IsReadOnly="True"
-                      SelectionMode="Single">
+                      SelectionMode="Single"
+                      SelectedItem="{Binding SelectedDownload, Mode=TwoWay}">
                 <DataGrid.Columns>
                     <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="2*" />
                     <DataGridTextColumn Header="Status" Binding="{Binding StatusText}" Width="*" />
@@ -36,6 +59,26 @@
                     <DataGridTextColumn Header="Speed" Binding="{Binding SpeedText}" Width="*" />
                     <DataGridTextColumn Header="ETA" Binding="{Binding EtaText}" Width="*" />
                     <DataGridTextColumn Header="Mode" Binding="{Binding ModeText}" Width="*" />
+                    <DataGridTemplateColumn Header="Actions" Width="2*">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                                    <Button Content="Pause"
+                                            Margin="2"
+                                            Command="{Binding DataContext.PauseDownloadCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                            CommandParameter="{Binding}" />
+                                    <Button Content="Resume"
+                                            Margin="2"
+                                            Command="{Binding DataContext.ResumeDownloadCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                            CommandParameter="{Binding}" />
+                                    <Button Content="Delete"
+                                            Margin="2"
+                                            Command="{Binding DataContext.DeleteDownloadCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                            CommandParameter="{Binding}" />
+                                </StackPanel>
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
                 </DataGrid.Columns>
             </DataGrid>
             <TabControl Grid.Row="1" Margin="8">
