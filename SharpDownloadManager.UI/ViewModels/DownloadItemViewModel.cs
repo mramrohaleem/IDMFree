@@ -7,6 +7,7 @@ namespace SharpDownloadManager.UI.ViewModels;
 
 public class DownloadItemViewModel : INotifyPropertyChanged
 {
+    private Guid _id;
     private string _name = string.Empty;
     private string _statusText = string.Empty;
     private double _progress;
@@ -22,6 +23,12 @@ public class DownloadItemViewModel : INotifyPropertyChanged
     public DownloadItemViewModel(DownloadTask task)
     {
         UpdateFromTask(task);
+    }
+
+    public Guid Id
+    {
+        get => _id;
+        set => SetProperty(ref _id, value);
     }
 
     public string Name
@@ -75,6 +82,7 @@ public class DownloadItemViewModel : INotifyPropertyChanged
             throw new ArgumentNullException(nameof(task));
         }
 
+        Id = task.Id;
         Name = string.IsNullOrWhiteSpace(task.FileName) ? task.Url : task.FileName;
         StatusText = task.Status.ToString();
 

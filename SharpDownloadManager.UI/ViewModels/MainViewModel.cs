@@ -1,63 +1,382 @@
+using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Input;
+using System.Windows.Threading;
+using SharpDownloadManager.Core.Abstractions;
+using SharpDownloadManager.Core.Domain;
 
 namespace SharpDownloadManager.UI.ViewModels;
 
-public class MainViewModel
+public class MainViewModel : INotifyPropertyChanged
 {
-    public ObservableCollection<DownloadItemViewModel> Downloads { get; } = new();
+    private readonly IDownloadEngine _engine;
+    private readonly DispatcherTimer _refreshTimer;
+    private readonly AsyncCommand _addDownloadCommand;
+    private readonly AsyncCommand<DownloadItemViewModel> _pauseDownloadCommand;
+    private readonly AsyncCommand<DownloadItemViewModel> _resumeDownloadCommand;
+    private readonly AsyncCommand<DownloadItemViewModel> _deleteDownloadCommand;
+    private string _newDownloadUrl = string.Empty;
+    private string _saveFolderPath = string.Empty;
+    private DownloadItemViewModel? _selectedDownload;
 
-    public ICommand NewDownloadCommand { get; }
-    public ICommand ResumeCommand { get; }
-    public ICommand PauseCommand { get; }
-    public ICommand DeleteCommand { get; }
-    public ICommand OpenFileCommand { get; }
-    public ICommand OpenFolderCommand { get; }
-    public ICommand SettingsCommand { get; }
+    public ObservableCollection<DownloadItemViewModel> Downloads { get; }
+
+    public string NewDownloadUrl
+    {
+        get => _newDownloadUrl;
+        set
+        {
+            if (SetProperty(ref _newDownloadUrl, value))
+            {
+                _addDownloadCommand.RaiseCanExecuteChanged();
+            }
+        }
+    }
+
+    public string SaveFolderPath
+    {
+        get => _saveFolderPath;
+        set => SetProperty(ref _saveFolderPath, value);
+    }
+
+    public DownloadItemViewModel? SelectedDownload
+    {
+        get => _selectedDownload;
+        set
+        {
+            if (SetProperty(ref _selectedDownload, value))
+            {
+                _pauseDownloadCommand.RaiseCanExecuteChanged();
+                _resumeDownloadCommand.RaiseCanExecuteChanged();
+                _deleteDownloadCommand.RaiseCanExecuteChanged();
+            }
+        }
+    }
+
+    public ICommand AddDownloadCommand => _addDownloadCommand;
+
+    public ICommand PauseDownloadCommand => _pauseDownloadCommand;
+
+    public ICommand ResumeDownloadCommand => _resumeDownloadCommand;
+
+    public ICommand DeleteDownloadCommand => _deleteDownloadCommand;
+
+    public event PropertyChangedEventHandler? PropertyChanged;
 
     public MainViewModel()
+        : this(new DesignTimeDownloadEngine())
     {
-        NewDownloadCommand = new RelayCommand(OnNewDownload);
-        ResumeCommand = new RelayCommand(OnResume);
-        PauseCommand = new RelayCommand(OnPause);
-        DeleteCommand = new RelayCommand(OnDelete);
-        OpenFileCommand = new RelayCommand(OnOpenFile);
-        OpenFolderCommand = new RelayCommand(OnOpenFolder);
-        SettingsCommand = new RelayCommand(OnSettings);
     }
 
-    private void OnNewDownload()
+    public MainViewModel(IDownloadEngine engine)
     {
-        // TODO: Implement new download workflow.
+        _engine = engine ?? throw new ArgumentNullException(nameof(engine));
+        Downloads = new ObservableCollection<DownloadItemViewModel>();
+
+        var downloadsFolder = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            "Downloads");
+        SaveFolderPath = downloadsFolder;
+
+        _addDownloadCommand = new AsyncCommand(AddDownloadAsync, () => !string.IsNullOrWhiteSpace(NewDownloadUrl));
+        _pauseDownloadCommand = new AsyncCommand<DownloadItemViewModel>(PauseDownloadAsync, CanOperateOnItem);
+        _resumeDownloadCommand = new AsyncCommand<DownloadItemViewModel>(ResumeDownloadAsync, CanOperateOnItem);
+        _deleteDownloadCommand = new AsyncCommand<DownloadItemViewModel>(DeleteDownloadAsync, CanOperateOnItem);
+
+        _refreshTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(500)
+        };
+        _refreshTimer.Tick += async (_, _) => await RefreshFromEngineAsync();
+        _refreshTimer.Start();
+
+        _ = RefreshFromEngineAsync();
     }
 
-    private void OnResume()
+    private bool CanOperateOnItem(DownloadItemViewModel? item) => (item ?? SelectedDownload) is not null;
+
+    private async Task AddDownloadAsync()
     {
-        // TODO: Implement resume functionality.
+        var url = NewDownloadUrl;
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return;
+        }
+
+        try
+        {
+            var task = await _engine.EnqueueDownloadAsync(url, null, SaveFolderPath);
+            var existing = Downloads.FirstOrDefault(d => d.Id == task.Id);
+            if (existing is null)
+            {
+                Downloads.Add(new DownloadItemViewModel(task));
+            }
+            else
+            {
+                existing.UpdateFromTask(task);
+            }
+
+            NewDownloadUrl = string.Empty;
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine(ex);
+        }
     }
 
-    private void OnPause()
+    private async Task PauseDownloadAsync(DownloadItemViewModel? item)
     {
-        // TODO: Implement pause functionality.
+        var target = item ?? SelectedDownload;
+        if (target is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await _engine.PauseAsync(target.Id);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine(ex);
+        }
     }
 
-    private void OnDelete()
+    private async Task ResumeDownloadAsync(DownloadItemViewModel? item)
     {
-        // TODO: Implement delete functionality.
+        var target = item ?? SelectedDownload;
+        if (target is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await _engine.ResumeAsync(target.Id);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine(ex);
+        }
     }
 
-    private void OnOpenFile()
+    private async Task DeleteDownloadAsync(DownloadItemViewModel? item)
     {
-        // TODO: Implement open file functionality.
+        var target = item ?? SelectedDownload;
+        if (target is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await _engine.DeleteAsync(target.Id);
+
+            var existing = Downloads.FirstOrDefault(d => d.Id == target.Id);
+            if (existing is not null)
+            {
+                if (ReferenceEquals(existing, SelectedDownload))
+                {
+                    SelectedDownload = null;
+                }
+
+                Downloads.Remove(existing);
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine(ex);
+        }
     }
 
-    private void OnOpenFolder()
+    private async Task RefreshFromEngineAsync()
     {
-        // TODO: Implement open folder functionality.
+        try
+        {
+            var snapshot = await _engine.GetAllDownloadsSnapshotAsync();
+
+            foreach (var task in snapshot)
+            {
+                var existing = Downloads.FirstOrDefault(d => d.Id == task.Id);
+                if (existing is null)
+                {
+                    Downloads.Add(new DownloadItemViewModel(task));
+                }
+                else
+                {
+                    existing.UpdateFromTask(task);
+                }
+            }
+
+            var ids = new HashSet<Guid>(snapshot.Select(t => t.Id));
+            for (int i = Downloads.Count - 1; i >= 0; i--)
+            {
+                if (!ids.Contains(Downloads[i].Id))
+                {
+                    if (ReferenceEquals(Downloads[i], SelectedDownload))
+                    {
+                        SelectedDownload = null;
+                    }
+
+                    Downloads.RemoveAt(i);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine(ex);
+        }
     }
 
-    private void OnSettings()
+    protected bool SetProperty<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
     {
-        // TODO: Implement settings workflow.
+        if (EqualityComparer<T>.Default.Equals(field, value))
+        {
+            return false;
+        }
+
+        field = value;
+        OnPropertyChanged(propertyName);
+        return true;
+    }
+
+    protected virtual void OnPropertyChanged(string? propertyName) =>
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+
+    private sealed class AsyncCommand : ICommand
+    {
+        private readonly Func<Task> _execute;
+        private readonly Func<bool>? _canExecute;
+
+        public AsyncCommand(Func<Task> execute, Func<bool>? canExecute = null)
+        {
+            _execute = execute ?? throw new ArgumentNullException(nameof(execute));
+            _canExecute = canExecute;
+        }
+
+        public event EventHandler? CanExecuteChanged;
+
+        public bool CanExecute(object? parameter) => _canExecute?.Invoke() ?? true;
+
+        public async void Execute(object? parameter)
+        {
+            await _execute();
+        }
+
+        public void RaiseCanExecuteChanged() => CanExecuteChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private sealed class AsyncCommand<T> : ICommand
+    {
+        private readonly Func<T?, Task> _execute;
+        private readonly Func<T?, bool>? _canExecute;
+
+        public AsyncCommand(Func<T?, Task> execute, Func<T?, bool>? canExecute = null)
+        {
+            _execute = execute ?? throw new ArgumentNullException(nameof(execute));
+            _canExecute = canExecute;
+        }
+
+        public event EventHandler? CanExecuteChanged;
+
+        public bool CanExecute(object? parameter) => _canExecute?.Invoke(ConvertParameter(parameter)) ?? true;
+
+        public async void Execute(object? parameter)
+        {
+            await _execute(ConvertParameter(parameter));
+        }
+
+        public void RaiseCanExecuteChanged() => CanExecuteChanged?.Invoke(this, EventArgs.Empty);
+
+        private static T? ConvertParameter(object? parameter)
+        {
+            if (parameter is null)
+            {
+                return default;
+            }
+
+            if (parameter is T value)
+            {
+                return value;
+            }
+
+            return default;
+        }
+    }
+
+    private sealed class DesignTimeDownloadEngine : IDownloadEngine
+    {
+        private readonly List<DownloadTask> _tasks = new()
+        {
+            new DownloadTask
+            {
+                Id = Guid.NewGuid(),
+                Url = "https://example.com/sample1.bin",
+                FileName = "sample1.bin",
+                Mode = DownloadMode.Normal,
+                Status = DownloadStatus.Downloading,
+                ContentLength = 1_000_000,
+                TotalDownloadedBytes = 250_000
+            },
+            new DownloadTask
+            {
+                Id = Guid.NewGuid(),
+                Url = "https://example.com/sample2.bin",
+                FileName = "sample2.bin",
+                Mode = DownloadMode.SafeMode,
+                Status = DownloadStatus.Paused,
+                ContentLength = 500_000,
+                TotalDownloadedBytes = 100_000
+            }
+        };
+
+        public Task InitializeAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        public Task<IReadOnlyList<DownloadTask>> GetAllDownloadsSnapshotAsync(CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlyList<DownloadTask>>(_tasks);
+
+        public Task<DownloadTask> EnqueueDownloadAsync(
+            string url,
+            string? suggestedFileName,
+            string saveFolderPath,
+            DownloadMode mode = DownloadMode.Normal,
+            CancellationToken cancellationToken = default)
+        {
+            var resolvedFileName = string.IsNullOrWhiteSpace(suggestedFileName)
+                ? "download.bin"
+                : suggestedFileName;
+
+            var task = new DownloadTask
+            {
+                Id = Guid.NewGuid(),
+                Url = url,
+                FileName = resolvedFileName,
+                SavePath = Path.Combine(saveFolderPath, resolvedFileName),
+                Mode = mode,
+                Status = DownloadStatus.Queued,
+                ContentLength = 1_000_000,
+                TotalDownloadedBytes = 0
+            };
+            _tasks.Add(task);
+            return Task.FromResult(task);
+        }
+
+        public Task ResumeAsync(Guid downloadId, CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        public Task PauseAsync(Guid downloadId, CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        public Task DeleteAsync(Guid downloadId, CancellationToken cancellationToken = default)
+        {
+            _tasks.RemoveAll(t => t.Id == downloadId);
+            return Task.CompletedTask;
+        }
     }
 }
