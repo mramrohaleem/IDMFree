@@ -1,9 +1,11 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using SharpDownloadManager.Core.Abstractions;
@@ -172,7 +174,8 @@ public sealed class NetworkClient : INetworkClient
         long? to,
         Stream target,
         IProgress<long>? progress = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool allowHtmlFallback = true)
     {
         if (url is null) throw new ArgumentNullException(nameof(url));
         if (target is null) throw new ArgumentNullException(nameof(target));
@@ -216,23 +219,56 @@ public sealed class NetworkClient : INetworkClient
                 .ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)
                 .ConfigureAwait(false);
 
-            if (!from.HasValue &&
+            var isHtmlResponse =
                 mediaType is not null &&
                 mediaType.StartsWith("text/html", StringComparison.OrdinalIgnoreCase) &&
                 !url.AbsolutePath.EndsWith(".htm", StringComparison.OrdinalIgnoreCase) &&
-                !url.AbsolutePath.EndsWith(".html", StringComparison.OrdinalIgnoreCase) &&
-                firstRead > 0)
+                !url.AbsolutePath.EndsWith(".html", StringComparison.OrdinalIgnoreCase);
+
+            if (firstRead > 0 && isHtmlResponse)
             {
-                var snippetLength = Math.Min(firstRead, 1024);
+                var snippetLength = Math.Min(firstRead, 4096);
                 var snippet = Encoding.UTF8.GetString(buffer, 0, snippetLength);
+
+                var isFullDownload = !from.HasValue && !to.HasValue;
+
+                if (allowHtmlFallback && isFullDownload &&
+                    TryExtractDownloadUrlFromHtml(snippet, url, out var fallbackUrl) &&
+                    fallbackUrl is not null)
+                {
+                    _logger.Info(
+                        "HTML fallback extracted a file URL from page.",
+                        eventCode: "DOWNLOAD_HTML_FALLBACK",
+                        context: new
+                        {
+                            OriginalUrl = url.ToString(),
+                            FallbackUrl = fallbackUrl.ToString()
+                        });
+
+                    responseStream.Dispose();
+                    response.Dispose();
+
+                    await DownloadRangeToStreamAsync(
+                            fallbackUrl,
+                            null,
+                            null,
+                            target,
+                            progress,
+                            cancellationToken,
+                            allowHtmlFallback: false)
+                        .ConfigureAwait(false);
+
+                    return;
+                }
+
+                var safeSnippet = snippet.Length > 1000 ? snippet[..1000] : snippet;
 
                 var message =
                     "Server returned an HTML page instead of the requested file. " +
                     "This usually means the link requires login, a browser session, " +
-                    "or an extra confirmation step." +
-                    Environment.NewLine +
+                    "or an extra confirmation step." + Environment.NewLine +
                     "HTML snippet:" + Environment.NewLine +
-                    snippet;
+                    safeSnippet;
 
                 var ex = new HttpRequestException(message);
                 ex.Data["CustomErrorCode"] = DownloadErrorCode.HtmlResponse;
@@ -299,13 +335,258 @@ public sealed class NetworkClient : INetworkClient
 
         try
         {
-            var origin = new Uri($"{uri.Scheme}://{uri.Host}/");
-            request.Headers.Referrer = origin;
+            if (uri.Host.EndsWith("gofile.io", StringComparison.OrdinalIgnoreCase) &&
+                !uri.Host.Equals("gofile.io", StringComparison.OrdinalIgnoreCase))
+            {
+                // Some hosts (e.g. store-eu-par-*.gofile.io) expect the main gofile.io referrer.
+                request.Headers.Referrer = new Uri("https://gofile.io/");
+            }
+            else
+            {
+                var origin = new Uri($"{uri.Scheme}://{uri.Host}/");
+                request.Headers.Referrer = origin;
+            }
         }
         catch
         {
             // ignore invalid referrer
         }
+    }
+
+    private static readonly Regex MetaRefreshRegex = new(
+        @"<meta\s+[^>]*http-equiv\s*=\s*['\"]?refresh['\"]?[^>]*content\s*=\s*(?<quote>['\"])(?<content>.*?)\k<quote>[^>]*>",
+        RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
+
+    private static readonly Regex AnchorRegex = new(
+        @"<a\s+[^>]*href\s*=\s*(?<quote>['\"])(?<url>[^'\"]+)\k<quote>[^>]*>(?<text>.*?)</a>",
+        RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
+
+    private static readonly string[] AnchorKeywords =
+    {
+        "download",
+        "click here",
+        "direct link",
+        "get file"
+    };
+
+    private static readonly HashSet<string> LikelyFileExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".zip",
+        ".rar",
+        ".7z",
+        ".tar",
+        ".gz",
+        ".tgz",
+        ".iso",
+        ".exe",
+        ".msi",
+        ".mp4",
+        ".mkv",
+        ".avi",
+        ".mov",
+        ".mp3",
+        ".flac",
+        ".wav",
+        ".pdf",
+        ".epub"
+    };
+
+    private static bool TryExtractDownloadUrlFromHtml(
+        string htmlSnippet,
+        Uri originalUrl,
+        out Uri? downloadUrl)
+    {
+        downloadUrl = null;
+
+        if (string.IsNullOrWhiteSpace(htmlSnippet))
+        {
+            return false;
+        }
+
+        if (TryExtractFromMetaRefresh(htmlSnippet, originalUrl, out downloadUrl))
+        {
+            return true;
+        }
+
+        if (TryExtractFromAnchors(htmlSnippet, originalUrl, out downloadUrl))
+        {
+            return true;
+        }
+
+        downloadUrl = null;
+        return false;
+    }
+
+    private static bool TryExtractFromMetaRefresh(string htmlSnippet, Uri originalUrl, out Uri? downloadUrl)
+    {
+        downloadUrl = null;
+
+        foreach (Match match in MetaRefreshRegex.Matches(htmlSnippet))
+        {
+            var contentValue = match.Groups["content"].Value;
+            if (string.IsNullOrWhiteSpace(contentValue))
+            {
+                continue;
+            }
+
+            var urlIndex = contentValue.IndexOf("url", StringComparison.OrdinalIgnoreCase);
+            if (urlIndex < 0)
+            {
+                continue;
+            }
+
+            var equalsIndex = contentValue.IndexOf('=', urlIndex);
+            if (equalsIndex < 0 || equalsIndex + 1 >= contentValue.Length)
+            {
+                continue;
+            }
+
+            var candidateString = contentValue[(equalsIndex + 1)..].Trim();
+            candidateString = candidateString.Trim('\'', '"');
+
+            if (!TryBuildCandidateUrl(candidateString, originalUrl, out var candidate))
+            {
+                continue;
+            }
+
+            if (candidate is not null &&
+                !IsSameResource(candidate, originalUrl) &&
+                IsCandidateLikelyFile(candidate, originalUrl))
+            {
+                downloadUrl = candidate;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryExtractFromAnchors(string htmlSnippet, Uri originalUrl, out Uri? downloadUrl)
+    {
+        downloadUrl = null;
+
+        foreach (Match match in AnchorRegex.Matches(htmlSnippet))
+        {
+            var href = match.Groups["url"].Value;
+            if (!TryBuildCandidateUrl(href, originalUrl, out var candidate) || candidate is null)
+            {
+                continue;
+            }
+
+            var anchorText = match.Groups["text"].Value;
+            var anchorTag = match.Value;
+
+            var isLikelyDownload = anchorTag.IndexOf("download", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (!isLikelyDownload)
+            {
+                foreach (var keyword in AnchorKeywords)
+                {
+                    if (anchorText.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        isLikelyDownload = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!isLikelyDownload)
+            {
+                continue;
+            }
+
+            if (IsSameResource(candidate, originalUrl))
+            {
+                continue;
+            }
+
+            if (!IsCandidateLikelyFile(candidate, originalUrl))
+            {
+                continue;
+            }
+
+            downloadUrl = candidate;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsSameResource(Uri candidate, Uri original)
+    {
+        return Uri.Compare(
+                   candidate,
+                   original,
+                   UriComponents.HttpRequestUrl,
+                   UriFormat.Unescaped,
+                   StringComparison.OrdinalIgnoreCase) == 0;
+    }
+
+    private static bool TryBuildCandidateUrl(string href, Uri originalUrl, out Uri? candidateUrl)
+    {
+        candidateUrl = null;
+
+        if (string.IsNullOrWhiteSpace(href))
+        {
+            return false;
+        }
+
+        href = href.Trim();
+
+        if (href.Length == 0 ||
+            href.StartsWith("#", StringComparison.Ordinal) ||
+            href.StartsWith("javascript:", StringComparison.OrdinalIgnoreCase) ||
+            href.StartsWith("mailto:", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (Uri.TryCreate(href, UriKind.Absolute, out var absolute))
+        {
+            candidateUrl = absolute;
+            return true;
+        }
+
+        if (Uri.TryCreate(originalUrl, href, out var relative))
+        {
+            candidateUrl = relative;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsCandidateLikelyFile(Uri candidate, Uri originalUrl)
+    {
+        if (candidate is null)
+        {
+            return false;
+        }
+
+        if (!(string.Equals(candidate.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) ||
+              string.Equals(candidate.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        var extension = Path.GetExtension(candidate.AbsolutePath);
+        if (string.IsNullOrEmpty(extension) || !LikelyFileExtensions.Contains(extension))
+        {
+            return false;
+        }
+
+        if (candidate.Host.Equals(originalUrl.Host, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (candidate.Host.EndsWith("." + originalUrl.Host, StringComparison.OrdinalIgnoreCase) ||
+            originalUrl.Host.EndsWith("." + candidate.Host, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return false;
     }
 
     private static async Task<HttpResponseMessage> SendWithFallbackAsync(
