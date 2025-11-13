@@ -84,12 +84,36 @@
             </DataGrid>
             <TabControl Grid.Row="1" Margin="8">
                 <TabItem Header="Overview">
-                    <TextBlock Text="Overview details will appear here." Margin="8" />
+                    <Grid Margin="8">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                        </Grid.RowDefinitions>
+
+                        <StackPanel Grid.Row="0" Margin="0,0,0,8">
+                            <TextBlock Text="Selected download" FontWeight="Bold" Margin="0,0,0,4" />
+
+                            <TextBlock Text="{Binding SelectedDownload.Name}" />
+                            <TextBlock Text="{Binding SelectedDownload.StatusText}" />
+                            <TextBlock Text="{Binding SelectedDownload.SizeText}" />
+                            <TextBlock Text="{Binding SelectedDownload.SpeedText}" />
+                            <TextBlock Text="{Binding SelectedDownload.EtaText}" />
+                            <TextBlock Text="{Binding SelectedDownload.ModeText}" />
+                        </StackPanel>
+
+                        <GroupBox Grid.Row="1" Header="Last error" Margin="0">
+                            <TextBox Text="{Binding SelectedDownload.ErrorText}"
+                                     TextWrapping="Wrap"
+                                     AcceptsReturn="True"
+                                     IsReadOnly="True"
+                                     VerticalScrollBarVisibility="Auto" />
+                        </GroupBox>
+                    </Grid>
                 </TabItem>
                 <TabItem Header="Connections">
-                    <TextBlock Text="Connection information will appear here." Margin="8" />
+                    <TextBlock Text="Per-connection details will appear here." Margin="8" />
                 </TabItem>
-                <TabItem Header="Log">
+                <TabItem Header="Logs">
                     <TextBlock Text="Log output will appear here." Margin="8" />
                 </TabItem>
             </TabControl>

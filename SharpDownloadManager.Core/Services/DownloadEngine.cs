@@ -480,14 +480,31 @@ public class DownloadEngine : IDownloadEngine
         }
         catch (HttpRequestException httpEx)
         {
-            var code = MapHttpErrorCode(httpEx.StatusCode);
+            DownloadErrorCode code;
+
+            if (httpEx.Data.Contains("CustomErrorCode") &&
+                httpEx.Data["CustomErrorCode"] is DownloadErrorCode customCode)
+            {
+                code = customCode;
+            }
+            else
+            {
+                code = MapHttpErrorCode(httpEx.StatusCode);
+            }
+
             task.MarkAsError(code, httpEx.Message);
             await SaveStateAsync(task, CancellationToken.None, ignoreCancellation: true).ConfigureAwait(false);
             _logger.Error(
                 "Download failed due to HTTP error.",
                 downloadId: task.Id,
                 eventCode: "DOWNLOAD_RUN_HTTP_ERROR",
-                exception: httpEx);
+                exception: httpEx,
+                context: new
+                {
+                    Url = task.Url,
+                    StatusCode = (int?)httpEx.StatusCode,
+                    ErrorCode = code.ToString()
+                });
         }
         catch (Exception ex)
         {
@@ -500,7 +517,16 @@ public class DownloadEngine : IDownloadEngine
 
             task.MarkAsError(code, ex.Message);
             await SaveStateAsync(task, CancellationToken.None, ignoreCancellation: true).ConfigureAwait(false);
-            _logger.Error("Download failed.", downloadId: task.Id, eventCode: "DOWNLOAD_RUN_ERROR", exception: ex);
+            _logger.Error(
+                "Download failed.",
+                downloadId: task.Id,
+                eventCode: "DOWNLOAD_RUN_ERROR",
+                exception: ex,
+                context: new
+                {
+                    Url = task.Url,
+                    ErrorCode = code.ToString()
+                });
         }
         finally
         {

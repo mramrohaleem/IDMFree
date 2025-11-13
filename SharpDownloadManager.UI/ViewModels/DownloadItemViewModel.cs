@@ -16,6 +16,8 @@ public class DownloadItemViewModel : INotifyPropertyChanged
     private string _etaText = string.Empty;
     private string _modeText = string.Empty;
     private string _errorText = string.Empty;
+    private long _lastBytes;
+    private DateTime _lastUpdateTimeUtc;
 
     public DownloadItemViewModel()
     {
@@ -89,6 +91,8 @@ public class DownloadItemViewModel : INotifyPropertyChanged
             throw new ArgumentNullException(nameof(task));
         }
 
+        var isSameTask = _id == task.Id;
+
         Id = task.Id;
         Name = string.IsNullOrWhiteSpace(task.FileName) ? task.Url : task.FileName;
         if (task.Status == DownloadStatus.Error && task.LastErrorCode != DownloadErrorCode.None)
@@ -110,9 +114,110 @@ public class DownloadItemViewModel : INotifyPropertyChanged
 
         Progress = progress;
         SizeText = $"{task.TotalDownloadedBytes} / {task.ContentLength?.ToString() ?? "Unknown"}";
-        SpeedText = string.Empty;
-        EtaText = string.Empty;
+        var nowUtc = DateTime.UtcNow;
+        var totalBytes = task.TotalDownloadedBytes;
+
+        if (!isSameTask)
+        {
+            _lastUpdateTimeUtc = default;
+            _lastBytes = 0;
+        }
+
+        if (_lastUpdateTimeUtc == default)
+        {
+            _lastUpdateTimeUtc = nowUtc;
+            _lastBytes = totalBytes;
+            SpeedText = string.Empty;
+            EtaText = string.Empty;
+        }
+        else
+        {
+            var deltaBytes = totalBytes - _lastBytes;
+            var deltaSeconds = (nowUtc - _lastUpdateTimeUtc).TotalSeconds;
+
+            if (deltaSeconds > 0.5 && deltaBytes >= 0)
+            {
+                var bytesPerSecond = deltaBytes / deltaSeconds;
+                SpeedText = FormatSpeed(bytesPerSecond);
+
+                if (task.ContentLength.HasValue &&
+                    task.ContentLength.Value > 0 &&
+                    bytesPerSecond > 0 &&
+                    task.Status == DownloadStatus.Downloading)
+                {
+                    var remaining = task.ContentLength.Value - totalBytes;
+                    if (remaining > 0)
+                    {
+                        var eta = TimeSpan.FromSeconds(remaining / bytesPerSecond);
+                        EtaText = FormatEta(eta);
+                    }
+                    else
+                    {
+                        EtaText = string.Empty;
+                    }
+                }
+                else
+                {
+                    EtaText = string.Empty;
+                }
+
+                _lastUpdateTimeUtc = nowUtc;
+                _lastBytes = totalBytes;
+            }
+        }
+
+        if (task.Status == DownloadStatus.Completed)
+        {
+            SpeedText = string.Empty;
+            EtaText = string.Empty;
+        }
+        else if (task.Status == DownloadStatus.Error)
+        {
+            SpeedText = string.Empty;
+            EtaText = string.Empty;
+        }
+
         ModeText = task.Mode.ToString();
+    }
+
+    private static string FormatSpeed(double bytesPerSecond)
+    {
+        if (bytesPerSecond <= 0)
+        {
+            return string.Empty;
+        }
+
+        string[] units = { "B/s", "KB/s", "MB/s", "GB/s" };
+        double value = bytesPerSecond;
+        int unitIndex = 0;
+
+        while (value >= 1024 && unitIndex < units.Length - 1)
+        {
+            value /= 1024;
+            unitIndex++;
+        }
+
+        return $"{value:0.0} {units[unitIndex]}";
+    }
+
+    private static string FormatEta(TimeSpan eta)
+    {
+        if (eta.TotalSeconds <= 0 || double.IsInfinity(eta.TotalSeconds) || double.IsNaN(eta.TotalSeconds))
+        {
+            return string.Empty;
+        }
+
+        if (eta.TotalHours >= 1)
+        {
+            return $"{(int)eta.TotalHours}h {eta.Minutes}m";
+        }
+
+        if (eta.TotalMinutes >= 1)
+        {
+            return $"{(int)eta.TotalMinutes}m {eta.Seconds}s";
+        }
+
+        return $"{eta.Seconds}s";
     }
 
     protected bool SetProperty<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)

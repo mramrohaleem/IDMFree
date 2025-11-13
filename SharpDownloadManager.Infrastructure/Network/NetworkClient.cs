@@ -3,6 +3,7 @@ using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using SharpDownloadManager.Core.Abstractions;
@@ -76,28 +77,28 @@ public sealed class NetworkClient : INetworkClient
                 .ConfigureAwait(false);
 
             response.EnsureSuccessStatusCode();
-var contentLength = response.Content.Headers.ContentLength;
+            var contentLength = response.Content.Headers.ContentLength;
 
-var supportsRange =
-    response.Headers.AcceptRanges.Contains("bytes") ||
-    response.Content.Headers.ContentRange != null;
+            var supportsRange =
+                response.Headers.AcceptRanges.Contains("bytes") ||
+                response.Content.Headers.ContentRange != null;
 
-var isChunkedWithoutLength =
-    !contentLength.HasValue &&
-    response.Headers.TransferEncodingChunked == true;
+            var isChunkedWithoutLength =
+                !contentLength.HasValue &&
+                response.Headers.TransferEncodingChunked == true;
 
-// نكتفي باللي جاي من Content headers
-var lastModified = response.Content.Headers.LastModified;
+            // نكتفي باللي جاي من Content headers
+            var lastModified = response.Content.Headers.LastModified;
 
-var info = new HttpResourceInfo
-{
-    Url = uri,
-    ContentLength = contentLength,
-    SupportsRange = supportsRange,
-    ETag = response.Headers.ETag?.Tag,
-    LastModified = lastModified,
-    IsChunkedWithoutLength = isChunkedWithoutLength
-};
+            var info = new HttpResourceInfo
+            {
+                Url = uri,
+                ContentLength = contentLength,
+                SupportsRange = supportsRange,
+                ETag = response.Headers.ETag?.Tag,
+                LastModified = lastModified,
+                IsChunkedWithoutLength = isChunkedWithoutLength
+            };
 
             _logger.Info(
                 "Probe completed",
@@ -205,26 +206,47 @@ var info = new HttpResourceInfo
             response.EnsureSuccessStatusCode();
 
             var mediaType = response.Content.Headers.ContentType?.MediaType;
-
-            // Guard: if server returns HTML instead of a file for a "file-looking" URL.
-            if (!from.HasValue &&
-                mediaType != null &&
-                mediaType.StartsWith("text/html", StringComparison.OrdinalIgnoreCase) &&
-                !url.AbsolutePath.EndsWith(".htm", StringComparison.OrdinalIgnoreCase) &&
-                !url.AbsolutePath.EndsWith(".html", StringComparison.OrdinalIgnoreCase))
-            {
-                var message =
-                    "Server returned an HTML page instead of the requested file. " +
-                    "This usually means the link requires login, a browser session, " +
-                    "or an extra confirmation step.";
-                throw new HttpRequestException(message);
-            }
-
             using var responseStream = await response.Content
                 .ReadAsStreamAsync(cancellationToken)
                 .ConfigureAwait(false);
 
             var buffer = new byte[81_920];
+
+            var firstRead = await responseStream
+                .ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)
+                .ConfigureAwait(false);
+
+            if (!from.HasValue &&
+                mediaType is not null &&
+                mediaType.StartsWith("text/html", StringComparison.OrdinalIgnoreCase) &&
+                !url.AbsolutePath.EndsWith(".htm", StringComparison.OrdinalIgnoreCase) &&
+                !url.AbsolutePath.EndsWith(".html", StringComparison.OrdinalIgnoreCase) &&
+                firstRead > 0)
+            {
+                var snippetLength = Math.Min(firstRead, 1024);
+                var snippet = Encoding.UTF8.GetString(buffer, 0, snippetLength);
+
+                var message =
+                    "Server returned an HTML page instead of the requested file. " +
+                    "This usually means the link requires login, a browser session, " +
+                    "or an extra confirmation step." +
+                    Environment.NewLine +
+                    "HTML snippet:" + Environment.NewLine +
+                    snippet;
+
+                var ex = new HttpRequestException(message);
+                ex.Data["CustomErrorCode"] = DownloadErrorCode.HtmlResponse;
+                throw ex;
+            }
+
+            if (firstRead > 0)
+            {
+                await target
+                    .WriteAsync(buffer.AsMemory(0, firstRead), cancellationToken)
+                    .ConfigureAwait(false);
+
+                progress?.Report(firstRead);
+            }
 
             while (true)
             {

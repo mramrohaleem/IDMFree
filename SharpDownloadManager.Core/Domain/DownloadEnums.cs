@@ -41,5 +41,6 @@ public enum DownloadErrorCode
     MergeFailed,
     ChecksumMismatch,
     StateStoreCorrupted,
-    Unknown
+    Unknown,
+    HtmlResponse
 }
