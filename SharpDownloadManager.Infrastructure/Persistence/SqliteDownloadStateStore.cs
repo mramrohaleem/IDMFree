@@ -154,7 +154,7 @@ CREATE TABLE IF NOT EXISTS Chunks (
         using var connection = CreateConnection();
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
 
-        using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        using var transaction = connection.BeginTransaction();
 
         try
         {
@@ -258,13 +258,13 @@ INSERT INTO Chunks (
                 }
             }
 
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            transaction.Commit();
 
             _logger.Info("Download state saved.", eventCode: "STATE_STORE_SAVE", downloadId: task.Id, context: new { task.Status, task.Mode, ChunkCount = task.Chunks.Count });
         }
         catch (SqliteException ex) when (IsCorruptionError(ex))
         {
-            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            transaction.Rollback();
             _logger.Error("SQLite state store corruption during save.", eventCode: "STATE_STORE_SAVE_CORRUPTED", exception: ex, downloadId: task.Id, context: new { DbPath = _dbPath });
 
             TryArchiveCorruptedDb();
@@ -395,7 +395,7 @@ INSERT INTO Chunks (
         using var connection = CreateConnection();
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
 
-        using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        using var transaction = connection.BeginTransaction();
 
         try
         {
@@ -415,13 +415,13 @@ INSERT INTO Chunks (
                 await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            transaction.Commit();
 
             _logger.Info("Deleted download from state store.", eventCode: "STATE_STORE_DELETE", downloadId: id);
         }
         catch (SqliteException ex) when (IsCorruptionError(ex))
         {
-            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            transaction.Rollback();
             _logger.Error("SQLite state store corruption during delete.", eventCode: "STATE_STORE_DELETE_CORRUPTED", exception: ex, downloadId: id, context: new { DbPath = _dbPath });
 
             TryArchiveCorruptedDb();
