@@ -76,30 +76,28 @@ public sealed class NetworkClient : INetworkClient
                 .ConfigureAwait(false);
 
             response.EnsureSuccessStatusCode();
+var contentLength = response.Content.Headers.ContentLength;
 
-            var contentLength = response.Content.Headers.ContentLength;
+var supportsRange =
+    response.Headers.AcceptRanges.Contains("bytes") ||
+    response.Content.Headers.ContentRange != null;
 
-            var supportsRange =
-                response.Headers.AcceptRanges.Contains("bytes") ||
-                response.Content.Headers.ContentRange != null;
+var isChunkedWithoutLength =
+    !contentLength.HasValue &&
+    response.Headers.TransferEncodingChunked == true;
 
-            var isChunkedWithoutLength =
-                !contentLength.HasValue &&
-                response.Headers.TransferEncodingChunked == true;
+// نكتفي باللي جاي من Content headers
+var lastModified = response.Content.Headers.LastModified;
 
-            var lastModified =
-                response.Content.Headers.LastModified ??
-                response.Headers.LastModified;
-
-            var info = new HttpResourceInfo
-            {
-                Url = uri,
-                ContentLength = contentLength,
-                SupportsRange = supportsRange,
-                ETag = response.Headers.ETag?.Tag,
-                LastModified = lastModified,
-                IsChunkedWithoutLength = isChunkedWithoutLength
-            };
+var info = new HttpResourceInfo
+{
+    Url = uri,
+    ContentLength = contentLength,
+    SupportsRange = supportsRange,
+    ETag = response.Headers.ETag?.Tag,
+    LastModified = lastModified,
+    IsChunkedWithoutLength = isChunkedWithoutLength
+};
 
             _logger.Info(
                 "Probe completed",
