@@ -1,0 +1,54 @@
+<Window x:Class="SharpDownloadManager.UI.Views.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d"
+        Title="Sharp Download Manager"
+        Height="600"
+        Width="1000">
+    <DockPanel>
+        <ToolBar DockPanel.Dock="Top">
+            <Button Content="New Download" Command="{Binding NewDownloadCommand}" Margin="2" />
+            <Button Content="Resume" Command="{Binding ResumeCommand}" Margin="2" />
+            <Button Content="Pause" Command="{Binding PauseCommand}" Margin="2" />
+            <Button Content="Delete" Command="{Binding DeleteCommand}" Margin="2" />
+            <Button Content="Open File" Command="{Binding OpenFileCommand}" Margin="2" />
+            <Button Content="Open Folder" Command="{Binding OpenFolderCommand}" Margin="2" />
+            <Button Content="Settings" Command="{Binding SettingsCommand}" Margin="2" />
+        </ToolBar>
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*" />
+                <RowDefinition Height="2*" />
+            </Grid.RowDefinitions>
+            <DataGrid Grid.Row="0"
+                      AutoGenerateColumns="False"
+                      ItemsSource="{Binding Downloads}"
+                      Margin="8"
+                      IsReadOnly="True"
+                      SelectionMode="Single">
+                <DataGrid.Columns>
+                    <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="2*" />
+                    <DataGridTextColumn Header="Status" Binding="{Binding StatusText}" Width="*" />
+                    <DataGridTextColumn Header="Progress (%)" Binding="{Binding Progress}" Width="*" />
+                    <DataGridTextColumn Header="Size (Total / Downloaded)" Binding="{Binding SizeText}" Width="*" />
+                    <DataGridTextColumn Header="Speed" Binding="{Binding SpeedText}" Width="*" />
+                    <DataGridTextColumn Header="ETA" Binding="{Binding EtaText}" Width="*" />
+                    <DataGridTextColumn Header="Mode" Binding="{Binding ModeText}" Width="*" />
+                </DataGrid.Columns>
+            </DataGrid>
+            <TabControl Grid.Row="1" Margin="8">
+                <TabItem Header="Overview">
+                    <TextBlock Text="Overview details will appear here." Margin="8" />
+                </TabItem>
+                <TabItem Header="Connections">
+                    <TextBlock Text="Connection information will appear here." Margin="8" />
+                </TabItem>
+                <TabItem Header="Log">
+                    <TextBlock Text="Log output will appear here." Margin="8" />
+                </TabItem>
+            </TabControl>
+        </Grid>
+    </DockPanel>
+</Window>
