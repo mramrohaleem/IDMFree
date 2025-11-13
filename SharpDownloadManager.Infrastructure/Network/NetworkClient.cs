@@ -172,7 +172,7 @@ public sealed class NetworkClient : INetworkClient
         long? from,
         long? to,
         Stream target,
-        IProgress<long> progress,
+        IProgress<long>? progress = null,
         CancellationToken cancellationToken = default)
     {
         if (url is null) throw new ArgumentNullException(nameof(url));
