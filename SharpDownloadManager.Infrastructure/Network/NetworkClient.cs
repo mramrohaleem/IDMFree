@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -175,7 +176,8 @@ public sealed class NetworkClient : INetworkClient
         Stream target,
         IProgress<long>? progress = null,
         CancellationToken cancellationToken = default,
-        bool allowHtmlFallback = true)
+        bool allowHtmlFallback = true,
+        IReadOnlyDictionary<string, string>? extraHeaders = null)
     {
         if (url is null) throw new ArgumentNullException(nameof(url));
         if (target is null) throw new ArgumentNullException(nameof(target));
@@ -189,6 +191,7 @@ public sealed class NetworkClient : INetworkClient
 
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         ApplyCommonHeaders(request, url);
+        ApplyExtraHeaders(request, extraHeaders);
 
         if (from.HasValue)
         {
@@ -255,13 +258,23 @@ public sealed class NetworkClient : INetworkClient
                             target,
                             progress,
                             cancellationToken,
-                            allowHtmlFallback: false)
+                            allowHtmlFallback: false,
+                            extraHeaders: extraHeaders)
                         .ConfigureAwait(false);
 
                     return;
                 }
 
                 var safeSnippet = snippet.Length > 1000 ? snippet[..1000] : snippet;
+
+                _logger.Error(
+                    "Server returned HTML instead of file.",
+                    eventCode: "DOWNLOAD_HTML_RESPONSE",
+                    context: new
+                    {
+                        Url = url.ToString(),
+                        Snippet = safeSnippet
+                    });
 
                 var message =
                     "Server returned an HTML page instead of the requested file. " +
@@ -307,6 +320,30 @@ public sealed class NetworkClient : INetworkClient
                 eventCode: "DOWNLOAD_RANGE_SUCCESS",
                 context: ctx);
         }
+        catch (HttpRequestException ex) when (ex.StatusCode.HasValue)
+        {
+            var status = ex.StatusCode.Value;
+            var friendly = GetFriendlyHttpErrorMessage(status);
+            var wrapped = new HttpRequestException(friendly, ex, status);
+
+            foreach (var key in ex.Data.Keys.Cast<object>().ToArray())
+            {
+                wrapped.Data[key] = ex.Data[key];
+            }
+
+            _logger.Error(
+                "Range download HTTP error",
+                eventCode: "DOWNLOAD_RANGE_HTTP_ERROR",
+                exception: wrapped,
+                context: new
+                {
+                    ctx.Url,
+                    Status = (int)status,
+                    Reason = status.ToString()
+                });
+
+            throw wrapped;
+        }
         catch (HttpRequestException ex)
         {
             _logger.Error(
@@ -335,6 +372,18 @@ public sealed class NetworkClient : INetworkClient
 
         try
         {
+            request.Headers.UserAgent.Clear();
+            request.Headers.UserAgent.ParseAdd(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                "Chrome/120.0.0.0 Safari/537.36");
+
+            request.Headers.Accept.Clear();
+            request.Headers.Accept.ParseAdd("*/*");
+
+            request.Headers.AcceptLanguage.Clear();
+            request.Headers.AcceptLanguage.ParseAdd("en-US,en;q=0.9");
+
             if (uri.Host.EndsWith("gofile.io", StringComparison.OrdinalIgnoreCase) &&
                 !uri.Host.Equals("gofile.io", StringComparison.OrdinalIgnoreCase))
             {
@@ -350,6 +399,55 @@ public sealed class NetworkClient : INetworkClient
         catch
         {
             // ignore invalid referrer
+        }
+    }
+
+    private static void ApplyExtraHeaders(HttpRequestMessage request, IReadOnlyDictionary<string, string>? extraHeaders)
+    {
+        if (request is null)
+        {
+            throw new ArgumentNullException(nameof(request));
+        }
+
+        if (extraHeaders is null)
+        {
+            return;
+        }
+
+        foreach (var kvp in extraHeaders)
+        {
+            var headerName = kvp.Key?.Trim();
+            if (string.IsNullOrWhiteSpace(headerName))
+            {
+                continue;
+            }
+
+            if (headerName.Equals("Host", StringComparison.OrdinalIgnoreCase) ||
+                headerName.Equals("Content-Length", StringComparison.OrdinalIgnoreCase) ||
+                headerName.Equals("Range", StringComparison.OrdinalIgnoreCase))
+            {
+                // Host and Content-Length are managed by HttpClient, Range is managed by downloader.
+                continue;
+            }
+
+            var headerValue = kvp.Value ?? string.Empty;
+
+            if (headerName.Equals("Referer", StringComparison.OrdinalIgnoreCase))
+            {
+                if (Uri.TryCreate(headerValue, UriKind.Absolute, out var referer))
+                {
+                    request.Headers.Referrer = referer;
+                }
+
+                continue;
+            }
+
+            if (request.Headers.Contains(headerName))
+            {
+                request.Headers.Remove(headerName);
+            }
+
+            request.Headers.TryAddWithoutValidation(headerName, headerValue);
         }
     }
 
@@ -623,5 +721,24 @@ public sealed class NetworkClient : INetworkClient
         }
 
         return response;
+    }
+
+    private static string GetFriendlyHttpErrorMessage(HttpStatusCode statusCode)
+    {
+        return statusCode switch
+        {
+            HttpStatusCode.Forbidden =>
+                "Server returned 403 Forbidden. This usually means the link requires a browser session, login, or an extra confirmation step.",
+            HttpStatusCode.NotFound =>
+                "Server returned 404 Not Found. The file link is invalid or has expired.",
+            HttpStatusCode.TooManyRequests =>
+                "Server returned 429 Too Many Requests. You may need to wait or slow down your downloads.",
+            HttpStatusCode.InternalServerError =>
+                "Server returned 500 Internal Server Error.",
+            HttpStatusCode.ServiceUnavailable =>
+                "Server returned 503 Service Unavailable. The service may be temporarily down.",
+            _ =>
+                $"Server returned HTTP {(int)statusCode} ({statusCode})."
+        };
     }
 }

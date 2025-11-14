@@ -42,5 +42,7 @@ public enum DownloadErrorCode
     ChecksumMismatch,
     StateStoreCorrupted,
     Unknown,
-    HtmlResponse
+    HtmlResponse,
+    ValidationMismatch,
+    ZeroBytes
 }

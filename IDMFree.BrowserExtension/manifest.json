@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "IDMFree Bridge",
+  "description": "Bridge between the browser and IDMFree download manager.",
+  "version": "0.1.0",
+  "permissions": [
+    "downloads",
+    "webRequest",
+    "webRequestBlocking"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1:5454/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "128": "icon128.png"
+  }
+}

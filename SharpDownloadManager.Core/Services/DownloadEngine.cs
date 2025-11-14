@@ -69,6 +69,7 @@ public class DownloadEngine : IDownloadEngine
         string? suggestedFileName,
         string saveFolderPath,
         DownloadMode mode = DownloadMode.Normal,
+        IReadOnlyDictionary<string, string>? requestHeaders = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(url))
@@ -81,12 +82,39 @@ public class DownloadEngine : IDownloadEngine
             throw new ArgumentException("Save folder path must be provided.", nameof(saveFolderPath));
         }
 
-        var resourceInfo = await _networkClient.ProbeAsync(url, cancellationToken).ConfigureAwait(false);
+        HttpResourceInfo resourceInfo;
+        try
+        {
+            resourceInfo = await _networkClient.ProbeAsync(url, cancellationToken).ConfigureAwait(false);
+        }
+        catch (HttpRequestException ex) when (requestHeaders is not null && requestHeaders.Count > 0)
+        {
+            _logger.Warn(
+                "Probe failed with browser-provided headers; falling back to minimal metadata.",
+                eventCode: "PROBE_FALLBACK_BROWSER",
+                context: new { Url = url, ex.Message });
+
+            resourceInfo = new HttpResourceInfo
+            {
+                Url = new Uri(url),
+                ContentLength = null,
+                SupportsRange = false,
+                ETag = null,
+                LastModified = null,
+                IsChunkedWithoutLength = true
+            };
+        }
 
         var id = Guid.NewGuid();
         var fileName = ResolveFileName(suggestedFileName, resourceInfo.Url);
         var savePath = Path.Combine(saveFolderPath, fileName);
         var tempFolderPath = Path.Combine(saveFolderPath, ".sharpdm", id.ToString("N"));
+
+        IReadOnlyDictionary<string, string>? normalizedHeaders = null;
+        if (requestHeaders is not null && requestHeaders.Count > 0)
+        {
+            normalizedHeaders = new Dictionary<string, string>(requestHeaders, StringComparer.OrdinalIgnoreCase);
+        }
 
         var task = new DownloadTask
         {
@@ -100,7 +128,8 @@ public class DownloadEngine : IDownloadEngine
             ContentLength = resourceInfo.ContentLength,
             SupportsRange = resourceInfo.SupportsRange,
             ETag = resourceInfo.ETag,
-            LastModified = resourceInfo.LastModified
+            LastModified = resourceInfo.LastModified,
+            RequestHeaders = normalizedHeaders
         };
 
         var connectionsCount = DetermineConnectionsCount(mode, resourceInfo);
@@ -339,13 +368,18 @@ public class DownloadEngine : IDownloadEngine
                         task.UpdateProgressFromChunks();
                     });
 
+                    var allowFallback = !from.HasValue && !to.HasValue;
+
                     await _networkClient.DownloadRangeToStreamAsync(
-                        taskUri,
-                        from,
-                        to,
-                        fileStream,
-                        progress,
-                        ct).ConfigureAwait(false);
+                            taskUri,
+                            from,
+                            to,
+                            fileStream,
+                            progress,
+                            ct,
+                            allowFallback,
+                            task.RequestHeaders)
+                        .ConfigureAwait(false);
 
                     chunk.Status = ChunkStatus.Completed;
                     chunk.LastErrorCode = null;
@@ -453,17 +487,52 @@ public class DownloadEngine : IDownloadEngine
                 }
             }
 
+            var finalFileInfo = new FileInfo(task.SavePath);
+            var finalLength = finalFileInfo.Length;
+            task.BytesWritten = finalLength;
+            task.TotalDownloadedBytes = finalLength;
+
             if (task.ContentLength.HasValue)
             {
-                var finalLength = new FileInfo(task.SavePath).Length;
                 if (finalLength != task.ContentLength.Value)
                 {
-                    task.MarkAsError(DownloadErrorCode.ChecksumMismatch, "Downloaded size does not match Content-Length.");
+                    var message =
+                        $"Downloaded size does not match Content-Length. Expected {task.ContentLength.Value} bytes but received {finalLength} bytes.";
+
+                    task.MarkAsError(DownloadErrorCode.ValidationMismatch, message);
                     await SaveStateAsync(task, cancellationToken).ConfigureAwait(false);
+
+                    _logger.Error(
+                        "Download validation failed due to size mismatch.",
+                        downloadId: task.Id,
+                        eventCode: "DOWNLOAD_VALIDATION_MISMATCH",
+                        context: new
+                        {
+                            task.Url,
+                            Expected = task.ContentLength.Value,
+                            Actual = finalLength
+                        });
+
                     return;
                 }
             }
+            else if (finalLength == 0)
+            {
+                const string zeroMessage = "Download completed with zero bytes written.";
+                task.MarkAsError(DownloadErrorCode.ZeroBytes, zeroMessage);
+                await SaveStateAsync(task, cancellationToken).ConfigureAwait(false);
 
+                _logger.Error(
+                    "Download validation failed due to zero-byte file.",
+                    downloadId: task.Id,
+                    eventCode: "DOWNLOAD_VALIDATION_ZERO_BYTES",
+                    context: new { task.Url });
+
+                return;
+            }
+
+            task.LastErrorCode = DownloadErrorCode.None;
+            task.LastErrorMessage = null;
             task.Status = DownloadStatus.Completed;
             await SaveStateAsync(task, cancellationToken).ConfigureAwait(false);
             _logger.Info("Download completed.", downloadId: task.Id, eventCode: "DOWNLOAD_RUN_COMPLETED");

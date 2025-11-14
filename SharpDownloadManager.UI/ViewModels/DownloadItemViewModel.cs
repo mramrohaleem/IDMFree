@@ -106,16 +106,18 @@ public class DownloadItemViewModel : INotifyPropertyChanged
 
         ErrorText = task.LastErrorMessage ?? string.Empty;
 
+        var writtenBytes = task.BytesWritten;
+
         double progress = 0d;
         if (task.ContentLength.HasValue && task.ContentLength.Value > 0)
         {
-            progress = 100.0 * task.TotalDownloadedBytes / task.ContentLength.Value;
+            progress = 100.0 * writtenBytes / task.ContentLength.Value;
         }
 
         Progress = progress;
-        SizeText = $"{task.TotalDownloadedBytes} / {task.ContentLength?.ToString() ?? "Unknown"}";
+        SizeText = $"{writtenBytes} / {task.ContentLength?.ToString() ?? "Unknown"}";
         var nowUtc = DateTime.UtcNow;
-        var totalBytes = task.TotalDownloadedBytes;
+        var totalBytes = writtenBytes;
 
         if (!isSameTask)
         {

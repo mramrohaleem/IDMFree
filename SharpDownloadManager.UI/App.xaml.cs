@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Windows;
 using SharpDownloadManager.Core.Services;
 using SharpDownloadManager.Infrastructure.Logging;
@@ -6,11 +7,14 @@ using SharpDownloadManager.Infrastructure.Network;
 using SharpDownloadManager.Infrastructure.Persistence;
 using SharpDownloadManager.UI.ViewModels;
 using SharpDownloadManager.UI.Views;
+using SharpDownloadManager.UI.Services;
 
 namespace SharpDownloadManager.UI;
 
 public partial class App : Application
 {
+    private BrowserBridgeServer? _browserBridge;
+
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
@@ -25,6 +29,24 @@ public partial class App : Application
             var engine = new DownloadEngine(networkClient, stateStore, logger);
 
             await engine.InitializeAsync();
+
+            var downloadsFolder = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                "Downloads");
+
+            var browserBridge = new BrowserBridgeServer(engine, logger, downloadsFolder);
+            try
+            {
+                await browserBridge.StartAsync();
+                _browserBridge = browserBridge;
+            }
+            catch (Exception bridgeEx)
+            {
+                logger.Warn(
+                    "Failed to start browser bridge.",
+                    eventCode: "BROWSER_BRIDGE_UNHANDLED_START_ERROR",
+                    context: new { bridgeEx.Message });
+            }
 
             logger.Info("Engine initialized - creating main window", eventCode: "APP_INIT_OK");
 
@@ -56,5 +78,11 @@ public partial class App : Application
 
             Shutdown(-1);
         }
+    }
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        _browserBridge?.Dispose();
+        base.OnExit(e);
     }
 }
