@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
+using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -89,6 +90,29 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
 
             return BrowserDownloadResult.Accepted(task);
         }
+        catch (HttpRequestException httpEx)
+        {
+            var status = httpEx.StatusCode ?? HttpStatusCode.BadGateway;
+
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                _dispatcher.Invoke(() =>
+                {
+                    MessageBox.Show(
+                        httpEx.Message,
+                        "Download failed",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                });
+            }
+
+            _logger.Warn(
+                "Failed to enqueue download due to HTTP error.",
+                eventCode: "BROWSER_DOWNLOAD_DIALOG_HTTP_ERROR",
+                context: new { request.Url, Status = (int)status, httpEx.Message });
+
+            return BrowserDownloadResult.Failed(status, httpEx.Message);
+        }
         catch (Exception ex)
         {
             _logger.Error(
@@ -96,6 +120,18 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
                 eventCode: "BROWSER_DOWNLOAD_DIALOG_ERROR",
                 exception: ex,
                 context: new { request.Url });
+
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                _dispatcher.Invoke(() =>
+                {
+                    MessageBox.Show(
+                        ex.Message,
+                        "Failed to start download",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Error);
+                });
+            }
 
             return BrowserDownloadResult.Failed(HttpStatusCode.InternalServerError, ex.Message);
         }

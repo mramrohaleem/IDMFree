@@ -23,6 +23,7 @@ public class DownloadEngine : IDownloadEngine
     private readonly Dictionary<Guid, CancellationTokenSource> _activeTokens = new();
     private readonly Dictionary<Guid, Task> _activeDownloadTasks = new();
     private readonly Dictionary<Guid, DownloadCancellationReason> _cancellationReasons = new();
+    private readonly string _tempRootFolder;
 
     private enum DownloadCancellationReason
     {
@@ -40,6 +41,7 @@ public class DownloadEngine : IDownloadEngine
         _networkClient = networkClient ?? throw new ArgumentNullException(nameof(networkClient));
         _stateStore = stateStore ?? throw new ArgumentNullException(nameof(stateStore));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _tempRootFolder = InitializeTempRootFolder();
     }
 
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
@@ -92,39 +94,20 @@ public class DownloadEngine : IDownloadEngine
             throw new ArgumentException("Save folder path must be provided.", nameof(saveFolderPath));
         }
 
-        HttpResourceInfo resourceInfo;
-        try
-        {
-            resourceInfo = await _networkClient.ProbeAsync(url, cancellationToken).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex) when (requestHeaders is not null && requestHeaders.Count > 0)
-        {
-            _logger.Warn(
-                "Probe failed with browser-provided headers; falling back to minimal metadata.",
-                eventCode: "PROBE_FALLBACK_BROWSER",
-                context: new { Url = url, ex.Message });
-
-            resourceInfo = new HttpResourceInfo
-            {
-                Url = new Uri(url),
-                ContentLength = null,
-                SupportsRange = false,
-                ETag = null,
-                LastModified = null,
-                IsChunkedWithoutLength = true
-            };
-        }
-
-        var id = Guid.NewGuid();
-        var fileName = ResolveFileName(suggestedFileName, resourceInfo.ContentDispositionFileName, resourceInfo.Url);
-        var savePath = Path.Combine(saveFolderPath, fileName);
-        var tempFolderPath = Path.Combine(saveFolderPath, ".sharpdm", id.ToString("N"));
-
         IReadOnlyDictionary<string, string>? normalizedHeaders = null;
         if (requestHeaders is not null && requestHeaders.Count > 0)
         {
             normalizedHeaders = new Dictionary<string, string>(requestHeaders, StringComparer.OrdinalIgnoreCase);
         }
+
+        var resourceInfo = await _networkClient
+            .ProbeAsync(url, normalizedHeaders, cancellationToken)
+            .ConfigureAwait(false);
+
+        var id = Guid.NewGuid();
+        var fileName = ResolveFileName(suggestedFileName, resourceInfo.ContentDispositionFileName, resourceInfo.Url);
+        var savePath = Path.Combine(saveFolderPath, fileName);
+        var tempFolderPath = Path.Combine(_tempRootFolder, id.ToString("N"));
 
         var task = new DownloadTask
         {
@@ -402,7 +385,7 @@ public class DownloadEngine : IDownloadEngine
 
                     var allowFallback = !from.HasValue && !to.HasValue;
 
-                    await _networkClient.DownloadRangeToStreamAsync(
+                    var responseMetadata = await _networkClient.DownloadRangeToStreamAsync(
                             taskUri,
                             from,
                             to,
@@ -412,6 +395,8 @@ public class DownloadEngine : IDownloadEngine
                             allowFallback,
                             task.RequestHeaders)
                         .ConfigureAwait(false);
+
+                    TryUpdateTaskMetadataFromResponse(task, responseMetadata);
 
                     chunk.Status = ChunkStatus.Completed;
                     chunk.LastErrorCode = null;
@@ -740,6 +725,95 @@ public class DownloadEngine : IDownloadEngine
         return _stateStore.SaveDownloadAsync(task, token);
     }
 
+    private string InitializeTempRootFolder()
+    {
+        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        if (!string.IsNullOrWhiteSpace(appData))
+        {
+            var candidate = Path.Combine(appData, "SharpDownloadManager", "Temp");
+            try
+            {
+                Directory.CreateDirectory(candidate);
+                return candidate;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn(
+                    "Failed to prepare AppData temp folder. Falling back to system temp.",
+                    eventCode: "TEMP_ROOT_FALLBACK",
+                    context: new { candidate, ex.Message });
+            }
+        }
+
+        var fallback = Path.Combine(Path.GetTempPath(), "SharpDownloadManager", "Temp");
+        Directory.CreateDirectory(fallback);
+        return fallback;
+    }
+
+    private void TryUpdateTaskMetadataFromResponse(DownloadTask task, DownloadResponseMetadata metadata)
+    {
+        if (task is null || metadata is null)
+        {
+            return;
+        }
+
+        if (metadata.ResourceLength.HasValue)
+        {
+            var length = metadata.ResourceLength.Value;
+            if (!task.ContentLength.HasValue || task.ContentLength.Value != length)
+            {
+                task.ContentLength = length;
+
+                if (task.Chunks.Count == 1)
+                {
+                    var singleChunk = task.Chunks[0];
+                    if (singleChunk.EndByte < 0)
+                    {
+                        singleChunk.EndByte = length > 0 ? length - 1 : -1;
+                    }
+                }
+            }
+        }
+
+        if (metadata.SupportsRange && !task.SupportsRange)
+        {
+            task.SupportsRange = true;
+        }
+
+        if (!string.IsNullOrEmpty(metadata.ETag) && string.IsNullOrEmpty(task.ETag))
+        {
+            task.ETag = metadata.ETag;
+        }
+
+        if (metadata.LastModified.HasValue && task.LastModified is null)
+        {
+            task.LastModified = metadata.LastModified;
+        }
+
+        if (!string.IsNullOrWhiteSpace(metadata.ContentDispositionFileName))
+        {
+            var normalized = FileNameHelper.NormalizeFileName(metadata.ContentDispositionFileName);
+            if (!string.IsNullOrWhiteSpace(normalized) &&
+                !string.Equals(task.FileName, normalized, StringComparison.Ordinal))
+            {
+                var directory = Path.GetDirectoryName(task.SavePath);
+                if (!string.IsNullOrEmpty(directory))
+                {
+                    var newSavePath = Path.Combine(directory, normalized);
+
+                    _logger.Info(
+                        "Updating file name based on server response metadata.",
+                        downloadId: task.Id,
+                        eventCode: "DOWNLOAD_FILENAME_UPDATED",
+                        context: new { Old = task.FileName, New = normalized });
+
+                    task.FileName = normalized;
+                    task.SavePath = newSavePath;
+                }
+            }
+        }
+    }
+
     private static void TryDeleteFile(string? path)
     {
         if (string.IsNullOrWhiteSpace(path))
@@ -830,8 +904,8 @@ public class DownloadEngine : IDownloadEngine
     private static string ResolveFileName(string? browserFileName, string? contentDispositionFileName, Uri resourceUri)
     {
         var candidate =
-            FileNameHelper.NormalizeFileName(browserFileName) ??
             FileNameHelper.NormalizeFileName(contentDispositionFileName) ??
+            FileNameHelper.NormalizeFileName(browserFileName) ??
             FileNameHelper.NormalizeFileName(Path.GetFileName(resourceUri.AbsolutePath));
 
         if (string.IsNullOrWhiteSpace(candidate))

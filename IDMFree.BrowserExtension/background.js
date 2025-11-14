@@ -49,6 +49,90 @@ function normalizeFileName(filePath) {
   return base || null;
 }
 
+function buildHeadersObject(requestHeaders) {
+  if (!Array.isArray(requestHeaders) || requestHeaders.length === 0) {
+    return undefined;
+  }
+
+  const headersObject = {};
+  for (const header of requestHeaders) {
+    if (!header || !header.name || typeof header.value !== "string") {
+      continue;
+    }
+
+    const name = header.name;
+    if (headersObject[name]) {
+      headersObject[name] = `${headersObject[name]}, ${header.value}`;
+    } else {
+      headersObject[name] = header.value;
+    }
+  }
+
+  return Object.keys(headersObject).length > 0 ? headersObject : undefined;
+}
+
+function pauseDownload(downloadId) {
+  return new Promise((resolve) => {
+    chrome.downloads.pause(downloadId, () => {
+      if (chrome.runtime.lastError) {
+        console.debug(
+          "[IDMFree] Unable to pause browser download",
+          downloadId,
+          chrome.runtime.lastError
+        );
+        resolve(false);
+        return;
+      }
+
+      resolve(true);
+    });
+  });
+}
+
+function resumeDownload(downloadId) {
+  return new Promise((resolve) => {
+    chrome.downloads.resume(downloadId, () => {
+      if (chrome.runtime.lastError) {
+        console.debug(
+          "[IDMFree] Unable to resume browser download",
+          downloadId,
+          chrome.runtime.lastError
+        );
+        resolve(false);
+        return;
+      }
+
+      resolve(true);
+    });
+  });
+}
+
+function cancelAndErase(downloadId) {
+  return new Promise((resolve) => {
+    chrome.downloads.cancel(downloadId, () => {
+      const cancelError = chrome.runtime.lastError;
+
+      chrome.downloads.erase({ id: downloadId }, () => {
+        const eraseError = chrome.runtime.lastError;
+
+        if (cancelError) {
+          console.warn("[IDMFree] Failed to cancel browser download", cancelError);
+        } else {
+          console.debug("[IDMFree] Browser download canceled", downloadId);
+        }
+
+        if (eraseError) {
+          console.warn("[IDMFree] Failed to erase browser download entry", eraseError);
+        } else {
+          console.debug("[IDMFree] Browser download entry removed", downloadId);
+        }
+
+        resolve(!cancelError);
+      });
+    });
+  });
+}
+
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
     recentRequests.set(details.url, {
@@ -64,7 +148,7 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
   ["requestHeaders", "extraHeaders"]
 );
 
-chrome.downloads.onCreated.addListener((item) => {
+chrome.downloads.onCreated.addListener(async (item) => {
   if (!item || !item.url) {
     return;
   }
@@ -81,18 +165,7 @@ chrome.downloads.onCreated.addListener((item) => {
     context ? "with headers" : "without headers"
   );
 
-  const headersObject = {};
-  if (context && Array.isArray(context.requestHeaders)) {
-    for (const header of context.requestHeaders) {
-      if (!header || !header.name || typeof header.value !== "string") {
-        continue;
-      }
-
-      headersObject[header.name] = header.value;
-    }
-  }
-
-  const headers = Object.keys(headersObject).length > 0 ? headersObject : undefined;
+  const headers = buildHeadersObject(context ? context.requestHeaders : undefined);
   const normalizedFileName = normalizeFileName(item.filename);
 
   const payload = {
@@ -107,75 +180,47 @@ chrome.downloads.onCreated.addListener((item) => {
 
   console.debug("[IDMFree] Forwarding download", payload);
 
-  const cancelAndErase = () => {
-    chrome.downloads.cancel(item.id, () => {
-      if (chrome.runtime.lastError) {
-        console.warn(
-          "[IDMFree] Failed to cancel browser download",
-          chrome.runtime.lastError
-        );
-      } else {
-        console.debug("[IDMFree] Browser download canceled", item.id);
-      }
+  const wasPaused = await pauseDownload(item.id);
+  let handledByManager = false;
 
-      chrome.downloads.erase({ id: item.id }, () => {
-        if (chrome.runtime.lastError) {
-          console.warn(
-            "[IDMFree] Failed to erase browser download entry",
-            chrome.runtime.lastError
-          );
-        } else {
-          console.debug("[IDMFree] Browser download entry removed", item.id);
-        }
-      });
+  try {
+    const response = await fetch("http://127.0.0.1:5454/api/downloads", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
     });
-  };
 
-  cancelAndErase();
+    let body = null;
+    try {
+      body = await response.json();
+    } catch (jsonError) {
+      console.warn("[IDMFree] Failed to parse bridge response", jsonError);
+    }
 
-  let fallbackTriggered = false;
-  const triggerBrowserFallback = (reason) => {
-    if (fallbackTriggered) {
+    handledByManager = Boolean(body && body.handled === true);
+
+    if (handledByManager) {
+      await cancelAndErase(item.id);
+      console.debug("[IDMFree] Download delegated to desktop manager", item.id);
       return;
     }
-    fallbackTriggered = true;
 
-    console.warn("[IDMFree] Falling back to browser download", reason);
-
-    const options = { url: item.url };
-    if (item.filename && item.filename.trim().length > 0) {
-      options.filename = item.filename;
-    } else if (normalizedFileName) {
-      options.filename = normalizedFileName;
+    const statusCode = body && typeof body.statusCode === "number" ? body.statusCode : response.status;
+    if (body && body.error) {
+      console.warn("[IDMFree] Desktop manager declined download", body.error, statusCode);
+    } else {
+      console.debug("[IDMFree] Desktop manager declined download", statusCode);
     }
+  } catch (err) {
+    console.warn("[IDMFree] Failed to reach desktop manager", err);
+  }
 
-    chrome.downloads.download(options, (newId) => {
-      if (chrome.runtime.lastError) {
-        console.error(
-          "[IDMFree] Failed to restart browser download",
-          chrome.runtime.lastError
-        );
-      } else {
-        console.debug("[IDMFree] Browser download resumed", newId);
-      }
-    });
-  };
-
-  fetch("http://127.0.0.1:5454/api/downloads", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  })
-    .then((res) => {
-      if (res.ok) {
-        console.debug("[IDMFree] Download queued in IDMFree", item.id);
-      } else {
-        triggerBrowserFallback(`status ${res.status}`);
-      }
-    })
-    .catch((err) => {
-      triggerBrowserFallback(err);
-    });
+  if (!handledByManager && wasPaused) {
+    const resumed = await resumeDownload(item.id);
+    if (resumed) {
+      console.debug("[IDMFree] Browser download resumed", item.id);
+    }
+  }
 });

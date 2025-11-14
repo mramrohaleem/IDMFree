@@ -193,7 +193,11 @@ public sealed class BrowserBridgeServer : IDisposable
                 (url.Scheme != Uri.UriSchemeHttp && url.Scheme != Uri.UriSchemeHttps))
             {
                 response.StatusCode = (int)HttpStatusCode.BadRequest;
-                await WriteJsonAsync(response, new { error = "Invalid download request." }, cancellationToken).ConfigureAwait(false);
+                await WriteJsonAsync(
+                        response,
+                        new { handled = false, error = "Invalid download request." },
+                        cancellationToken)
+                    .ConfigureAwait(false);
                 _logger.Warn(
                     "Browser API received invalid payload.",
                     eventCode: "BROWSER_API_REQUEST_INVALID");
@@ -217,7 +221,13 @@ public sealed class BrowserBridgeServer : IDisposable
             {
                 await WriteJsonAsync(
                         response,
-                        new { status = "queued", id = result.Task.Id },
+                        new
+                        {
+                            handled = result.Handled,
+                            status = "queued",
+                            id = result.Task.Id,
+                            statusCode = (int)result.StatusCode
+                        },
                         cancellationToken)
                     .ConfigureAwait(false);
 
@@ -233,7 +243,12 @@ public sealed class BrowserBridgeServer : IDisposable
             {
                 await WriteJsonAsync(
                         response,
-                        new { error = result.Error ?? "User declined the download." },
+                        new
+                        {
+                            handled = result.Handled,
+                            error = result.Error ?? "User declined the download.",
+                            statusCode = (int)result.StatusCode
+                        },
                         cancellationToken)
                     .ConfigureAwait(false);
 
@@ -246,7 +261,12 @@ public sealed class BrowserBridgeServer : IDisposable
 
             await WriteJsonAsync(
                     response,
-                    new { error = result.Error ?? "Failed to process download request." },
+                    new
+                    {
+                        handled = result.Handled,
+                        error = result.Error ?? "Failed to process download request.",
+                        statusCode = (int)result.StatusCode
+                    },
                     cancellationToken)
                 .ConfigureAwait(false);
 
@@ -258,7 +278,11 @@ public sealed class BrowserBridgeServer : IDisposable
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             response.StatusCode = (int)HttpStatusCode.InternalServerError;
-            await WriteJsonAsync(response, new { error = "Unexpected server error." }, cancellationToken).ConfigureAwait(false);
+            await WriteJsonAsync(
+                    response,
+                    new { handled = false, error = "Unexpected server error." },
+                    cancellationToken)
+                .ConfigureAwait(false);
 
             _logger.Error(
                 "Unexpected error in browser bridge handler.",
