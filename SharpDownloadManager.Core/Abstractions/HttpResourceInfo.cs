@@ -18,4 +18,6 @@ public class HttpResourceInfo
     /// True if the server uses Transfer-Encoding: chunked and does not provide a Content-Length.
     /// </summary>
     public bool IsChunkedWithoutLength { get; init; }
+
+    public string? ContentDispositionFileName { get; init; }
 }

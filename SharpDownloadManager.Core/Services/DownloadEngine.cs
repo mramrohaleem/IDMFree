@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using SharpDownloadManager.Core.Abstractions;
 using SharpDownloadManager.Core.Domain;
+using SharpDownloadManager.Core.Utilities;
 
 namespace SharpDownloadManager.Core.Services;
 
@@ -115,7 +116,7 @@ public class DownloadEngine : IDownloadEngine
         }
 
         var id = Guid.NewGuid();
-        var fileName = ResolveFileName(suggestedFileName, resourceInfo.Url);
+        var fileName = ResolveFileName(suggestedFileName, resourceInfo.ContentDispositionFileName, resourceInfo.Url);
         var savePath = Path.Combine(saveFolderPath, fileName);
         var tempFolderPath = Path.Combine(saveFolderPath, ".sharpdm", id.ToString("N"));
 
@@ -138,7 +139,8 @@ public class DownloadEngine : IDownloadEngine
             SupportsRange = resourceInfo.SupportsRange,
             ETag = resourceInfo.ETag,
             LastModified = resourceInfo.LastModified,
-            RequestHeaders = normalizedHeaders
+            RequestHeaders = normalizedHeaders,
+            ActualFileSize = null
         };
 
         var connectionsCount = DetermineConnectionsCount(mode, resourceInfo);
@@ -245,9 +247,17 @@ public class DownloadEngine : IDownloadEngine
     public async Task DeleteAsync(Guid downloadId, CancellationToken cancellationToken = default)
     {
         bool removed;
+        string? savePath = null;
+        string? tempFolderPath = null;
         CancellationTokenSource? ctsToCancel = null;
         lock (_syncRoot)
         {
+            if (_downloads.TryGetValue(downloadId, out var existing))
+            {
+                savePath = existing.SavePath;
+                tempFolderPath = existing.TempFolderPath;
+            }
+
             removed = _downloads.Remove(downloadId);
             if (_activeTokens.TryGetValue(downloadId, out var cts))
             {
@@ -263,6 +273,9 @@ public class DownloadEngine : IDownloadEngine
         ctsToCancel?.Cancel();
 
         await _stateStore.DeleteDownloadAsync(downloadId, cancellationToken).ConfigureAwait(false);
+
+        TryDeleteFile(savePath);
+        TryDeleteDirectory(tempFolderPath);
 
         if (removed)
         {
@@ -516,10 +529,13 @@ public class DownloadEngine : IDownloadEngine
                 }
             }
 
+            TryDeleteDirectory(task.TempFolderPath);
+
             var finalFileInfo = new FileInfo(task.SavePath);
             var finalLength = finalFileInfo.Length;
             task.BytesWritten = finalLength;
             task.TotalDownloadedBytes = finalLength;
+            task.ActualFileSize = finalLength;
 
             if (task.ContentLength.HasValue)
             {
@@ -529,6 +545,9 @@ public class DownloadEngine : IDownloadEngine
                         $"Downloaded size does not match Content-Length. Expected {task.ContentLength.Value} bytes but received {finalLength} bytes.";
 
                     task.MarkAsError(DownloadErrorCode.ValidationMismatch, message);
+                    task.ActualFileSize = null;
+                    TryDeleteFile(task.SavePath);
+                    TryDeleteDirectory(task.TempFolderPath);
                     await SaveStateAsync(task, cancellationToken).ConfigureAwait(false);
 
                     _logger.Error(
@@ -549,6 +568,9 @@ public class DownloadEngine : IDownloadEngine
             {
                 const string zeroMessage = "Download completed with zero bytes written.";
                 task.MarkAsError(DownloadErrorCode.ZeroBytes, zeroMessage);
+                task.ActualFileSize = null;
+                TryDeleteFile(task.SavePath);
+                TryDeleteDirectory(task.TempFolderPath);
                 await SaveStateAsync(task, cancellationToken).ConfigureAwait(false);
 
                 _logger.Error(
@@ -596,6 +618,8 @@ public class DownloadEngine : IDownloadEngine
             }
 
             task.MarkAsError(code, httpEx.Message);
+            task.ActualFileSize = null;
+            TryDeleteFile(task.SavePath);
             await SaveStateAsync(task, CancellationToken.None, ignoreCancellation: true).ConfigureAwait(false);
             _logger.Error(
                 "Download failed due to HTTP error.",
@@ -619,6 +643,8 @@ public class DownloadEngine : IDownloadEngine
             };
 
             task.MarkAsError(code, ex.Message);
+            task.ActualFileSize = null;
+            TryDeleteFile(task.SavePath);
             await SaveStateAsync(task, CancellationToken.None, ignoreCancellation: true).ConfigureAwait(false);
             _logger.Error(
                 "Download failed.",
@@ -714,6 +740,46 @@ public class DownloadEngine : IDownloadEngine
         return _stateStore.SaveDownloadAsync(task, token);
     }
 
+    private static void TryDeleteFile(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
+            // Best-effort cleanup.
+        }
+    }
+
+    private static void TryDeleteDirectory(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        try
+        {
+            if (Directory.Exists(path))
+            {
+                Directory.Delete(path, recursive: true);
+            }
+        }
+        catch
+        {
+            // Best-effort cleanup.
+        }
+    }
+
     private static DownloadErrorCode MapHttpErrorCode(HttpStatusCode? statusCode)
     {
         if (!statusCode.HasValue)
@@ -761,14 +827,13 @@ public class DownloadEngine : IDownloadEngine
         return 4;
     }
 
-    private static string ResolveFileName(string? suggestedFileName, Uri resourceUri)
+    private static string ResolveFileName(string? browserFileName, string? contentDispositionFileName, Uri resourceUri)
     {
-        if (!string.IsNullOrWhiteSpace(suggestedFileName))
-        {
-            return suggestedFileName.Trim();
-        }
+        var candidate =
+            FileNameHelper.NormalizeFileName(browserFileName) ??
+            FileNameHelper.NormalizeFileName(contentDispositionFileName) ??
+            FileNameHelper.NormalizeFileName(Path.GetFileName(resourceUri.AbsolutePath));
 
-        var candidate = Path.GetFileName(resourceUri.AbsolutePath);
         if (string.IsNullOrWhiteSpace(candidate))
         {
             return "download.bin";

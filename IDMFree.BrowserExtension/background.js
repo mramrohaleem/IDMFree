@@ -26,6 +26,29 @@ function pruneOldEntries() {
   }
 }
 
+function normalizeFileName(filePath) {
+  if (!filePath || typeof filePath !== "string") {
+    return null;
+  }
+
+  const trimmed = filePath.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const parts = trimmed.split(/[\\/]/);
+  let base = parts[parts.length - 1];
+  if (!base) {
+    return null;
+  }
+
+  if (base.toLowerCase().endsWith(".crdownload")) {
+    base = base.slice(0, -".crdownload".length);
+  }
+
+  return base || null;
+}
+
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
     recentRequests.set(details.url, {
@@ -69,14 +92,74 @@ chrome.downloads.onCreated.addListener((item) => {
     }
   }
 
+  const headers = Object.keys(headersObject).length > 0 ? headersObject : undefined;
+  const normalizedFileName = normalizeFileName(item.filename);
+
   const payload = {
     url: item.url,
-    fileName: item.filename || null,
+    fileName: normalizedFileName,
     method: context ? context.method : "GET",
-    headers: Object.keys(headersObject).length > 0 ? headersObject : undefined,
   };
 
+  if (headers) {
+    payload.headers = headers;
+  }
+
   console.debug("[IDMFree] Forwarding download", payload);
+
+  const cancelAndErase = () => {
+    chrome.downloads.cancel(item.id, () => {
+      if (chrome.runtime.lastError) {
+        console.warn(
+          "[IDMFree] Failed to cancel browser download",
+          chrome.runtime.lastError
+        );
+      } else {
+        console.debug("[IDMFree] Browser download canceled", item.id);
+      }
+
+      chrome.downloads.erase({ id: item.id }, () => {
+        if (chrome.runtime.lastError) {
+          console.warn(
+            "[IDMFree] Failed to erase browser download entry",
+            chrome.runtime.lastError
+          );
+        } else {
+          console.debug("[IDMFree] Browser download entry removed", item.id);
+        }
+      });
+    });
+  };
+
+  cancelAndErase();
+
+  let fallbackTriggered = false;
+  const triggerBrowserFallback = (reason) => {
+    if (fallbackTriggered) {
+      return;
+    }
+    fallbackTriggered = true;
+
+    console.warn("[IDMFree] Falling back to browser download", reason);
+
+    const options = { url: item.url };
+    if (item.filename && item.filename.trim().length > 0) {
+      options.filename = item.filename;
+    } else if (normalizedFileName) {
+      options.filename = normalizedFileName;
+    }
+
+    chrome.downloads.download(options, (newId) => {
+      if (chrome.runtime.lastError) {
+        console.error(
+          "[IDMFree] Failed to restart browser download",
+          chrome.runtime.lastError
+        );
+      } else {
+        console.debug("[IDMFree] Browser download resumed", newId);
+      }
+    });
+  };
 
   fetch("http://127.0.0.1:5454/api/downloads", {
     method: "POST",
@@ -88,35 +171,11 @@ chrome.downloads.onCreated.addListener((item) => {
     .then((res) => {
       if (res.ok) {
         console.debug("[IDMFree] Download queued in IDMFree", item.id);
-        chrome.downloads.cancel(item.id, () => {
-          if (chrome.runtime.lastError) {
-            console.warn(
-              "[IDMFree] Failed to cancel browser download",
-              chrome.runtime.lastError
-            );
-          }
-
-          chrome.downloads.erase({ id: item.id }, () => {
-            if (chrome.runtime.lastError) {
-              console.warn(
-                "[IDMFree] Failed to erase browser download entry",
-                chrome.runtime.lastError
-              );
-            }
-          });
-        });
       } else {
-        console.error(
-          "[IDMFree] IDMFree bridge error, falling back to normal browser download",
-          res.status
-        );
+        triggerBrowserFallback(`status ${res.status}`);
       }
     })
     .catch((err) => {
-      console.error(
-        "[IDMFree] IDMFree bridge error, falling back to normal browser download",
-        err
-      );
-      // On error, do NOT cancel the browser download.
+      triggerBrowserFallback(err);
     });
 });

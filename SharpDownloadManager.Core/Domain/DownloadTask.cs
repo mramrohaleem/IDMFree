@@ -31,6 +31,8 @@ public class DownloadTask
 
     public long BytesWritten { get; set; }
 
+    public long? ActualFileSize { get; set; }
+
     public int ConnectionsCount { get; set; }
 
     public List<Chunk> Chunks { get; set; } = new List<Chunk>();

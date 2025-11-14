@@ -15,7 +15,7 @@ public sealed class NullablePercentageConverter : IValueConverter
             return clamped.ToString("0.0", culture) + "%";
         }
 
-        return "—";
+        return "--";
     }
 
     public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture) => Binding.DoNothing;

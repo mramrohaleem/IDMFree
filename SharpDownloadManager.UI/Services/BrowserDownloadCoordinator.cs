@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
@@ -7,6 +8,7 @@ using System.Windows;
 using System.Windows.Threading;
 using SharpDownloadManager.Core.Abstractions;
 using SharpDownloadManager.Core.Domain;
+using SharpDownloadManager.Core.Utilities;
 using SharpDownloadManager.Infrastructure.Logging;
 using SharpDownloadManager.UI.Views;
 using Application = System.Windows.Application;
@@ -105,9 +107,8 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
         BringWindowToFront(owner);
 
         var defaultFolder = _getDefaultFolder();
-        var suggestedFileName = string.IsNullOrWhiteSpace(request.FileName)
-            ? ExtractFileNameFromUrl(request.Url)
-            : request.FileName;
+        var suggestedFileName = FileNameHelper.NormalizeFileName(request.FileName)
+            ?? ExtractFileNameFromUrl(request.Url);
 
         var dialog = new NewDownloadDialog();
         dialog.Owner = owner;
@@ -155,13 +156,8 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
         try
         {
             var uri = new Uri(url);
-            var fileName = System.IO.Path.GetFileName(uri.AbsolutePath);
-            if (string.IsNullOrWhiteSpace(fileName))
-            {
-                return "download.bin";
-            }
-
-            return fileName;
+            var fileName = FileNameHelper.NormalizeFileName(Path.GetFileName(uri.AbsolutePath));
+            return string.IsNullOrWhiteSpace(fileName) ? "download.bin" : fileName;
         }
         catch
         {

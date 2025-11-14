@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using SharpDownloadManager.Core.Abstractions;
+using SharpDownloadManager.Core.Utilities;
 using SharpDownloadManager.Infrastructure.Logging;
 
 namespace SharpDownloadManager.UI.Services;
@@ -198,6 +199,8 @@ public sealed class BrowserBridgeServer : IDisposable
                     eventCode: "BROWSER_API_REQUEST_INVALID");
                 return;
             }
+
+            payload.FileName = FileNameHelper.NormalizeFileName(payload.FileName);
 
             _logger.Info(
                 "Browser API request received.",
