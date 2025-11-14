@@ -25,7 +25,7 @@ internal static class BrowserDownloadSafetyInspector
             {
                 return new BrowserDownloadPromptMessage(
                     "The current file name looks temporary. IDMFree will update it once the server reveals the actual name.",
-                    isWarning: false);
+                    IsWarning: false);
             }
 
             return null;

@@ -33,11 +33,11 @@ public partial class NewDownloadDialog : Window
             PromptBorder.Visibility = Visibility.Visible;
             PromptTextBlock.Text = promptMessage.Message;
             PromptTextBlock.Foreground = promptMessage.IsWarning
-                ? new SolidColorBrush(Colors.OrangeRed)
-                : new SolidColorBrush(Color.FromRgb(33, 150, 243));
+                ? new SolidColorBrush(System.Windows.Media.Colors.OrangeRed)
+                : new SolidColorBrush(System.Windows.Media.Color.FromRgb(33, 150, 243));
             PromptBorder.Background = promptMessage.IsWarning
-                ? new SolidColorBrush(Color.FromArgb(24, 255, 69, 0))
-                : new SolidColorBrush(Color.FromArgb(18, 33, 150, 243));
+                ? new SolidColorBrush(System.Windows.Media.Color.FromArgb(24, 255, 69, 0))
+                : new SolidColorBrush(System.Windows.Media.Color.FromArgb(18, 33, 150, 243));
         }
         else
         {
