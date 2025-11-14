@@ -16,6 +16,7 @@ public class DownloadItemViewModel : INotifyPropertyChanged
     private double? _progressPercent;
     private string _sizeText = string.Empty;
     private string _speedText = string.Empty;
+    private string _averageSpeedText = string.Empty;
     private string _etaText = string.Empty;
     private string _modeText = string.Empty;
     private string _errorText = string.Empty;
@@ -77,6 +78,12 @@ public class DownloadItemViewModel : INotifyPropertyChanged
         set => SetProperty(ref _speedText, value);
     }
 
+    public string AverageSpeedText
+    {
+        get => _averageSpeedText;
+        set => SetProperty(ref _averageSpeedText, value);
+    }
+
     public string EtaText
     {
         get => _etaText;
@@ -131,9 +138,27 @@ public class DownloadItemViewModel : INotifyPropertyChanged
         var isSameTask = _id == task.Id;
 
         Id = task.Id;
-        Name = string.IsNullOrWhiteSpace(task.FileName) ? task.Url : task.FileName;
+        var displayName = string.IsNullOrWhiteSpace(task.FinalFileName)
+            ? (string.IsNullOrWhiteSpace(task.FileName) ? task.Url : task.FileName)
+            : task.FinalFileName;
+        Name = displayName;
         Status = task.Status;
-        if (task.Status == DownloadStatus.Error && task.LastErrorCode != DownloadErrorCode.None)
+        if (task.Status == DownloadStatus.Throttled || task.HttpStatusCategory == HttpStatusCategory.TooManyRequests)
+        {
+            var message = "Paused (server said: Too Many Requests";
+            if (task.NextRetryUtc.HasValue)
+            {
+                var retryIn = task.NextRetryUtc.Value - DateTimeOffset.UtcNow;
+                if (retryIn > TimeSpan.Zero)
+                {
+                    message += $", retrying in {FormatEta(retryIn)}";
+                }
+            }
+
+            message += ", try again after a while)";
+            StatusText = message;
+        }
+        else if (task.Status == DownloadStatus.Error && task.LastErrorCode != DownloadErrorCode.None)
         {
             StatusText = $"{task.Status} ({task.LastErrorCode})";
         }
@@ -189,6 +214,9 @@ public class DownloadItemViewModel : INotifyPropertyChanged
         ProgressPercent = progressPercent.HasValue ? Math.Clamp(progressPercent.Value, 0d, 100d) : null;
         IsProgressIndeterminate = task.Status == DownloadStatus.Downloading && (!progressTotal.HasValue || progressTotal.Value <= 0);
         SizeText = $"{FormatBytes(writtenBytes)} / {FormatTotal(displayTotal)}";
+
+        var averageSpeed = task.GetAverageSpeedBytesPerSecond();
+        AverageSpeedText = averageSpeed > 0 ? FormatSpeed(averageSpeed) : string.Empty;
 
         var nowUtc = DateTime.UtcNow;
         if (!isSameTask)

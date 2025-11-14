@@ -37,6 +37,8 @@ public class MainViewModel : INotifyPropertyChanged
     private string _saveFolderPath = string.Empty;
     private DownloadItemViewModel? _selectedDownload;
     private bool _areCompletionNotificationsEnabled = true;
+    private double _globalAverageSpeedBytesPerSecond;
+    private string _globalAverageSpeedText = string.Empty;
 
     public ObservableCollection<DownloadItemViewModel> Downloads { get; }
 
@@ -92,6 +94,18 @@ public class MainViewModel : INotifyPropertyChanged
     {
         get => _areCompletionNotificationsEnabled;
         set => SetProperty(ref _areCompletionNotificationsEnabled, value);
+    }
+
+    public double GlobalAverageSpeedBytesPerSecond
+    {
+        get => _globalAverageSpeedBytesPerSecond;
+        private set => SetProperty(ref _globalAverageSpeedBytesPerSecond, value);
+    }
+
+    public string GlobalAverageSpeedText
+    {
+        get => _globalAverageSpeedText;
+        private set => SetProperty(ref _globalAverageSpeedText, value);
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -439,6 +453,7 @@ public class MainViewModel : INotifyPropertyChanged
             }
 
             UpdateCommandStates();
+            UpdateGlobalAverageSpeed(snapshot);
         }
         catch (Exception ex)
         {
@@ -455,6 +470,41 @@ public class MainViewModel : INotifyPropertyChanged
         _openFolderCommand.RaiseCanExecuteChanged();
     }
 
+    private void UpdateGlobalAverageSpeed(IEnumerable<DownloadTask> tasks)
+    {
+        if (tasks is null)
+        {
+            GlobalAverageSpeedBytesPerSecond = 0;
+            GlobalAverageSpeedText = string.Empty;
+            return;
+        }
+
+        double totalBytes = 0;
+        double totalSeconds = 0;
+        var now = DateTimeOffset.UtcNow;
+
+        foreach (var task in tasks)
+        {
+            if (task.Status != DownloadStatus.Downloading)
+            {
+                continue;
+            }
+
+            var activeSeconds = task.GetActiveSeconds(now);
+            if (activeSeconds <= 0)
+            {
+                continue;
+            }
+
+            totalBytes += task.TotalDownloadedBytes;
+            totalSeconds += activeSeconds;
+        }
+
+        var average = totalSeconds > 0 ? totalBytes / totalSeconds : 0;
+        GlobalAverageSpeedBytesPerSecond = average;
+        GlobalAverageSpeedText = average > 0 ? FormatSpeed(average) : string.Empty;
+    }
+
     protected bool SetProperty<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
     {
         if (EqualityComparer<T>.Default.Equals(field, value))
@@ -469,6 +519,26 @@ public class MainViewModel : INotifyPropertyChanged
 
     protected virtual void OnPropertyChanged(string? propertyName) =>
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+
+    private static string FormatSpeed(double bytesPerSecond)
+    {
+        if (bytesPerSecond <= 0)
+        {
+            return string.Empty;
+        }
+
+        string[] units = { "B/s", "KB/s", "MB/s", "GB/s" };
+        double value = bytesPerSecond;
+        int unitIndex = 0;
+
+        while (value >= 1024 && unitIndex < units.Length - 1)
+        {
+            value /= 1024;
+            unitIndex++;
+        }
+
+        return $"{value:0.0} {units[unitIndex]}";
+    }
 
     private sealed class AsyncCommand : ICommand
     {

@@ -224,7 +224,7 @@ public sealed class BrowserBridgeServer : IDisposable
                         new
                         {
                             handled = result.Handled,
-                            status = "queued",
+                            status = result.Status,
                             id = result.Task.Id,
                             statusCode = (int)result.StatusCode
                         },
@@ -246,6 +246,7 @@ public sealed class BrowserBridgeServer : IDisposable
                         new
                         {
                             handled = result.Handled,
+                            status = result.Status,
                             error = result.Error ?? "User declined the download.",
                             statusCode = (int)result.StatusCode
                         },
@@ -264,6 +265,7 @@ public sealed class BrowserBridgeServer : IDisposable
                     new
                     {
                         handled = result.Handled,
+                        status = result.Status,
                         error = result.Error ?? "Failed to process download request.",
                         statusCode = (int)result.StatusCode
                     },

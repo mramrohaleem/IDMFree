@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS Downloads (
     Id TEXT PRIMARY KEY,
     Url TEXT NOT NULL,
     FileName TEXT NOT NULL,
+    FinalFileName TEXT NOT NULL,
     SavePath TEXT NOT NULL,
     TempFolderPath TEXT NOT NULL,
     Status INTEGER NOT NULL,
@@ -60,7 +61,14 @@ CREATE TABLE IF NOT EXISTS Downloads (
     ConnectionsCount INTEGER NOT NULL,
     LastErrorCode INTEGER NOT NULL,
     LastErrorMessage TEXT NULL,
-    RequestHeaders TEXT NULL
+    RequestHeaders TEXT NULL,
+    TotalActiveSeconds REAL NOT NULL DEFAULT 0,
+    LastResumedAt TEXT NULL,
+    HttpStatusCategory INTEGER NOT NULL DEFAULT 0,
+    TooManyRequestsRetryCount INTEGER NOT NULL DEFAULT 0,
+    RetryBackoffSeconds REAL NOT NULL DEFAULT 0,
+    NextRetryUtc TEXT NULL,
+    MaxParallelConnections INTEGER NULL
 );";
 
             var createChunks = @"
@@ -114,6 +122,134 @@ CREATE TABLE IF NOT EXISTS Chunks (
                     cancellationToken)
                 .ConfigureAwait(false);
 
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "FinalFileName",
+                    "TEXT NOT NULL DEFAULT ''",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "TotalActiveSeconds",
+                    "REAL NOT NULL DEFAULT 0",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "LastResumedAt",
+                    "TEXT NULL",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "HttpStatusCategory",
+                    "INTEGER NOT NULL DEFAULT 0",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "TooManyRequestsRetryCount",
+                    "INTEGER NOT NULL DEFAULT 0",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "RetryBackoffSeconds",
+                    "REAL NOT NULL DEFAULT 0",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "NextRetryUtc",
+                    "TEXT NULL",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "MaxParallelConnections",
+                    "INTEGER NULL",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "FinalFileName",
+                    "TEXT NOT NULL DEFAULT ''",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "TotalActiveSeconds",
+                    "REAL NOT NULL DEFAULT 0",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "LastResumedAt",
+                    "TEXT NULL",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "HttpStatusCategory",
+                    "INTEGER NOT NULL DEFAULT 0",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "TooManyRequestsRetryCount",
+                    "INTEGER NOT NULL DEFAULT 0",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "RetryBackoffSeconds",
+                    "REAL NOT NULL DEFAULT 0",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "NextRetryUtc",
+                    "TEXT NULL",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "MaxParallelConnections",
+                    "INTEGER NULL",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
             _logger.Info("SQLite state store initialized successfully.", eventCode: "STATE_STORE_INIT", context: new { DbPath = _dbPath });
         }
         catch (SqliteException ex) when (IsCorruptionError(ex))
@@ -133,6 +269,7 @@ CREATE TABLE IF NOT EXISTS Downloads (
     Id TEXT PRIMARY KEY,
     Url TEXT NOT NULL,
     FileName TEXT NOT NULL,
+    FinalFileName TEXT NOT NULL,
     SavePath TEXT NOT NULL,
     TempFolderPath TEXT NOT NULL,
     Status INTEGER NOT NULL,
@@ -147,7 +284,14 @@ CREATE TABLE IF NOT EXISTS Downloads (
     ConnectionsCount INTEGER NOT NULL,
     LastErrorCode INTEGER NOT NULL,
     LastErrorMessage TEXT NULL,
-    RequestHeaders TEXT NULL
+    RequestHeaders TEXT NULL,
+    TotalActiveSeconds REAL NOT NULL DEFAULT 0,
+    LastResumedAt TEXT NULL,
+    HttpStatusCategory INTEGER NOT NULL DEFAULT 0,
+    TooManyRequestsRetryCount INTEGER NOT NULL DEFAULT 0,
+    RetryBackoffSeconds REAL NOT NULL DEFAULT 0,
+    NextRetryUtc TEXT NULL,
+    MaxParallelConnections INTEGER NULL
 );";
                 await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
@@ -219,23 +363,28 @@ CREATE TABLE IF NOT EXISTS Chunks (
                 cmd.Transaction = transaction;
                 cmd.CommandText = @"
 INSERT INTO Downloads (
-    Id, Url, FileName, SavePath, TempFolderPath,
+    Id, Url, FileName, FinalFileName, SavePath, TempFolderPath,
     Status, Mode, ContentLength, SupportsRange,
     ETag, LastModified,
     TotalDownloadedBytes, BytesWritten, ActualFileSize, ConnectionsCount,
     LastErrorCode, LastErrorMessage,
-    RequestHeaders
+    RequestHeaders,
+    TotalActiveSeconds, LastResumedAt, HttpStatusCategory,
+    TooManyRequestsRetryCount, RetryBackoffSeconds, NextRetryUtc, MaxParallelConnections
 ) VALUES (
-    $Id, $Url, $FileName, $SavePath, $TempFolderPath,
+    $Id, $Url, $FileName, $FinalFileName, $SavePath, $TempFolderPath,
     $Status, $Mode, $ContentLength, $SupportsRange,
     $ETag, $LastModified,
     $TotalDownloadedBytes, $BytesWritten, $ActualFileSize, $ConnectionsCount,
     $LastErrorCode, $LastErrorMessage,
-    $RequestHeaders
+    $RequestHeaders,
+    $TotalActiveSeconds, $LastResumedAt, $HttpStatusCategory,
+    $TooManyRequestsRetryCount, $RetryBackoffSeconds, $NextRetryUtc, $MaxParallelConnections
 )
 ON CONFLICT(Id) DO UPDATE SET
     Url = excluded.Url,
     FileName = excluded.FileName,
+    FinalFileName = excluded.FinalFileName,
     SavePath = excluded.SavePath,
     TempFolderPath = excluded.TempFolderPath,
     Status = excluded.Status,
@@ -250,14 +399,25 @@ ON CONFLICT(Id) DO UPDATE SET
     ConnectionsCount = excluded.ConnectionsCount,
     LastErrorCode = excluded.LastErrorCode,
     LastErrorMessage = excluded.LastErrorMessage,
-    RequestHeaders = excluded.RequestHeaders;
+    RequestHeaders = excluded.RequestHeaders,
+    TotalActiveSeconds = excluded.TotalActiveSeconds,
+    LastResumedAt = excluded.LastResumedAt,
+    HttpStatusCategory = excluded.HttpStatusCategory,
+    TooManyRequestsRetryCount = excluded.TooManyRequestsRetryCount,
+    RetryBackoffSeconds = excluded.RetryBackoffSeconds,
+    NextRetryUtc = excluded.NextRetryUtc,
+    MaxParallelConnections = excluded.MaxParallelConnections;
 ";
 
                 cmd.Parameters.AddWithValue("$Id", task.Id.ToString());
                 cmd.Parameters.AddWithValue("$Url", task.Url);
                 cmd.Parameters.AddWithValue("$FileName", task.FileName);
+                var finalFileName = string.IsNullOrWhiteSpace(task.FinalFileName)
+                    ? task.FileName
+                    : task.FinalFileName;
+                cmd.Parameters.AddWithValue("$FinalFileName", finalFileName);
                 cmd.Parameters.AddWithValue("$SavePath", task.SavePath);
-                cmd.Parameters.AddWithValue("$TempFolderPath", task.TempFolderPath);
+                cmd.Parameters.AddWithValue("$TempFolderPath", task.TempChunkFolderPath);
                 cmd.Parameters.AddWithValue("$Status", (int)task.Status);
                 cmd.Parameters.AddWithValue("$Mode", (int)task.Mode);
                 if (task.ContentLength.HasValue)
@@ -278,6 +438,20 @@ ON CONFLICT(Id) DO UPDATE SET
                 cmd.Parameters.AddWithValue("$LastErrorMessage", (object?)task.LastErrorMessage ?? DBNull.Value);
                 var headersJson = SerializeHeaders(task.RequestHeaders);
                 cmd.Parameters.AddWithValue("$RequestHeaders", (object?)headersJson ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$TotalActiveSeconds", task.TotalActiveTime.TotalSeconds);
+                cmd.Parameters.AddWithValue("$LastResumedAt", task.LastResumedAt?.ToString("o") ?? (object)DBNull.Value);
+                cmd.Parameters.AddWithValue("$HttpStatusCategory", (int)task.HttpStatusCategory);
+                cmd.Parameters.AddWithValue("$TooManyRequestsRetryCount", task.TooManyRequestsRetryCount);
+                cmd.Parameters.AddWithValue("$RetryBackoffSeconds", task.RetryBackoff.TotalSeconds);
+                cmd.Parameters.AddWithValue("$NextRetryUtc", task.NextRetryUtc?.ToString("o") ?? (object)DBNull.Value);
+                if (task.MaxParallelConnections.HasValue)
+                {
+                    cmd.Parameters.AddWithValue("$MaxParallelConnections", task.MaxParallelConnections.Value);
+                }
+                else
+                {
+                    cmd.Parameters.AddWithValue("$MaxParallelConnections", DBNull.Value);
+                }
 
                 await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
@@ -367,8 +541,13 @@ INSERT INTO Chunks (
                         Id = id,
                         Url = reader.GetString(reader.GetOrdinal("Url")),
                         FileName = reader.GetString(reader.GetOrdinal("FileName")),
+                        FinalFileName = reader.IsDBNull(reader.GetOrdinal("FinalFileName"))
+                            ? reader.GetString(reader.GetOrdinal("FileName"))
+                            : (string.IsNullOrWhiteSpace(reader.GetString(reader.GetOrdinal("FinalFileName")))
+                                ? reader.GetString(reader.GetOrdinal("FileName"))
+                                : reader.GetString(reader.GetOrdinal("FinalFileName"))),
                         SavePath = reader.GetString(reader.GetOrdinal("SavePath")),
-                        TempFolderPath = reader.GetString(reader.GetOrdinal("TempFolderPath")),
+                        TempChunkFolderPath = reader.GetString(reader.GetOrdinal("TempFolderPath")),
                         Status = (DownloadStatus)reader.GetInt32(reader.GetOrdinal("Status")),
                         Mode = (DownloadMode)reader.GetInt32(reader.GetOrdinal("Mode")),
                         ContentLength = reader.IsDBNull(reader.GetOrdinal("ContentLength"))
@@ -378,9 +557,6 @@ INSERT INTO Chunks (
                         ETag = reader.IsDBNull(reader.GetOrdinal("ETag"))
                             ? null
                             : reader.GetString(reader.GetOrdinal("ETag")),
-                        LastModified = reader.IsDBNull(reader.GetOrdinal("LastModified"))
-                            ? null
-                            : DateTimeOffset.Parse(reader.GetString(reader.GetOrdinal("LastModified"))),
                         TotalDownloadedBytes = reader.GetInt64(reader.GetOrdinal("TotalDownloadedBytes")),
                         BytesWritten = reader.GetInt64(reader.GetOrdinal("BytesWritten")),
                         ActualFileSize = reader.IsDBNull(reader.GetOrdinal("ActualFileSize"))
@@ -390,8 +566,55 @@ INSERT INTO Chunks (
                         LastErrorCode = (DownloadErrorCode)reader.GetInt32(reader.GetOrdinal("LastErrorCode")),
                         LastErrorMessage = reader.IsDBNull(reader.GetOrdinal("LastErrorMessage"))
                             ? null
-                            : reader.GetString(reader.GetOrdinal("LastErrorMessage"))
+                            : reader.GetString(reader.GetOrdinal("LastErrorMessage")),
+                        HttpStatusCategory = reader.IsDBNull(reader.GetOrdinal("HttpStatusCategory"))
+                            ? HttpStatusCategory.None
+                            : (HttpStatusCategory)reader.GetInt32(reader.GetOrdinal("HttpStatusCategory")),
+                        TooManyRequestsRetryCount = reader.IsDBNull(reader.GetOrdinal("TooManyRequestsRetryCount"))
+                            ? 0
+                            : reader.GetInt32(reader.GetOrdinal("TooManyRequestsRetryCount"))
                     };
+
+                    if (!reader.IsDBNull(reader.GetOrdinal("LastModified")))
+                    {
+                        if (DateTimeOffset.TryParse(reader.GetString(reader.GetOrdinal("LastModified")), out var lastModified))
+                        {
+                            task.LastModified = lastModified;
+                        }
+                    }
+
+                    if (!reader.IsDBNull(reader.GetOrdinal("TotalActiveSeconds")))
+                    {
+                        var seconds = reader.GetDouble(reader.GetOrdinal("TotalActiveSeconds"));
+                        task.TotalActiveTime = TimeSpan.FromSeconds(seconds);
+                    }
+
+                    if (!reader.IsDBNull(reader.GetOrdinal("LastResumedAt")))
+                    {
+                        if (DateTimeOffset.TryParse(reader.GetString(reader.GetOrdinal("LastResumedAt")), out var lastResumed)))
+                        {
+                            task.LastResumedAt = lastResumed;
+                        }
+                    }
+
+                    if (!reader.IsDBNull(reader.GetOrdinal("RetryBackoffSeconds")))
+                    {
+                        var backoffSeconds = reader.GetDouble(reader.GetOrdinal("RetryBackoffSeconds"));
+                        task.RetryBackoff = TimeSpan.FromSeconds(backoffSeconds);
+                    }
+
+                    if (!reader.IsDBNull(reader.GetOrdinal("NextRetryUtc")))
+                    {
+                        if (DateTimeOffset.TryParse(reader.GetString(reader.GetOrdinal("NextRetryUtc")), out var nextRetry)))
+                        {
+                            task.NextRetryUtc = nextRetry;
+                        }
+                    }
+
+                    if (!reader.IsDBNull(reader.GetOrdinal("MaxParallelConnections")))
+                    {
+                        task.MaxParallelConnections = reader.GetInt32(reader.GetOrdinal("MaxParallelConnections"));
+                    }
 
                     if (!reader.IsDBNull(reader.GetOrdinal("RequestHeaders")))
                     {

@@ -2,6 +2,9 @@ const MAX_RECENT_ENTRIES = 200;
 const MAX_ENTRY_AGE_MS = 5 * 60 * 1000; // 5 minutes
 
 const recentRequests = new Map();
+const fallbackHosts = new Map();
+
+const FALLBACK_TTL_MS = 3 * 60 * 1000; // 3 minutes
 
 function pruneOldEntries() {
   const now = Date.now();
@@ -23,6 +26,58 @@ function pruneOldEntries() {
       break;
     }
     recentRequests.delete(oldestKey);
+  }
+
+  pruneFallbackHosts();
+}
+
+function pruneFallbackHosts() {
+  const now = Date.now();
+  for (const [host, timestamp] of Array.from(fallbackHosts.entries())) {
+    if (!timestamp || now - timestamp > FALLBACK_TTL_MS) {
+      fallbackHosts.delete(host);
+    }
+  }
+}
+
+function rememberFallbackHost(url) {
+  if (!url) {
+    return;
+  }
+
+  try {
+    const host = new URL(url).host;
+    if (!host) {
+      return;
+    }
+    fallbackHosts.set(host, Date.now());
+  } catch (err) {
+    console.debug("[IDMFree] Unable to remember fallback host", url, err);
+  }
+}
+
+function shouldBypassBridge(url) {
+  if (!url) {
+    return false;
+  }
+
+  pruneFallbackHosts();
+
+  try {
+    const host = new URL(url).host;
+    if (!host) {
+      return false;
+    }
+
+    const timestamp = fallbackHosts.get(host);
+    if (!timestamp) {
+      return false;
+    }
+
+    return Date.now() - timestamp < FALLBACK_TTL_MS;
+  } catch (err) {
+    console.debug("[IDMFree] Failed to evaluate fallback host", err);
+    return false;
   }
 }
 
@@ -158,6 +213,11 @@ chrome.downloads.onCreated.addListener(async (item) => {
     recentRequests.delete(item.url);
   }
 
+  if (shouldBypassBridge(item.url)) {
+    console.debug("[IDMFree] Skipping bridge for", item.url, "due to recent fallback");
+    return;
+  }
+
   console.debug(
     "[IDMFree] Download detected",
     item.id,
@@ -199,7 +259,12 @@ chrome.downloads.onCreated.addListener(async (item) => {
       console.warn("[IDMFree] Failed to parse bridge response", jsonError);
     }
 
-    handledByManager = Boolean(body && body.handled === true);
+    const bridgeStatus = body && typeof body.status === "string" ? body.status : null;
+    handledByManager = bridgeStatus === "accepted";
+
+    if (bridgeStatus === "fallback") {
+      rememberFallbackHost(item.url);
+    }
 
     if (handledByManager) {
       await cancelAndErase(item.id);
@@ -208,13 +273,19 @@ chrome.downloads.onCreated.addListener(async (item) => {
     }
 
     const statusCode = body && typeof body.statusCode === "number" ? body.statusCode : response.status;
-    if (body && body.error) {
+    if (bridgeStatus === "fallback") {
+      console.debug("[IDMFree] Desktop manager requested fallback", statusCode);
+    } else if (bridgeStatus === "error") {
+      console.warn("[IDMFree] Desktop manager returned error", body && body.error, statusCode);
+      rememberFallbackHost(item.url);
+    } else if (body && body.error) {
       console.warn("[IDMFree] Desktop manager declined download", body.error, statusCode);
     } else {
       console.debug("[IDMFree] Desktop manager declined download", statusCode);
     }
   } catch (err) {
     console.warn("[IDMFree] Failed to reach desktop manager", err);
+    rememberFallbackHost(item.url);
   }
 
   if (!handledByManager && wasPaused) {

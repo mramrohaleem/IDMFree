@@ -64,6 +64,23 @@
             <Button Content="Settings"
                     Margin="2"
                     Command="{Binding OpenSettingsCommand}" />
+            <Separator />
+            <TextBlock Margin="4,0,0,0"
+                       Text="{Binding GlobalAverageSpeedText, StringFormat=Average speed: {0}}">
+                <TextBlock.Style>
+                    <Style TargetType="TextBlock">
+                        <Setter Property="Visibility" Value="Visible" />
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding GlobalAverageSpeedText}" Value="">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                            </DataTrigger>
+                            <DataTrigger Binding="{Binding GlobalAverageSpeedText}" Value="{x:Null}">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </TextBlock.Style>
+            </TextBlock>
         </ToolBar>
         <Grid>
             <Grid.RowDefinitions>
@@ -110,6 +127,10 @@
                                           MinWidth="140" />
                     <DataGridTextColumn Header="Speed"
                                           Binding="{Binding SpeedText}"
+                                          Width="*"
+                                          MinWidth="110" />
+                    <DataGridTextColumn Header="Avg Speed"
+                                          Binding="{Binding AverageSpeedText}"
                                           Width="*"
                                           MinWidth="110" />
                     <DataGridTextColumn Header="ETA"
@@ -169,6 +190,21 @@
                             <TextBlock Text="{Binding SelectedDownload.StatusText}" />
                             <TextBlock Text="{Binding SelectedDownload.SizeText}" />
                             <TextBlock Text="{Binding SelectedDownload.SpeedText}" />
+                            <TextBlock Text="{Binding SelectedDownload.AverageSpeedText, StringFormat=Average speed: {0}}">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="Visibility" Value="Visible" />
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding SelectedDownload.AverageSpeedText}" Value="">
+                                                <Setter Property="Visibility" Value="Collapsed" />
+                                            </DataTrigger>
+                                            <DataTrigger Binding="{Binding SelectedDownload.AverageSpeedText}" Value="{x:Null}">
+                                                <Setter Property="Visibility" Value="Collapsed" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
                             <TextBlock Text="{Binding SelectedDownload.EtaText}" />
                             <TextBlock Text="{Binding SelectedDownload.ModeText}" />
                         </StackPanel>
