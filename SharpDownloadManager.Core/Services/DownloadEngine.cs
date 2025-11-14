@@ -312,6 +312,8 @@ public class DownloadEngine : IDownloadEngine
     {
         _logger.Info("Starting download.", downloadId: task.Id, eventCode: "DOWNLOAD_RUN_START");
 
+        var taskUri = new Uri(task.Url);
+
         try
         {
             task.LastErrorCode = DownloadErrorCode.None;
@@ -324,8 +326,6 @@ public class DownloadEngine : IDownloadEngine
 
             Directory.CreateDirectory(task.TempChunkFolderPath);
             TryEnsureChunkFolderHidden(task.TempChunkFolderPath);
-
-            var taskUri = new Uri(task.Url);
 
             if (task.Chunks.Count == 0)
             {
