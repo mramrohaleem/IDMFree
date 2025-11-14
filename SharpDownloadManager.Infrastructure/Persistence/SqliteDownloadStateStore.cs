@@ -591,7 +591,7 @@ INSERT INTO Chunks (
 
                     if (!reader.IsDBNull(reader.GetOrdinal("LastResumedAt")))
                     {
-                        if (DateTimeOffset.TryParse(reader.GetString(reader.GetOrdinal("LastResumedAt")), out var lastResumed)))
+                        if (DateTimeOffset.TryParse(reader.GetString(reader.GetOrdinal("LastResumedAt")), out var lastResumed))
                         {
                             task.LastResumedAt = lastResumed;
                         }
@@ -605,7 +605,7 @@ INSERT INTO Chunks (
 
                     if (!reader.IsDBNull(reader.GetOrdinal("NextRetryUtc")))
                     {
-                        if (DateTimeOffset.TryParse(reader.GetString(reader.GetOrdinal("NextRetryUtc")), out var nextRetry)))
+                        if (DateTimeOffset.TryParse(reader.GetString(reader.GetOrdinal("NextRetryUtc")), out var nextRetry))
                         {
                             task.NextRetryUtc = nextRetry;
                         }
