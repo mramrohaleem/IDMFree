@@ -227,6 +227,7 @@ public sealed class NetworkClient : INetworkClient
                 .ConfigureAwait(false);
 
             var buffer = new byte[81_920];
+            long totalBytesRead = 0;
 
             var firstRead = await responseStream
                 .ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)
@@ -305,6 +306,7 @@ public sealed class NetworkClient : INetworkClient
                     .ConfigureAwait(false);
 
                 progress?.Report(firstRead);
+                totalBytesRead += firstRead;
             }
 
             while (true)
@@ -323,12 +325,30 @@ public sealed class NetworkClient : INetworkClient
                     .ConfigureAwait(false);
 
                 progress?.Report(read);
+                totalBytesRead += read;
             }
 
             _logger.Info(
                 "Completed range download",
                 eventCode: "DOWNLOAD_RANGE_SUCCESS",
                 context: ctx);
+
+            if (!from.HasValue && !to.HasValue && totalBytesRead > 0)
+            {
+                if (!metadata.ResourceLength.HasValue || metadata.ResourceLength.Value <= 0)
+                {
+                    var responseLength = metadata.ResponseContentLength;
+                    var resolvedResponseLength = responseLength.HasValue && responseLength.Value > 0
+                        ? responseLength.Value
+                        : totalBytesRead;
+
+                    metadata = metadata with
+                    {
+                        ResourceLength = totalBytesRead,
+                        ResponseContentLength = resolvedResponseLength
+                    };
+                }
+            }
 
             return metadata;
         }
@@ -837,7 +857,7 @@ public sealed class NetworkClient : INetworkClient
             response.Dispose();
 
             var getRequest = new HttpRequestMessage(HttpMethod.Get, uri);
-            ApplyCommonHeaders(getRequest, uri);
+            ApplyCommonHeaders(getRequest, uri, extraHeaders);
             ApplyExtraHeaders(getRequest, extraHeaders);
 
             return await _client

@@ -1219,6 +1219,23 @@ public class DownloadEngine : IDownloadEngine
                 }
             }
         }
+        else if (metadata.ResponseContentLength.HasValue)
+        {
+            var responseLength = metadata.ResponseContentLength.Value;
+            if (responseLength > 0 && (!task.ContentLength.HasValue || task.ContentLength.Value != responseLength))
+            {
+                task.ContentLength = responseLength;
+
+                if (task.Chunks.Count == 1)
+                {
+                    var singleChunk = task.Chunks[0];
+                    if (singleChunk.EndByte < 0)
+                    {
+                        singleChunk.EndByte = responseLength > 0 ? responseLength - 1 : -1;
+                    }
+                }
+            }
+        }
 
         if (metadata.SupportsRange && !task.SupportsRange)
         {
@@ -1397,10 +1414,19 @@ public class DownloadEngine : IDownloadEngine
         string? contentType,
         Uri resourceUri)
     {
-        var candidate =
-            FileNameHelper.NormalizeFileName(contentDispositionFileName) ??
-            FileNameHelper.NormalizeFileName(browserFileName) ??
-            FileNameHelper.NormalizeFileName(Path.GetFileName(resourceUri.AbsolutePath));
+        var normalizedDisposition = FileNameHelper.NormalizeFileName(contentDispositionFileName);
+        var normalizedBrowser = FileNameHelper.NormalizeFileName(browserFileName);
+        var normalizedFromUrl = FileNameHelper.TryExtractFileNameFromUrl(resourceUri);
+
+        var candidate = normalizedDisposition ?? normalizedBrowser;
+
+        if (FileNameHelper.LooksLikePlaceholderName(candidate) &&
+            !FileNameHelper.LooksLikePlaceholderName(normalizedFromUrl))
+        {
+            candidate = normalizedFromUrl;
+        }
+
+        candidate ??= normalizedFromUrl;
 
         if (string.IsNullOrWhiteSpace(candidate))
         {

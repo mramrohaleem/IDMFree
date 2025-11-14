@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Threading;
@@ -143,12 +142,32 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
         BringWindowToFront(owner);
 
         var defaultFolder = _getDefaultFolder();
-        var suggestedFileName = FileNameHelper.NormalizeFileName(request.FileName)
-            ?? ExtractFileNameFromUrl(request.Url);
+
+        Uri? requestUri = null;
+        if (Uri.TryCreate(request.Url, UriKind.Absolute, out var parsedUri))
+        {
+            requestUri = parsedUri;
+        }
+
+        var normalizedSuggested = FileNameHelper.NormalizeFileName(request.FileName);
+        var fallbackFromUrl = FileNameHelper.TryExtractFileNameFromUrl(requestUri);
+        string? suggestedFileName = normalizedSuggested;
+
+        if (FileNameHelper.LooksLikePlaceholderName(suggestedFileName) &&
+            !FileNameHelper.LooksLikePlaceholderName(fallbackFromUrl))
+        {
+            suggestedFileName = fallbackFromUrl;
+        }
+
+        suggestedFileName ??= fallbackFromUrl;
+        suggestedFileName ??= ExtractFileNameFromUrl(request.Url);
+
+        var promptMessage = BrowserDownloadSafetyInspector
+            .Analyze(requestUri, suggestedFileName);
 
         var dialog = new NewDownloadDialog();
         dialog.Owner = owner;
-        dialog.Initialize(request.Url, suggestedFileName, defaultFolder);
+        dialog.Initialize(request.Url, suggestedFileName, defaultFolder, promptMessage);
 
         _logger.Info(
             "Browser download dialog shown.",
@@ -192,7 +211,7 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
         try
         {
             var uri = new Uri(url);
-            var fileName = FileNameHelper.NormalizeFileName(Path.GetFileName(uri.AbsolutePath));
+            var fileName = FileNameHelper.TryExtractFileNameFromUrl(uri);
             return string.IsNullOrWhiteSpace(fileName) ? "download.bin" : fileName;
         }
         catch
