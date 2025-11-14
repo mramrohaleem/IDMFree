@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS Downloads (
     LastModified TEXT NULL,
     TotalDownloadedBytes INTEGER NOT NULL,
     BytesWritten INTEGER NOT NULL DEFAULT 0,
+    ActualFileSize INTEGER NULL,
     ConnectionsCount INTEGER NOT NULL,
     LastErrorCode INTEGER NOT NULL,
     LastErrorMessage TEXT NULL,
@@ -100,6 +101,14 @@ CREATE TABLE IF NOT EXISTS Chunks (
             await EnsureColumnExistsAsync(
                     connection,
                     "Downloads",
+                    "ActualFileSize",
+                    "INTEGER NULL",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
                     "RequestHeaders",
                     "TEXT NULL",
                     cancellationToken)
@@ -134,6 +143,7 @@ CREATE TABLE IF NOT EXISTS Downloads (
     LastModified TEXT NULL,
     TotalDownloadedBytes INTEGER NOT NULL,
     BytesWritten INTEGER NOT NULL DEFAULT 0,
+    ActualFileSize INTEGER NULL,
     ConnectionsCount INTEGER NOT NULL,
     LastErrorCode INTEGER NOT NULL,
     LastErrorMessage TEXT NULL,
@@ -172,6 +182,14 @@ CREATE TABLE IF NOT EXISTS Chunks (
             await EnsureColumnExistsAsync(
                     connection,
                     "Downloads",
+                    "ActualFileSize",
+                    "INTEGER NULL",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
                     "RequestHeaders",
                     "TEXT NULL",
                     cancellationToken)
@@ -204,14 +222,14 @@ INSERT INTO Downloads (
     Id, Url, FileName, SavePath, TempFolderPath,
     Status, Mode, ContentLength, SupportsRange,
     ETag, LastModified,
-    TotalDownloadedBytes, BytesWritten, ConnectionsCount,
+    TotalDownloadedBytes, BytesWritten, ActualFileSize, ConnectionsCount,
     LastErrorCode, LastErrorMessage,
     RequestHeaders
 ) VALUES (
     $Id, $Url, $FileName, $SavePath, $TempFolderPath,
     $Status, $Mode, $ContentLength, $SupportsRange,
     $ETag, $LastModified,
-    $TotalDownloadedBytes, $BytesWritten, $ConnectionsCount,
+    $TotalDownloadedBytes, $BytesWritten, $ActualFileSize, $ConnectionsCount,
     $LastErrorCode, $LastErrorMessage,
     $RequestHeaders
 )
@@ -228,6 +246,7 @@ ON CONFLICT(Id) DO UPDATE SET
     LastModified = excluded.LastModified,
     TotalDownloadedBytes = excluded.TotalDownloadedBytes,
     BytesWritten = excluded.BytesWritten,
+    ActualFileSize = excluded.ActualFileSize,
     ConnectionsCount = excluded.ConnectionsCount,
     LastErrorCode = excluded.LastErrorCode,
     LastErrorMessage = excluded.LastErrorMessage,
@@ -250,6 +269,10 @@ ON CONFLICT(Id) DO UPDATE SET
                 cmd.Parameters.AddWithValue("$LastModified", task.LastModified?.ToString("o") ?? (object)DBNull.Value);
                 cmd.Parameters.AddWithValue("$TotalDownloadedBytes", task.TotalDownloadedBytes);
                 cmd.Parameters.AddWithValue("$BytesWritten", task.BytesWritten);
+                if (task.ActualFileSize.HasValue)
+                    cmd.Parameters.AddWithValue("$ActualFileSize", task.ActualFileSize.Value);
+                else
+                    cmd.Parameters.AddWithValue("$ActualFileSize", DBNull.Value);
                 cmd.Parameters.AddWithValue("$ConnectionsCount", task.ConnectionsCount);
                 cmd.Parameters.AddWithValue("$LastErrorCode", (int)task.LastErrorCode);
                 cmd.Parameters.AddWithValue("$LastErrorMessage", (object?)task.LastErrorMessage ?? DBNull.Value);
@@ -360,6 +383,9 @@ INSERT INTO Chunks (
                             : DateTimeOffset.Parse(reader.GetString(reader.GetOrdinal("LastModified"))),
                         TotalDownloadedBytes = reader.GetInt64(reader.GetOrdinal("TotalDownloadedBytes")),
                         BytesWritten = reader.GetInt64(reader.GetOrdinal("BytesWritten")),
+                        ActualFileSize = reader.IsDBNull(reader.GetOrdinal("ActualFileSize"))
+                            ? null
+                            : reader.GetInt64(reader.GetOrdinal("ActualFileSize")),
                         ConnectionsCount = reader.GetInt32(reader.GetOrdinal("ConnectionsCount")),
                         LastErrorCode = (DownloadErrorCode)reader.GetInt32(reader.GetOrdinal("LastErrorCode")),
                         LastErrorMessage = reader.IsDBNull(reader.GetOrdinal("LastErrorMessage"))

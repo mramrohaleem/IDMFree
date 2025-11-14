@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Windows;
+using SharpDownloadManager.Core.Utilities;
 using MessageBox = System.Windows.MessageBox;
 
 namespace SharpDownloadManager.UI.Views;
@@ -12,14 +13,15 @@ public partial class NewDownloadDialog : Window
         InitializeComponent();
     }
 
-    public string SelectedFileName => FileNameTextBox.Text.Trim();
+    public string SelectedFileName => FileNameHelper.NormalizeFileName(FileNameTextBox.Text) ?? string.Empty;
 
     public string SelectedFolder => FolderTextBox.Text.Trim();
 
     public void Initialize(string url, string? suggestedFileName, string defaultFolder)
     {
         UrlTextBox.Text = url;
-        FileNameTextBox.Text = string.IsNullOrWhiteSpace(suggestedFileName) ? "download.bin" : suggestedFileName;
+        var normalized = FileNameHelper.NormalizeFileName(suggestedFileName) ?? "download.bin";
+        FileNameTextBox.Text = normalized;
         FolderTextBox.Text = string.IsNullOrWhiteSpace(defaultFolder)
             ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
             : defaultFolder;

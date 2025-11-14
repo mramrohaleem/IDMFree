@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using System.IO;
@@ -18,11 +19,12 @@ public class DownloadItemViewModel : INotifyPropertyChanged
     private string _etaText = string.Empty;
     private string _modeText = string.Empty;
     private string _errorText = string.Empty;
-    private long _lastBytes;
-    private DateTime _lastUpdateTimeUtc;
     private DownloadStatus _status;
     private string _filePath = string.Empty;
     private bool _isFileAvailable;
+    private bool _isProgressIndeterminate;
+    private readonly Queue<SpeedSample> _speedSamples = new();
+    private const double SpeedWindowSeconds = 3.0;
 
     public DownloadItemViewModel()
     {
@@ -111,6 +113,12 @@ public class DownloadItemViewModel : INotifyPropertyChanged
         set => SetProperty(ref _isFileAvailable, value);
     }
 
+    public bool IsProgressIndeterminate
+    {
+        get => _isProgressIndeterminate;
+        set => SetProperty(ref _isProgressIndeterminate, value);
+    }
+
     public event PropertyChangedEventHandler? PropertyChanged;
 
     public void UpdateFromTask(DownloadTask task)
@@ -138,55 +146,84 @@ public class DownloadItemViewModel : INotifyPropertyChanged
         FilePath = task.SavePath ?? string.Empty;
         IsFileAvailable = !string.IsNullOrWhiteSpace(task.SavePath) && File.Exists(task.SavePath);
 
-        var writtenBytes = task.BytesWritten;
+        var writtenBytes = task.BytesWritten < 0 ? 0 : task.BytesWritten;
+
+        long? progressTotal = null;
+        if (task.ContentLength.HasValue && task.ContentLength.Value > 0)
+        {
+            progressTotal = task.ContentLength.Value;
+        }
+        else if (task.Status == DownloadStatus.Completed)
+        {
+            if (task.ActualFileSize.HasValue && task.ActualFileSize.Value > 0)
+            {
+                progressTotal = task.ActualFileSize.Value;
+            }
+            else if (writtenBytes > 0)
+            {
+                progressTotal = writtenBytes;
+            }
+        }
+
+        long? displayTotal = progressTotal;
+        if (!displayTotal.HasValue && task.ActualFileSize.HasValue && task.ActualFileSize.Value > 0)
+        {
+            displayTotal = task.ActualFileSize.Value;
+        }
 
         double progress = 0d;
         double? progressPercent = null;
-        if (task.ContentLength.HasValue && task.ContentLength.Value > 0)
+        if (task.Status == DownloadStatus.Completed)
         {
-            progress = 100.0 * writtenBytes / task.ContentLength.Value;
+            progress = 100d;
+            progressPercent = 100d;
+        }
+        else if (progressTotal.HasValue && progressTotal.Value > 0)
+        {
+            progress = 100.0 * writtenBytes / progressTotal.Value;
             progressPercent = progress;
         }
 
-        Progress = progress;
-        ProgressPercent = progressPercent;
-        SizeText = $"{FormatBytes(writtenBytes)} / {FormatTotal(task.ContentLength)}";
-        var nowUtc = DateTime.UtcNow;
-        var totalBytes = writtenBytes;
+        var clampedProgress = Math.Clamp(progress, 0d, 100d);
+        Progress = clampedProgress;
+        ProgressPercent = progressPercent.HasValue ? Math.Clamp(progressPercent.Value, 0d, 100d) : null;
+        IsProgressIndeterminate = task.Status == DownloadStatus.Downloading && (!progressTotal.HasValue || progressTotal.Value <= 0);
+        SizeText = $"{FormatBytes(writtenBytes)} / {FormatTotal(displayTotal)}";
 
+        var nowUtc = DateTime.UtcNow;
         if (!isSameTask)
         {
-            _lastUpdateTimeUtc = default;
-            _lastBytes = 0;
+            _speedSamples.Clear();
         }
 
-        if (_lastUpdateTimeUtc == default)
+        if (task.Status == DownloadStatus.Downloading)
         {
-            _lastUpdateTimeUtc = nowUtc;
-            _lastBytes = totalBytes;
-            SpeedText = string.Empty;
-            EtaText = string.Empty;
-        }
-        else
-        {
-            var deltaBytes = totalBytes - _lastBytes;
-            var deltaSeconds = (nowUtc - _lastUpdateTimeUtc).TotalSeconds;
+            var sample = new SpeedSample(nowUtc, writtenBytes);
+            _speedSamples.Enqueue(sample);
 
-            if (deltaSeconds > 0.5 && deltaBytes >= 0)
+            while (_speedSamples.Count > 0 &&
+                   (sample.Timestamp - _speedSamples.Peek().Timestamp).TotalSeconds > SpeedWindowSeconds)
             {
-                var bytesPerSecond = deltaBytes / deltaSeconds;
-                SpeedText = FormatSpeed(bytesPerSecond);
+                _speedSamples.Dequeue();
+            }
 
-                if (task.ContentLength.HasValue &&
-                    task.ContentLength.Value > 0 &&
-                    bytesPerSecond > 0 &&
-                    task.Status == DownloadStatus.Downloading)
+            if (_speedSamples.Count > 1)
+            {
+                var oldest = _speedSamples.Peek();
+                var windowSeconds = (sample.Timestamp - oldest.Timestamp).TotalSeconds;
+                var bytesDelta = sample.Bytes - oldest.Bytes;
+
+                if (windowSeconds >= 0.5 && bytesDelta >= 0)
                 {
-                    var remaining = task.ContentLength.Value - totalBytes;
-                    if (remaining > 0)
+                    var bytesPerSecond = bytesDelta / windowSeconds;
+                    SpeedText = FormatSpeed(bytesPerSecond);
+
+                    if (task.ContentLength.HasValue && task.ContentLength.Value > 0 && bytesPerSecond > 0)
                     {
-                        var eta = TimeSpan.FromSeconds(remaining / bytesPerSecond);
-                        EtaText = FormatEta(eta);
+                        var remaining = task.ContentLength.Value - writtenBytes;
+                        EtaText = remaining > 0
+                            ? FormatEta(TimeSpan.FromSeconds(remaining / bytesPerSecond))
+                            : string.Empty;
                     }
                     else
                     {
@@ -195,21 +232,19 @@ public class DownloadItemViewModel : INotifyPropertyChanged
                 }
                 else
                 {
+                    SpeedText = string.Empty;
                     EtaText = string.Empty;
                 }
-
-                _lastUpdateTimeUtc = nowUtc;
-                _lastBytes = totalBytes;
+            }
+            else
+            {
+                SpeedText = string.Empty;
+                EtaText = string.Empty;
             }
         }
-
-        if (task.Status == DownloadStatus.Completed)
+        else
         {
-            SpeedText = string.Empty;
-            EtaText = string.Empty;
-        }
-        else if (task.Status == DownloadStatus.Error)
-        {
+            _speedSamples.Clear();
             SpeedText = string.Empty;
             EtaText = string.Empty;
         }
@@ -298,4 +333,17 @@ public class DownloadItemViewModel : INotifyPropertyChanged
 
     protected virtual void OnPropertyChanged(string? propertyName) =>
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+
+    private readonly struct SpeedSample
+    {
+        public SpeedSample(DateTime timestamp, long bytes)
+        {
+            Timestamp = timestamp;
+            Bytes = bytes;
+        }
+
+        public DateTime Timestamp { get; }
+
+        public long Bytes { get; }
+    }
 }

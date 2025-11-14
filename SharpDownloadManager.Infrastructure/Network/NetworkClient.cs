@@ -11,6 +11,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using SharpDownloadManager.Core.Abstractions;
 using SharpDownloadManager.Core.Domain;
+using SharpDownloadManager.Core.Utilities;
 using SharpDownloadManager.Infrastructure.Logging;
 
 namespace SharpDownloadManager.Infrastructure.Network;
@@ -70,51 +71,55 @@ public sealed class NetworkClient : INetworkClient
 
         HttpResponseMessage? response = null;
 
-        try
-        {
-            // Try HEAD first, fall back to GET when servers don't like HEAD.
-            response = await SendWithFallbackAsync(
-                    uri,
-                    HttpMethod.Head,
-                    cancellationToken)
-                .ConfigureAwait(false);
-
-            response.EnsureSuccessStatusCode();
-            var contentLength = response.Content.Headers.ContentLength;
-
-            var supportsRange =
-                response.Headers.AcceptRanges.Contains("bytes") ||
-                response.Content.Headers.ContentRange != null;
-
-            var isChunkedWithoutLength =
-                !contentLength.HasValue &&
-                response.Headers.TransferEncodingChunked == true;
-
-            // نكتفي باللي جاي من Content headers
-            var lastModified = response.Content.Headers.LastModified;
-
-            var info = new HttpResourceInfo
+            try
             {
-                Url = uri,
-                ContentLength = contentLength,
-                SupportsRange = supportsRange,
-                ETag = response.Headers.ETag?.Tag,
-                LastModified = lastModified,
-                IsChunkedWithoutLength = isChunkedWithoutLength
-            };
+                // Try HEAD first, fall back to GET when servers don't like HEAD.
+                response = await SendWithFallbackAsync(
+                        uri,
+                        HttpMethod.Head,
+                        cancellationToken)
+                    .ConfigureAwait(false);
 
-            _logger.Info(
-                "Probe completed",
-                eventCode: "PROBE_SUCCESS",
-                context: new
+                response.EnsureSuccessStatusCode();
+                var contentLength = response.Content.Headers.ContentLength;
+
+                var supportsRange =
+                    response.Headers.AcceptRanges.Contains("bytes") ||
+                    response.Content.Headers.ContentRange != null;
+
+                var isChunkedWithoutLength =
+                    !contentLength.HasValue &&
+                    response.Headers.TransferEncodingChunked == true;
+
+                // نكتفي باللي جاي من Content headers
+                var lastModified = response.Content.Headers.LastModified;
+                var contentDispositionName = ExtractFileNameFromContentDisposition(
+                    response.Content.Headers.ContentDisposition);
+
+                var info = new HttpResourceInfo
                 {
-                    Url = url,
-                    info.ContentLength,
-                    info.IsChunkedWithoutLength,
-                    info.SupportsRange,
-                    info.ETag,
-                    info.LastModified
-                });
+                    Url = uri,
+                    ContentLength = contentLength,
+                    SupportsRange = supportsRange,
+                    ETag = response.Headers.ETag?.Tag,
+                    LastModified = lastModified,
+                    IsChunkedWithoutLength = isChunkedWithoutLength,
+                    ContentDispositionFileName = contentDispositionName
+                };
+
+                _logger.Info(
+                    "Probe completed",
+                    eventCode: "PROBE_SUCCESS",
+                    context: new
+                    {
+                        Url = url,
+                        info.ContentLength,
+                        info.IsChunkedWithoutLength,
+                        info.SupportsRange,
+                        info.ETag,
+                        info.LastModified,
+                        info.ContentDispositionFileName
+                    });
 
             return info;
         }
@@ -546,6 +551,17 @@ public sealed class NetworkClient : INetworkClient
 
         downloadUrl = null;
         return false;
+    }
+
+    private static string? ExtractFileNameFromContentDisposition(ContentDispositionHeaderValue? disposition)
+    {
+        if (disposition is null)
+        {
+            return null;
+        }
+
+        return FileNameHelper.NormalizeFileName(disposition.FileNameStar)
+            ?? FileNameHelper.NormalizeFileName(disposition.FileName);
     }
 
     private static bool TryExtractFromMetaRefresh(string htmlSnippet, Uri originalUrl, out Uri? downloadUrl)

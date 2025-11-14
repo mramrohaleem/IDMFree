@@ -87,6 +87,19 @@
                                           Binding="{Binding StatusText}"
                                           Width="*"
                                           MinWidth="100" />
+                    <DataGridTemplateColumn Header="Progress"
+                                            Width="*"
+                                            MinWidth="120">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <ProgressBar Minimum="0"
+                                             Maximum="100"
+                                             Height="18"
+                                             Value="{Binding Progress}"
+                                             IsIndeterminate="{Binding IsProgressIndeterminate}" />
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
                     <DataGridTextColumn Header="Progress (%)"
                                           Binding="{Binding ProgressPercent, Converter={StaticResource NullablePercentageConverter}}"
                                           Width="*"
