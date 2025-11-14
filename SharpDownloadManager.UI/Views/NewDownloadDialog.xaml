@@ -1,0 +1,90 @@
+<Window x:Class="SharpDownloadManager.UI.Views.NewDownloadDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="New Download"
+        Width="480"
+        Height="260"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize">
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="Auto" />
+        </Grid.ColumnDefinitions>
+
+        <TextBlock Grid.Row="0"
+                   Grid.Column="0"
+                   Text="URL:"
+                   VerticalAlignment="Center"
+                   Margin="0,0,8,0" />
+        <TextBox Grid.Row="0"
+                 Grid.Column="1"
+                 Grid.ColumnSpan="2"
+                 x:Name="UrlTextBox"
+                 IsReadOnly="True"
+                 TextWrapping="Wrap"
+                 VerticalScrollBarVisibility="Auto"
+                 Height="60"
+                 Text="" />
+
+        <TextBlock Grid.Row="1"
+                   Grid.Column="0"
+                   Text="File name:"
+                   VerticalAlignment="Center"
+                   Margin="0,12,8,0" />
+        <TextBox Grid.Row="1"
+                 Grid.Column="1"
+                 Margin="0,12,8,0"
+                 x:Name="FileNameTextBox"
+                 VerticalAlignment="Center" />
+
+        <TextBlock Grid.Row="2"
+                   Grid.Column="0"
+                   Text="Save to:"
+                   VerticalAlignment="Center"
+                   Margin="0,12,8,0" />
+        <TextBox Grid.Row="2"
+                 Grid.Column="1"
+                 Margin="0,12,8,0"
+                 x:Name="FolderTextBox"
+                 VerticalAlignment="Center" />
+        <Button Grid.Row="2"
+                Grid.Column="2"
+                Margin="0,12,0,0"
+                Width="80"
+                Content="Browse..."
+                Click="OnBrowseClick" />
+
+        <TextBlock Grid.Row="3"
+                   Grid.Column="0"
+                   Grid.ColumnSpan="3"
+                   Text="Confirm to start the download with IDMFree."
+                   Margin="0,16,0,16" />
+
+        <StackPanel Grid.Row="4"
+                    Grid.Column="0"
+                    Grid.ColumnSpan="3"
+                    Orientation="Horizontal"
+                    HorizontalAlignment="Right"
+                    Spacing="8">
+            <Button Width="90"
+                    Height="28"
+                    Content="Cancel"
+                    IsCancel="True"
+                    Click="OnCancelClick" />
+            <Button Width="90"
+                    Height="28"
+                    Content="Download"
+                    IsDefault="True"
+                    Click="OnDownloadClick" />
+        </StackPanel>
+    </Grid>
+</Window>
