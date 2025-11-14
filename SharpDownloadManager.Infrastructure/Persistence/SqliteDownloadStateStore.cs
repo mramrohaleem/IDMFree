@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS Downloads (
     Mode INTEGER NOT NULL,
     ContentLength INTEGER NULL,
     SupportsRange INTEGER NOT NULL,
+    ResumeCapability INTEGER NOT NULL DEFAULT 0,
     ETag TEXT NULL,
     LastModified TEXT NULL,
     TotalDownloadedBytes INTEGER NOT NULL,
@@ -119,6 +120,14 @@ CREATE TABLE IF NOT EXISTS Chunks (
                     "Downloads",
                     "RequestHeaders",
                     "TEXT NULL",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "ResumeCapability",
+                    "INTEGER NOT NULL DEFAULT 0",
                     cancellationToken)
                 .ConfigureAwait(false);
 
@@ -364,7 +373,7 @@ CREATE TABLE IF NOT EXISTS Chunks (
                 cmd.CommandText = @"
 INSERT INTO Downloads (
     Id, Url, FileName, FinalFileName, SavePath, TempFolderPath,
-    Status, Mode, ContentLength, SupportsRange,
+    Status, Mode, ContentLength, SupportsRange, ResumeCapability,
     ETag, LastModified,
     TotalDownloadedBytes, BytesWritten, ActualFileSize, ConnectionsCount,
     LastErrorCode, LastErrorMessage,
@@ -373,7 +382,7 @@ INSERT INTO Downloads (
     TooManyRequestsRetryCount, RetryBackoffSeconds, NextRetryUtc, MaxParallelConnections
 ) VALUES (
     $Id, $Url, $FileName, $FinalFileName, $SavePath, $TempFolderPath,
-    $Status, $Mode, $ContentLength, $SupportsRange,
+    $Status, $Mode, $ContentLength, $SupportsRange, $ResumeCapability,
     $ETag, $LastModified,
     $TotalDownloadedBytes, $BytesWritten, $ActualFileSize, $ConnectionsCount,
     $LastErrorCode, $LastErrorMessage,
@@ -391,6 +400,7 @@ ON CONFLICT(Id) DO UPDATE SET
     Mode = excluded.Mode,
     ContentLength = excluded.ContentLength,
     SupportsRange = excluded.SupportsRange,
+    ResumeCapability = excluded.ResumeCapability,
     ETag = excluded.ETag,
     LastModified = excluded.LastModified,
     TotalDownloadedBytes = excluded.TotalDownloadedBytes,
@@ -425,6 +435,7 @@ ON CONFLICT(Id) DO UPDATE SET
                 else
                     cmd.Parameters.AddWithValue("$ContentLength", DBNull.Value);
                 cmd.Parameters.AddWithValue("$SupportsRange", task.SupportsRange ? 1 : 0);
+                cmd.Parameters.AddWithValue("$ResumeCapability", (int)task.ResumeCapability);
                 cmd.Parameters.AddWithValue("$ETag", (object?)task.ETag ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$LastModified", task.LastModified?.ToString("o") ?? (object)DBNull.Value);
                 cmd.Parameters.AddWithValue("$TotalDownloadedBytes", task.TotalDownloadedBytes);
@@ -554,6 +565,9 @@ INSERT INTO Chunks (
                             ? null
                             : reader.GetInt64(reader.GetOrdinal("ContentLength")),
                         SupportsRange = reader.GetInt32(reader.GetOrdinal("SupportsRange")) != 0,
+                        ResumeCapability = reader.IsDBNull(reader.GetOrdinal("ResumeCapability"))
+                            ? DownloadResumeCapability.Unknown
+                            : (DownloadResumeCapability)reader.GetInt32(reader.GetOrdinal("ResumeCapability")),
                         ETag = reader.IsDBNull(reader.GetOrdinal("ETag"))
                             ? null
                             : reader.GetString(reader.GetOrdinal("ETag")),

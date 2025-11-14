@@ -24,6 +24,7 @@ public class DownloadItemViewModel : INotifyPropertyChanged
     private string _filePath = string.Empty;
     private bool _isFileAvailable;
     private bool _isProgressIndeterminate;
+    private DownloadResumeCapability _resumeCapability;
     private readonly Queue<SpeedSample> _speedSamples = new();
     private const double SpeedWindowSeconds = 3.0;
 
@@ -126,6 +127,12 @@ public class DownloadItemViewModel : INotifyPropertyChanged
         set => SetProperty(ref _isProgressIndeterminate, value);
     }
 
+    public DownloadResumeCapability ResumeCapability
+    {
+        get => _resumeCapability;
+        set => SetProperty(ref _resumeCapability, value);
+    }
+
     public event PropertyChangedEventHandler? PropertyChanged;
 
     public void UpdateFromTask(DownloadTask task)
@@ -143,6 +150,7 @@ public class DownloadItemViewModel : INotifyPropertyChanged
             : task.FinalFileName;
         Name = displayName;
         Status = task.Status;
+        ResumeCapability = task.ResumeCapability;
         if (task.Status == DownloadStatus.Throttled || task.HttpStatusCategory == HttpStatusCategory.TooManyRequests)
         {
             var message = "Paused (server said: Too Many Requests";
@@ -165,6 +173,15 @@ public class DownloadItemViewModel : INotifyPropertyChanged
         else
         {
             StatusText = task.Status.ToString();
+        }
+
+        if (task.ResumeRestartsFromZero &&
+            task.Status is DownloadStatus.Paused or DownloadStatus.Downloading or DownloadStatus.Queued)
+        {
+            var note = "Resume will restart from the beginning (server does not support range requests)";
+            StatusText = string.IsNullOrWhiteSpace(StatusText)
+                ? note
+                : $"{StatusText} – {note}";
         }
 
         ErrorText = task.LastErrorMessage ?? string.Empty;
@@ -213,7 +230,14 @@ public class DownloadItemViewModel : INotifyPropertyChanged
         Progress = clampedProgress;
         ProgressPercent = progressPercent.HasValue ? Math.Clamp(progressPercent.Value, 0d, 100d) : null;
         IsProgressIndeterminate = task.Status == DownloadStatus.Downloading && (!progressTotal.HasValue || progressTotal.Value <= 0);
-        SizeText = $"{FormatBytes(writtenBytes)} / {FormatTotal(displayTotal)}";
+        if (displayTotal.HasValue && displayTotal.Value > 0)
+        {
+            SizeText = $"{FormatBytes(writtenBytes)} / {FormatBytes(displayTotal.Value)}";
+        }
+        else
+        {
+            SizeText = $"Downloaded {FormatBytes(writtenBytes)} (total size unknown)";
+        }
 
         var averageSpeed = task.GetAverageSpeedBytesPerSecond();
         AverageSpeedText = averageSpeed > 0 ? FormatSpeed(averageSpeed) : string.Empty;
@@ -278,13 +302,6 @@ public class DownloadItemViewModel : INotifyPropertyChanged
         }
 
         ModeText = task.Mode.ToString();
-    }
-
-    private static string FormatTotal(long? total)
-    {
-        return total.HasValue && total.Value > 0
-            ? FormatBytes(total.Value)
-            : "Unknown";
     }
 
     private static string FormatBytes(long bytes)

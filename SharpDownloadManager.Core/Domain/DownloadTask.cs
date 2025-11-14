@@ -25,6 +25,8 @@ public class DownloadTask
 
     public bool SupportsRange { get; set; }
 
+    public DownloadResumeCapability ResumeCapability { get; set; } = DownloadResumeCapability.Unknown;
+
     public string? ETag { get; set; }
 
     public DateTimeOffset? LastModified { get; set; }
@@ -58,6 +60,12 @@ public class DownloadTask
     public string? LastErrorMessage { get; set; }
 
     public IReadOnlyDictionary<string, string>? RequestHeaders { get; set; }
+
+    public bool HasKnownContentLength => ContentLength.HasValue && ContentLength.Value > 0;
+
+    public bool ResumeSupported => ResumeCapability == DownloadResumeCapability.Supported;
+
+    public bool ResumeRestartsFromZero => ResumeCapability == DownloadResumeCapability.RestartRequired;
 
     public void InitializeChunks(int desiredConnectionsCount)
     {
