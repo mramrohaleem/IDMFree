@@ -1366,10 +1366,10 @@ public class DownloadEngine : IDownloadEngine
                     LastPersistedBytes = task.TotalDownloadedBytes
                 };
 
-                if (task.HasKnownContentLength && task.ContentLength!.Value > 0)
+                if (task.HasKnownContentLength && task.ContentLength is long contentLength && contentLength > 0)
                 {
                     tracker.LastLoggedPercent =
-                        Math.Clamp((double)task.TotalDownloadedBytes / task.ContentLength.Value * 100d, 0d, 100d);
+                        Math.Clamp((double)task.TotalDownloadedBytes / contentLength * 100d, 0d, 100d);
                 }
 
                 _progressTrackers[task.Id] = tracker;
@@ -1546,8 +1546,7 @@ public class DownloadEngine : IDownloadEngine
                 "Failed to rename download file to updated name.",
                 downloadId: downloadId,
                 eventCode: "DOWNLOAD_FILENAME_RENAME_FAILED",
-                exception: ex,
-                context: new { OldPath = oldPath, NewPath = newPath });
+                context: new { OldPath = oldPath, NewPath = newPath, Exception = ex });
         }
     }
 
