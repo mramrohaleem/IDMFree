@@ -189,8 +189,7 @@ public sealed class BrowserBridgeServer : IDisposable
             }
 
             if (payload is null || string.IsNullOrWhiteSpace(payload.Url) ||
-                !Uri.TryCreate(payload.Url, UriKind.Absolute, out var url) ||
-                (url.Scheme != Uri.UriSchemeHttp && url.Scheme != Uri.UriSchemeHttps))
+                !Uri.TryCreate(payload.Url, UriKind.Absolute, out var url))
             {
                 response.StatusCode = (int)HttpStatusCode.BadRequest;
                 await WriteJsonAsync(
@@ -201,6 +200,33 @@ public sealed class BrowserBridgeServer : IDisposable
                 _logger.Warn(
                     "Browser API received invalid payload.",
                     eventCode: "BROWSER_API_REQUEST_INVALID");
+                return;
+            }
+
+            if (!string.Equals(url.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(url.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            {
+                var message = url.Scheme.Equals("blob", StringComparison.OrdinalIgnoreCase)
+                    ? "This link is a browser-only blob: URL. Let the browser handle the download."
+                    : $"IDMFree can only handle HTTP/HTTPS links. The {url.Scheme}: scheme must be downloaded by the browser.";
+
+                response.StatusCode = (int)HttpStatusCode.OK;
+                await WriteJsonAsync(
+                        response,
+                        new
+                        {
+                            handled = false,
+                            status = "fallback",
+                            error = message,
+                            statusCode = (int)HttpStatusCode.OK
+                        },
+                        cancellationToken)
+                    .ConfigureAwait(false);
+
+                _logger.Info(
+                    "Browser download skipped due to unsupported URL scheme.",
+                    eventCode: "BROWSER_API_REQUEST_UNSUPPORTED_SCHEME",
+                    context: new { payload.Url, Scheme = url.Scheme });
                 return;
             }
 

@@ -1,7 +1,9 @@
 using System;
 using System.IO;
 using System.Windows;
+using System.Windows.Media;
 using SharpDownloadManager.Core.Utilities;
+using SharpDownloadManager.UI.Services;
 using MessageBox = System.Windows.MessageBox;
 
 namespace SharpDownloadManager.UI.Views;
@@ -17,7 +19,7 @@ public partial class NewDownloadDialog : Window
 
     public string SelectedFolder => FolderTextBox.Text.Trim();
 
-    public void Initialize(string url, string? suggestedFileName, string defaultFolder)
+    public void Initialize(string url, string? suggestedFileName, string defaultFolder, BrowserDownloadPromptMessage? promptMessage = null)
     {
         UrlTextBox.Text = url;
         var normalized = FileNameHelper.NormalizeFileName(suggestedFileName) ?? "download.bin";
@@ -25,6 +27,23 @@ public partial class NewDownloadDialog : Window
         FolderTextBox.Text = string.IsNullOrWhiteSpace(defaultFolder)
             ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
             : defaultFolder;
+
+        if (promptMessage is not null)
+        {
+            PromptBorder.Visibility = Visibility.Visible;
+            PromptTextBlock.Text = promptMessage.Message;
+            PromptTextBlock.Foreground = promptMessage.IsWarning
+                ? new SolidColorBrush(Colors.OrangeRed)
+                : new SolidColorBrush(Color.FromRgb(33, 150, 243));
+            PromptBorder.Background = promptMessage.IsWarning
+                ? new SolidColorBrush(Color.FromArgb(24, 255, 69, 0))
+                : new SolidColorBrush(Color.FromArgb(18, 33, 150, 243));
+        }
+        else
+        {
+            PromptBorder.Visibility = Visibility.Collapsed;
+            PromptTextBlock.Text = string.Empty;
+        }
     }
 
     private void OnBrowseClick(object sender, RoutedEventArgs e)

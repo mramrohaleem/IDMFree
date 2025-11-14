@@ -11,6 +11,7 @@
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
@@ -63,13 +64,27 @@
                 Content="Browse..."
                 Click="OnBrowseClick" />
 
-        <TextBlock Grid.Row="3"
+        <Border Grid.Row="3"
+                Grid.Column="0"
+                Grid.ColumnSpan="3"
+                Margin="0,16,0,0"
+                Background="#11FFA500"
+                CornerRadius="4"
+                Padding="8"
+                Visibility="Collapsed"
+                x:Name="PromptBorder">
+            <TextBlock x:Name="PromptTextBlock"
+                       TextWrapping="Wrap"
+                       Foreground="DarkOrange" />
+        </Border>
+
+        <TextBlock Grid.Row="4"
                    Grid.Column="0"
                    Grid.ColumnSpan="3"
                    Text="Confirm to start the download with IDMFree."
                    Margin="0,16,0,16" />
 
-        <StackPanel Grid.Row="4"
+        <StackPanel Grid.Row="5"
                     Grid.Column="0"
                     Grid.ColumnSpan="3"
                     Orientation="Horizontal"
