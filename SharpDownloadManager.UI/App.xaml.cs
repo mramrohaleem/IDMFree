@@ -1,5 +1,3 @@
-using System;
-using System.IO;
 using System.Windows;
 using SharpDownloadManager.Core.Services;
 using SharpDownloadManager.Infrastructure.Logging;
@@ -14,6 +12,7 @@ namespace SharpDownloadManager.UI;
 public partial class App : Application
 {
     private BrowserBridgeServer? _browserBridge;
+    private INotificationService? _notificationService;
 
     protected override async void OnStartup(StartupEventArgs e)
     {
@@ -30,11 +29,30 @@ public partial class App : Application
 
             await engine.InitializeAsync();
 
-            var downloadsFolder = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                "Downloads");
+            logger.Info("Engine initialized - creating main window", eventCode: "APP_INIT_OK");
 
-            var browserBridge = new BrowserBridgeServer(engine, logger, downloadsFolder);
+            var notificationService = new NotificationService(logger);
+            _notificationService = notificationService;
+
+            var settingsDialogService = new SettingsDialogService();
+
+            var mainViewModel = new MainViewModel(engine, logger, notificationService, settingsDialogService);
+
+            var mainWindow = new MainWindow
+            {
+                DataContext = mainViewModel
+            };
+
+            mainWindow.Show();
+
+            var browserCoordinator = new BrowserDownloadCoordinator(
+                engine,
+                logger,
+                Dispatcher,
+                () => mainViewModel.SaveFolderPath,
+                folder => mainViewModel.SaveFolderPath = folder);
+
+            var browserBridge = new BrowserBridgeServer(browserCoordinator, logger);
             try
             {
                 await browserBridge.StartAsync();
@@ -47,15 +65,6 @@ public partial class App : Application
                     eventCode: "BROWSER_BRIDGE_UNHANDLED_START_ERROR",
                     context: new { bridgeEx.Message });
             }
-
-            logger.Info("Engine initialized - creating main window", eventCode: "APP_INIT_OK");
-
-            var mainWindow = new MainWindow
-            {
-                DataContext = new MainViewModel(engine)
-            };
-
-            mainWindow.Show();
         }
         catch (Exception ex)
         {
@@ -83,6 +92,7 @@ public partial class App : Application
     protected override void OnExit(ExitEventArgs e)
     {
         _browserBridge?.Dispose();
+        _notificationService?.Dispose();
         base.OnExit(e);
     }
 }

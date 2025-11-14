@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Text;
@@ -7,7 +6,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using SharpDownloadManager.Core.Abstractions;
-using SharpDownloadManager.Core.Domain;
+using SharpDownloadManager.Infrastructure.Logging;
 
 namespace SharpDownloadManager.UI.Services;
 
@@ -23,23 +22,19 @@ public sealed class BrowserBridgeServer : IDisposable
         WriteIndented = false
     };
 
-    private readonly IDownloadEngine _downloadEngine;
+    private readonly IBrowserDownloadCoordinator _coordinator;
     private readonly ILogger _logger;
     private readonly HttpListener _listener;
-    private readonly string _defaultSaveFolder;
 
     private CancellationTokenSource? _cts;
     private Task? _processingTask;
     private bool _isRunning;
     private bool _disposed;
 
-    public BrowserBridgeServer(IDownloadEngine downloadEngine, ILogger logger, string defaultSaveFolder)
+    public BrowserBridgeServer(IBrowserDownloadCoordinator coordinator, ILogger logger)
     {
-        _downloadEngine = downloadEngine ?? throw new ArgumentNullException(nameof(downloadEngine));
+        _coordinator = coordinator ?? throw new ArgumentNullException(nameof(coordinator));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        _defaultSaveFolder = defaultSaveFolder ?? throw new ArgumentNullException(nameof(defaultSaveFolder));
-
-        Directory.CreateDirectory(_defaultSaveFolder);
 
         _listener = new HttpListener();
         _listener.Prefixes.Add("http://127.0.0.1:5454/");
@@ -209,48 +204,53 @@ public sealed class BrowserBridgeServer : IDisposable
                 eventCode: "BROWSER_API_REQUEST_RECEIVED",
                 context: new { payload.Url, payload.Method });
 
-            IReadOnlyDictionary<string, string>? headers = null;
-            if (payload.Headers is not null && payload.Headers.Count > 0)
-            {
-                headers = new Dictionary<string, string>(payload.Headers, StringComparer.OrdinalIgnoreCase);
-            }
+            var result = await _coordinator
+                .HandleAsync(payload, cancellationToken)
+                .ConfigureAwait(false);
 
-            var suggestedFileName = string.IsNullOrWhiteSpace(payload.FileName) ? null : payload.FileName;
+            response.StatusCode = (int)result.StatusCode;
 
-            DownloadTask task;
-            try
+            if (result.Success && result.Task is not null)
             {
-                task = await _downloadEngine
-                    .EnqueueDownloadAsync(
-                        payload.Url,
-                        suggestedFileName,
-                        _defaultSaveFolder,
-                        DownloadMode.Normal,
-                        headers,
+                await WriteJsonAsync(
+                        response,
+                        new { status = "queued", id = result.Task.Id },
                         cancellationToken)
                     .ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                response.StatusCode = (int)HttpStatusCode.InternalServerError;
-                await WriteJsonAsync(response, new { error = ex.Message }, cancellationToken).ConfigureAwait(false);
 
-                _logger.Error(
-                    "Failed to enqueue download via browser API.",
-                    eventCode: "BROWSER_API_DOWNLOAD_FAILED",
-                    exception: ex,
+                _logger.Info(
+                    "Browser API download queued.",
+                    eventCode: "BROWSER_API_DOWNLOAD_QUEUED",
+                    downloadId: result.Task.Id,
                     context: new { payload.Url });
                 return;
             }
 
-            response.StatusCode = (int)HttpStatusCode.Accepted;
-            await WriteJsonAsync(response, new { status = "queued", id = task.Id }, cancellationToken).ConfigureAwait(false);
+            if (result.UserDeclined)
+            {
+                await WriteJsonAsync(
+                        response,
+                        new { error = result.Error ?? "User declined the download." },
+                        cancellationToken)
+                    .ConfigureAwait(false);
 
-            _logger.Info(
-                "Browser API download queued.",
-                eventCode: "BROWSER_API_DOWNLOAD_QUEUED",
-                downloadId: task.Id,
-                context: new { payload.Url, Headers = headers?.Count ?? 0 });
+                _logger.Info(
+                    "Browser download request declined by user.",
+                    eventCode: "BROWSER_API_DOWNLOAD_DECLINED",
+                    context: new { payload.Url });
+                return;
+            }
+
+            await WriteJsonAsync(
+                    response,
+                    new { error = result.Error ?? "Failed to process download request." },
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            _logger.Error(
+                "Failed to process browser download request.",
+                eventCode: "BROWSER_API_DOWNLOAD_FAILED",
+                context: new { payload.Url, result.Error, Status = (int)result.StatusCode });
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

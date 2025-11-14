@@ -21,6 +21,15 @@ public class DownloadEngine : IDownloadEngine
     private const int MaxConcurrentDownloads = 3;
     private readonly Dictionary<Guid, CancellationTokenSource> _activeTokens = new();
     private readonly Dictionary<Guid, Task> _activeDownloadTasks = new();
+    private readonly Dictionary<Guid, DownloadCancellationReason> _cancellationReasons = new();
+
+    private enum DownloadCancellationReason
+    {
+        Unknown,
+        UserPause,
+        UserDelete,
+        EngineShutdown
+    }
 
     public DownloadEngine(
         INetworkClient networkClient,
@@ -215,7 +224,12 @@ public class DownloadEngine : IDownloadEngine
 
             if (_activeTokens.TryGetValue(downloadId, out var cts))
             {
+                _cancellationReasons[downloadId] = DownloadCancellationReason.UserPause;
                 ctsToCancel = cts;
+            }
+            else
+            {
+                _cancellationReasons.Remove(downloadId);
             }
         }
 
@@ -237,7 +251,12 @@ public class DownloadEngine : IDownloadEngine
             removed = _downloads.Remove(downloadId);
             if (_activeTokens.TryGetValue(downloadId, out var cts))
             {
+                _cancellationReasons[downloadId] = DownloadCancellationReason.UserDelete;
                 ctsToCancel = cts;
+            }
+            else
+            {
+                _cancellationReasons.Remove(downloadId);
             }
         }
 
@@ -387,8 +406,18 @@ public class DownloadEngine : IDownloadEngine
                     task.UpdateProgressFromChunks();
                     await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
                 }
-                catch (OperationCanceledException)
+                catch (OperationCanceledException ex)
                 {
+                    if (!ct.IsCancellationRequested)
+                    {
+                        chunk.Status = ChunkStatus.Error;
+                        chunk.LastErrorCode = DownloadErrorCode.Unknown;
+                        chunk.LastErrorMessage = ex.Message;
+                        task.UpdateProgressFromChunks();
+                        await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
+                        throw;
+                    }
+
                     chunk.Status = ChunkStatus.Paused;
                     chunk.LastErrorCode = null;
                     chunk.LastErrorMessage = null;
@@ -537,7 +566,7 @@ public class DownloadEngine : IDownloadEngine
             await SaveStateAsync(task, cancellationToken).ConfigureAwait(false);
             _logger.Info("Download completed.", downloadId: task.Id, eventCode: "DOWNLOAD_RUN_COMPLETED");
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             if (task.Status != DownloadStatus.Completed && task.Status != DownloadStatus.Error)
             {
@@ -545,7 +574,12 @@ public class DownloadEngine : IDownloadEngine
             }
 
             await SaveStateAsync(task, cancellationToken, ignoreCancellation: true).ConfigureAwait(false);
-            _logger.Info("Download canceled.", downloadId: task.Id, eventCode: "DOWNLOAD_RUN_CANCELED");
+            var reason = ConsumeCancellationReason(task.Id);
+            _logger.Info(
+                "Download canceled.",
+                downloadId: task.Id,
+                eventCode: "DOWNLOAD_RUN_CANCELED",
+                context: new { task.Url, Reason = reason.ToString() });
         }
         catch (HttpRequestException httpEx)
         {
@@ -599,8 +633,26 @@ public class DownloadEngine : IDownloadEngine
         }
         finally
         {
+            lock (_syncRoot)
+            {
+                _cancellationReasons.Remove(task.Id);
+            }
             _logger.Info("Download finished.", downloadId: task.Id, eventCode: "DOWNLOAD_RUN_FINISHED");
         }
+    }
+
+    private DownloadCancellationReason ConsumeCancellationReason(Guid downloadId)
+    {
+        lock (_syncRoot)
+        {
+            if (_cancellationReasons.TryGetValue(downloadId, out var reason))
+            {
+                _cancellationReasons.Remove(downloadId);
+                return reason;
+            }
+        }
+
+        return DownloadCancellationReason.Unknown;
     }
 
     private void TryScheduleDownloads_NoLock()

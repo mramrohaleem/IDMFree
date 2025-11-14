@@ -13,20 +13,29 @@ using System.Windows.Input;
 using System.Windows.Threading;
 using SharpDownloadManager.Core.Abstractions;
 using SharpDownloadManager.Core.Domain;
+using SharpDownloadManager.UI.Services;
 
 namespace SharpDownloadManager.UI.ViewModels;
 
 public class MainViewModel : INotifyPropertyChanged
 {
     private readonly IDownloadEngine _engine;
+    private readonly ILogger _logger;
+    private readonly INotificationService _notificationService;
+    private readonly ISettingsDialogService _settingsDialogService;
     private readonly DispatcherTimer _refreshTimer;
     private readonly AsyncCommand _addDownloadCommand;
     private readonly AsyncCommand<DownloadItemViewModel> _pauseDownloadCommand;
     private readonly AsyncCommand<DownloadItemViewModel> _resumeDownloadCommand;
     private readonly AsyncCommand<DownloadItemViewModel> _deleteDownloadCommand;
+    private readonly AsyncCommand<DownloadItemViewModel> _openFileCommand;
+    private readonly AsyncCommand<DownloadItemViewModel> _openFolderCommand;
+    private readonly RelayCommand _openSettingsCommand;
+    private readonly HashSet<Guid> _notifiedCompletedDownloads = new();
     private string _newDownloadUrl = string.Empty;
     private string _saveFolderPath = string.Empty;
     private DownloadItemViewModel? _selectedDownload;
+    private bool _areCompletionNotificationsEnabled = true;
 
     public ObservableCollection<DownloadItemViewModel> Downloads { get; }
 
@@ -58,6 +67,8 @@ public class MainViewModel : INotifyPropertyChanged
                 _pauseDownloadCommand.RaiseCanExecuteChanged();
                 _resumeDownloadCommand.RaiseCanExecuteChanged();
                 _deleteDownloadCommand.RaiseCanExecuteChanged();
+                _openFileCommand.RaiseCanExecuteChanged();
+                _openFolderCommand.RaiseCanExecuteChanged();
             }
         }
     }
@@ -70,16 +81,39 @@ public class MainViewModel : INotifyPropertyChanged
 
     public ICommand DeleteDownloadCommand => _deleteDownloadCommand;
 
+    public ICommand OpenFileCommand => _openFileCommand;
+
+    public ICommand OpenFolderCommand => _openFolderCommand;
+
+    public ICommand OpenSettingsCommand => _openSettingsCommand;
+
+    public bool AreCompletionNotificationsEnabled
+    {
+        get => _areCompletionNotificationsEnabled;
+        set => SetProperty(ref _areCompletionNotificationsEnabled, value);
+    }
+
     public event PropertyChangedEventHandler? PropertyChanged;
 
     public MainViewModel()
-        : this(new DesignTimeDownloadEngine())
+        : this(
+            new DesignTimeDownloadEngine(),
+            new DesignTimeLogger(),
+            new NoopNotificationService(),
+            new DesignTimeSettingsDialogService())
     {
     }
 
-    public MainViewModel(IDownloadEngine engine)
+    public MainViewModel(
+        IDownloadEngine engine,
+        ILogger logger,
+        INotificationService notificationService,
+        ISettingsDialogService settingsDialogService)
     {
         _engine = engine ?? throw new ArgumentNullException(nameof(engine));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _notificationService = notificationService ?? throw new ArgumentNullException(nameof(notificationService));
+        _settingsDialogService = settingsDialogService ?? throw new ArgumentNullException(nameof(settingsDialogService));
         Downloads = new ObservableCollection<DownloadItemViewModel>();
 
         var downloadsFolder = Path.Combine(
@@ -91,6 +125,9 @@ public class MainViewModel : INotifyPropertyChanged
         _pauseDownloadCommand = new AsyncCommand<DownloadItemViewModel>(PauseDownloadAsync, CanOperateOnItem);
         _resumeDownloadCommand = new AsyncCommand<DownloadItemViewModel>(ResumeDownloadAsync, CanOperateOnItem);
         _deleteDownloadCommand = new AsyncCommand<DownloadItemViewModel>(DeleteDownloadAsync, CanOperateOnItem);
+        _openFileCommand = new AsyncCommand<DownloadItemViewModel>(OpenFileAsync, CanOpenFile);
+        _openFolderCommand = new AsyncCommand<DownloadItemViewModel>(OpenFolderAsync, CanOpenFile);
+        _openSettingsCommand = new RelayCommand(OpenSettings);
 
         _refreshTimer = new DispatcherTimer
         {
@@ -103,6 +140,12 @@ public class MainViewModel : INotifyPropertyChanged
     }
 
     private bool CanOperateOnItem(DownloadItemViewModel? item) => (item ?? SelectedDownload) is not null;
+
+    private bool CanOpenFile(DownloadItemViewModel? item)
+    {
+        var target = item ?? SelectedDownload;
+        return target?.IsFileAvailable ?? false;
+    }
 
     private async Task AddDownloadAsync()
     {
@@ -222,6 +265,118 @@ public class MainViewModel : INotifyPropertyChanged
         }
     }
 
+    private Task OpenFileAsync(DownloadItemViewModel? item)
+    {
+        var target = item ?? SelectedDownload;
+        if (target is null)
+        {
+            return Task.CompletedTask;
+        }
+
+        var path = target.FilePath;
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            MessageBox.Show(
+                "The downloaded file could not be found. It may have been moved or deleted.",
+                "Open File",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            return Task.CompletedTask;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo(path)
+            {
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.Error(
+                "Failed to open downloaded file.",
+                downloadId: target.Id,
+                eventCode: "DOWNLOAD_OPEN_FILE_FAILED",
+                exception: ex,
+                context: new { target.FilePath });
+
+            MessageBox.Show(
+                ex.Message,
+                "Open File",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private Task OpenFolderAsync(DownloadItemViewModel? item)
+    {
+        var target = item ?? SelectedDownload;
+        if (target is null)
+        {
+            return Task.CompletedTask;
+        }
+
+        var path = target.FilePath;
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            MessageBox.Show(
+                "The downloaded file could not be found. It may have been moved or deleted.",
+                "Open Containing Folder",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            return Task.CompletedTask;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo("explorer.exe")
+            {
+                Arguments = $"/select,\"{path}\"",
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.Error(
+                "Failed to open containing folder.",
+                downloadId: target.Id,
+                eventCode: "DOWNLOAD_OPEN_FOLDER_FAILED",
+                exception: ex,
+                context: new { target.FilePath });
+
+            MessageBox.Show(
+                ex.Message,
+                "Open Containing Folder",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private void OpenSettings()
+    {
+        try
+        {
+            _settingsDialogService.ShowSettings(this);
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn(
+                "Failed to open settings dialog.",
+                eventCode: "SETTINGS_DIALOG_ERROR",
+                context: new { ex.Message });
+
+            MessageBox.Show(
+                ex.Message,
+                "Settings",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+        }
+    }
+
     private async Task RefreshFromEngineAsync()
     {
         try
@@ -233,11 +388,38 @@ public class MainViewModel : INotifyPropertyChanged
                 var existing = Downloads.FirstOrDefault(d => d.Id == task.Id);
                 if (existing is null)
                 {
-                    Downloads.Add(new DownloadItemViewModel(task));
+                    existing = new DownloadItemViewModel(task);
+                    Downloads.Add(existing);
                 }
                 else
                 {
                     existing.UpdateFromTask(task);
+                }
+
+                if (task.Status == DownloadStatus.Completed)
+                {
+                    if (_notifiedCompletedDownloads.Add(task.Id) && AreCompletionNotificationsEnabled)
+                    {
+                        try
+                        {
+                            var targetFolder = string.IsNullOrWhiteSpace(task.SavePath)
+                                ? null
+                                : Path.GetDirectoryName(task.SavePath);
+                            _notificationService.ShowDownloadCompleted(task.FileName, targetFolder);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.Warn(
+                                "Failed to show completion notification.",
+                                downloadId: task.Id,
+                                eventCode: "DOWNLOAD_NOTIFICATION_ERROR",
+                                context: new { ex.Message });
+                        }
+                    }
+                }
+                else
+                {
+                    _notifiedCompletedDownloads.Remove(task.Id);
                 }
             }
 
@@ -254,11 +436,22 @@ public class MainViewModel : INotifyPropertyChanged
                     Downloads.RemoveAt(i);
                 }
             }
+
+            UpdateCommandStates();
         }
         catch (Exception ex)
         {
             Debug.WriteLine(ex);
         }
+    }
+
+    private void UpdateCommandStates()
+    {
+        _pauseDownloadCommand.RaiseCanExecuteChanged();
+        _resumeDownloadCommand.RaiseCanExecuteChanged();
+        _deleteDownloadCommand.RaiseCanExecuteChanged();
+        _openFileCommand.RaiseCanExecuteChanged();
+        _openFolderCommand.RaiseCanExecuteChanged();
     }
 
     protected bool SetProperty<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
@@ -407,6 +600,39 @@ public class MainViewModel : INotifyPropertyChanged
         {
             _tasks.RemoveAll(t => t.Id == downloadId);
             return Task.CompletedTask;
+        }
+    }
+
+    private sealed class DesignTimeLogger : ILogger
+    {
+        public void Info(string message, Guid? downloadId = null, string? eventCode = null, object? context = null)
+        {
+        }
+
+        public void Warn(string message, Guid? downloadId = null, string? eventCode = null, object? context = null)
+        {
+        }
+
+        public void Error(string message, Guid? downloadId = null, string? eventCode = null, Exception? exception = null, object? context = null)
+        {
+        }
+    }
+
+    private sealed class NoopNotificationService : INotificationService
+    {
+        public void ShowDownloadCompleted(string fileName, string? targetFolder)
+        {
+        }
+
+        public void Dispose()
+        {
+        }
+    }
+
+    private sealed class DesignTimeSettingsDialogService : ISettingsDialogService
+    {
+        public void ShowSettings(MainViewModel viewModel)
+        {
         }
     }
 }

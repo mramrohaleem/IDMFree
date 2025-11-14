@@ -320,6 +320,35 @@ public sealed class NetworkClient : INetworkClient
                 eventCode: "DOWNLOAD_RANGE_SUCCESS",
                 context: ctx);
         }
+        catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
+        {
+            _logger.Info(
+                "Range download canceled by request.",
+                eventCode: "DOWNLOAD_RANGE_CANCELED",
+                context: new
+                {
+                    ctx.Url,
+                    From = ctx.From,
+                    To = ctx.To,
+                    CancellationRequested = true
+                });
+
+            throw;
+        }
+        catch (OperationCanceledException ex)
+        {
+            var timeoutEx = new TimeoutException(
+                "The download operation timed out or the remote host closed the connection.",
+                ex);
+
+            _logger.Error(
+                "Range download canceled unexpectedly (timeout).",
+                eventCode: "DOWNLOAD_RANGE_ERROR",
+                exception: timeoutEx,
+                context: ctx);
+
+            throw timeoutEx;
+        }
         catch (HttpRequestException ex) when (ex.StatusCode.HasValue)
         {
             var status = ex.StatusCode.Value;
@@ -354,7 +383,7 @@ public sealed class NetworkClient : INetworkClient
 
             throw;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not TimeoutException)
         {
             _logger.Error(
                 "Range download failed",

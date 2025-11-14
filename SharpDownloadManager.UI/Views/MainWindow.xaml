@@ -3,10 +3,27 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:converters="clr-namespace:SharpDownloadManager.UI.Converters"
         mc:Ignorable="d"
         Title="Sharp Download Manager"
         Height="600"
         Width="1000">
+    <Window.Resources>
+        <converters:NullablePercentageConverter x:Key="NullablePercentageConverter" />
+        <Style TargetType="DataGridRow">
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Status}" Value="Completed">
+                    <Setter Property="Background" Value="#E8F8E8" />
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Status}" Value="Error">
+                    <Setter Property="Background" Value="#FCE8E6" />
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Status}" Value="Paused">
+                    <Setter Property="Background" Value="#FFF9E6" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+    </Window.Resources>
     <DockPanel>
         <ToolBar DockPanel.Dock="Top">
             <TextBlock Text="URL:" VerticalAlignment="Center" Margin="2" />
@@ -35,9 +52,18 @@
                     Margin="2"
                     Command="{Binding DeleteDownloadCommand}"
                     CommandParameter="{Binding SelectedDownload}" />
-            <Button Content="Open File" Margin="2" IsEnabled="False" Command="{x:Null}" />
-            <Button Content="Open Folder" Margin="2" IsEnabled="False" Command="{x:Null}" />
-            <Button Content="Settings" Margin="2" IsEnabled="False" Command="{x:Null}" />
+            <Button Content="Open File"
+                    Margin="2"
+                    Command="{Binding OpenFileCommand}"
+                    CommandParameter="{Binding SelectedDownload}" />
+            <Button Content="Open Folder"
+                    Margin="2"
+                    Command="{Binding OpenFolderCommand}"
+                    CommandParameter="{Binding SelectedDownload}" />
+            <Separator />
+            <Button Content="Settings"
+                    Margin="2"
+                    Command="{Binding OpenSettingsCommand}" />
         </ToolBar>
         <Grid>
             <Grid.RowDefinitions>
@@ -50,20 +76,53 @@
                       Margin="8"
                       IsReadOnly="True"
                       SelectionMode="Single"
-                      SelectedItem="{Binding SelectedDownload, Mode=TwoWay}">
+                      SelectedItem="{Binding SelectedDownload, Mode=TwoWay}"
+                      MouseDoubleClick="OnDownloadsDoubleClick">
                 <DataGrid.Columns>
-                    <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="2*" />
-                    <DataGridTextColumn Header="Status" Binding="{Binding StatusText}" Width="*" />
-                    <DataGridTextColumn Header="Progress (%)" Binding="{Binding Progress}" Width="*" />
-                    <DataGridTextColumn Header="Size (Total / Downloaded)" Binding="{Binding SizeText}" Width="*" />
-                    <DataGridTextColumn Header="Speed" Binding="{Binding SpeedText}" Width="*" />
-                    <DataGridTextColumn Header="ETA" Binding="{Binding EtaText}" Width="*" />
-                    <DataGridTextColumn Header="Mode" Binding="{Binding ModeText}" Width="*" />
-                    <DataGridTextColumn Header="Error" Binding="{Binding ErrorText}" Width="2*" />
-                    <DataGridTemplateColumn Header="Actions" Width="2*">
+                    <DataGridTextColumn Header="Name"
+                                          Binding="{Binding Name}"
+                                          Width="2*"
+                                          MinWidth="160" />
+                    <DataGridTextColumn Header="Status"
+                                          Binding="{Binding StatusText}"
+                                          Width="*"
+                                          MinWidth="100" />
+                    <DataGridTextColumn Header="Progress (%)"
+                                          Binding="{Binding ProgressPercent, Converter={StaticResource NullablePercentageConverter}}"
+                                          Width="*"
+                                          MinWidth="90" />
+                    <DataGridTextColumn Header="Size (Downloaded / Total)"
+                                          Binding="{Binding SizeText}"
+                                          Width="*"
+                                          MinWidth="140" />
+                    <DataGridTextColumn Header="Speed"
+                                          Binding="{Binding SpeedText}"
+                                          Width="*"
+                                          MinWidth="110" />
+                    <DataGridTextColumn Header="ETA"
+                                          Binding="{Binding EtaText}"
+                                          Width="*"
+                                          MinWidth="90" />
+                    <DataGridTextColumn Header="Mode"
+                                          Binding="{Binding ModeText}"
+                                          Width="*"
+                                          MinWidth="80" />
+                    <DataGridTextColumn Header="Error"
+                                          Binding="{Binding ErrorText}"
+                                          Width="2*"
+                                          MinWidth="160" />
+                    <DataGridTemplateColumn Header="Actions" Width="2*" MinWidth="220">
                         <DataGridTemplateColumn.CellTemplate>
                             <DataTemplate>
                                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                                    <Button Content="Open"
+                                            Margin="2"
+                                            Command="{Binding DataContext.OpenFileCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                            CommandParameter="{Binding}" />
+                                    <Button Content="Folder"
+                                            Margin="2"
+                                            Command="{Binding DataContext.OpenFolderCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                            CommandParameter="{Binding}" />
                                     <Button Content="Pause"
                                             Margin="2"
                                             Command="{Binding DataContext.PauseDownloadCommand, RelativeSource={RelativeSource AncestorType=Window}}"

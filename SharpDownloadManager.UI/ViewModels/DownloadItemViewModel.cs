@@ -1,6 +1,7 @@
 using System;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using System.IO;
 using SharpDownloadManager.Core.Domain;
 
 namespace SharpDownloadManager.UI.ViewModels;
@@ -11,6 +12,7 @@ public class DownloadItemViewModel : INotifyPropertyChanged
     private string _name = string.Empty;
     private string _statusText = string.Empty;
     private double _progress;
+    private double? _progressPercent;
     private string _sizeText = string.Empty;
     private string _speedText = string.Empty;
     private string _etaText = string.Empty;
@@ -18,6 +20,9 @@ public class DownloadItemViewModel : INotifyPropertyChanged
     private string _errorText = string.Empty;
     private long _lastBytes;
     private DateTime _lastUpdateTimeUtc;
+    private DownloadStatus _status;
+    private string _filePath = string.Empty;
+    private bool _isFileAvailable;
 
     public DownloadItemViewModel()
     {
@@ -52,6 +57,12 @@ public class DownloadItemViewModel : INotifyPropertyChanged
         set => SetProperty(ref _progress, value);
     }
 
+    public double? ProgressPercent
+    {
+        get => _progressPercent;
+        set => SetProperty(ref _progressPercent, value);
+    }
+
     public string SizeText
     {
         get => _sizeText;
@@ -82,6 +93,24 @@ public class DownloadItemViewModel : INotifyPropertyChanged
         set => SetProperty(ref _errorText, value);
     }
 
+    public DownloadStatus Status
+    {
+        get => _status;
+        set => SetProperty(ref _status, value);
+    }
+
+    public string FilePath
+    {
+        get => _filePath;
+        set => SetProperty(ref _filePath, value);
+    }
+
+    public bool IsFileAvailable
+    {
+        get => _isFileAvailable;
+        set => SetProperty(ref _isFileAvailable, value);
+    }
+
     public event PropertyChangedEventHandler? PropertyChanged;
 
     public void UpdateFromTask(DownloadTask task)
@@ -95,6 +124,7 @@ public class DownloadItemViewModel : INotifyPropertyChanged
 
         Id = task.Id;
         Name = string.IsNullOrWhiteSpace(task.FileName) ? task.Url : task.FileName;
+        Status = task.Status;
         if (task.Status == DownloadStatus.Error && task.LastErrorCode != DownloadErrorCode.None)
         {
             StatusText = $"{task.Status} ({task.LastErrorCode})";
@@ -105,17 +135,22 @@ public class DownloadItemViewModel : INotifyPropertyChanged
         }
 
         ErrorText = task.LastErrorMessage ?? string.Empty;
+        FilePath = task.SavePath ?? string.Empty;
+        IsFileAvailable = !string.IsNullOrWhiteSpace(task.SavePath) && File.Exists(task.SavePath);
 
         var writtenBytes = task.BytesWritten;
 
         double progress = 0d;
+        double? progressPercent = null;
         if (task.ContentLength.HasValue && task.ContentLength.Value > 0)
         {
             progress = 100.0 * writtenBytes / task.ContentLength.Value;
+            progressPercent = progress;
         }
 
         Progress = progress;
-        SizeText = $"{writtenBytes} / {task.ContentLength?.ToString() ?? "Unknown"}";
+        ProgressPercent = progressPercent;
+        SizeText = $"{FormatBytes(writtenBytes)} / {FormatTotal(task.ContentLength)}";
         var nowUtc = DateTime.UtcNow;
         var totalBytes = writtenBytes;
 
@@ -180,6 +215,33 @@ public class DownloadItemViewModel : INotifyPropertyChanged
         }
 
         ModeText = task.Mode.ToString();
+    }
+
+    private static string FormatTotal(long? total)
+    {
+        return total.HasValue && total.Value > 0
+            ? FormatBytes(total.Value)
+            : "Unknown";
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes < 0)
+        {
+            return "0 B";
+        }
+
+        string[] units = { "B", "KB", "MB", "GB", "TB" };
+        double value = bytes;
+        int unitIndex = 0;
+
+        while (value >= 1024 && unitIndex < units.Length - 1)
+        {
+            value /= 1024;
+            unitIndex++;
+        }
+
+        return $"{value:0.##} {units[unitIndex]}";
     }
 
     private static string FormatSpeed(double bytesPerSecond)

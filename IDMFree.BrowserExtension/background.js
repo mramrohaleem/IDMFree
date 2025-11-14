@@ -95,16 +95,28 @@ chrome.downloads.onCreated.addListener((item) => {
               chrome.runtime.lastError
             );
           }
+
+          chrome.downloads.erase({ id: item.id }, () => {
+            if (chrome.runtime.lastError) {
+              console.warn(
+                "[IDMFree] Failed to erase browser download entry",
+                chrome.runtime.lastError
+              );
+            }
+          });
         });
       } else {
-        console.warn(
-          "[IDMFree] IDMFree API returned non-success status",
+        console.error(
+          "[IDMFree] IDMFree bridge error, falling back to normal browser download",
           res.status
         );
       }
     })
     .catch((err) => {
-      console.error("[IDMFree] Failed to forward download", err);
+      console.error(
+        "[IDMFree] IDMFree bridge error, falling back to normal browser download",
+        err
+      );
       // On error, do NOT cancel the browser download.
     });
 });
