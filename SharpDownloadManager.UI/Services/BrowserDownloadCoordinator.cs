@@ -98,7 +98,7 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
             {
                 _dispatcher.Invoke(() =>
                 {
-                    MessageBox.Show(
+                    System.Windows.MessageBox.Show(
                         httpEx.Message,
                         "Download failed",
                         MessageBoxButton.OK,
@@ -125,7 +125,7 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
             {
                 _dispatcher.Invoke(() =>
                 {
-                    MessageBox.Show(
+                    System.Windows.MessageBox.Show(
                         ex.Message,
                         "Failed to start download",
                         MessageBoxButton.OK,
