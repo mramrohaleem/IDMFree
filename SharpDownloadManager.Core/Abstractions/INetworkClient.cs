@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -16,6 +17,7 @@ public interface INetworkClient
     Task<HttpResourceInfo> ProbeAsync(
         string url,
         IReadOnlyDictionary<string, string>? extraHeaders = null,
+        HttpMethod? preferredMethod = null,
         CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -32,5 +34,6 @@ public interface INetworkClient
         IProgress<long>? progress = null,
         CancellationToken cancellationToken = default,
         bool allowHtmlFallback = true,
-        IReadOnlyDictionary<string, string>? extraHeaders = null);
+        IReadOnlyDictionary<string, string>? extraHeaders = null,
+        HttpMethod? requestMethod = null);
 }
