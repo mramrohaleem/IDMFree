@@ -69,6 +69,8 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
             headers = new Dictionary<string, string>(request.Headers, StringComparer.OrdinalIgnoreCase);
         }
 
+        var normalizedMethod = NormalizeHttpMethod(request.Method);
+
         try
         {
             var task = await _downloadEngine
@@ -78,6 +80,7 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
                     prompt.TargetFolder,
                     DownloadMode.Normal,
                     headers,
+                    normalizedMethod,
                     cancellationToken)
                 .ConfigureAwait(false);
 
@@ -85,7 +88,7 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
                 "Browser download dialog confirmed.",
                 eventCode: "BROWSER_DOWNLOAD_DIALOG_CONFIRMED",
                 downloadId: task.Id,
-                context: new { request.Url, prompt.TargetFolder, prompt.FileName });
+                context: new { request.Url, prompt.TargetFolder, prompt.FileName, Method = normalizedMethod });
 
             return BrowserDownloadResult.Accepted(task);
         }
@@ -181,6 +184,24 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
         }
 
         return null;
+    }
+
+    private static string NormalizeHttpMethod(string? method)
+    {
+        if (string.IsNullOrWhiteSpace(method))
+        {
+            return HttpMethod.Get.Method;
+        }
+
+        try
+        {
+            var parsed = new HttpMethod(method.Trim());
+            return parsed.Method.ToUpperInvariant();
+        }
+        catch
+        {
+            return HttpMethod.Get.Method;
+        }
     }
 
     private static void BringWindowToFront(Window? window)

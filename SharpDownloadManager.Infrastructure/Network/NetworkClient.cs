@@ -20,6 +20,7 @@ public sealed class NetworkClient : INetworkClient
 {
     private readonly ILogger _logger;
     private static readonly HttpClient _client = CreateClient();
+    private const string RetryAfterSecondsKey = "RetryAfterSeconds";
 
     private static HttpClient CreateClient()
     {
@@ -56,6 +57,7 @@ public sealed class NetworkClient : INetworkClient
     public async Task<HttpResourceInfo> ProbeAsync(
         string url,
         IReadOnlyDictionary<string, string>? extraHeaders = null,
+        HttpMethod? preferredMethod = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(url))
@@ -71,58 +73,63 @@ public sealed class NetworkClient : INetworkClient
             context: new { Url = url });
 
         HttpResponseMessage? response = null;
+        var normalizedMethod = NormalizeHttpMethod(preferredMethod);
+        var shouldUseHeadProbe = normalizedMethod == HttpMethod.Get;
 
-            try
+        try
+        {
+            var primaryMethod = shouldUseHeadProbe ? HttpMethod.Head : normalizedMethod;
+            var fallbackMethod = normalizedMethod == HttpMethod.Head ? HttpMethod.Get : normalizedMethod;
+
+            response = await SendWithFallbackAsync(
+                    uri,
+                    primaryMethod,
+                    fallbackMethod,
+                    extraHeaders,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            response.EnsureSuccessStatusCode();
+            var contentLength = response.Content.Headers.ContentLength;
+
+            var supportsRange =
+                response.Headers.AcceptRanges.Contains("bytes") ||
+                response.Content.Headers.ContentRange != null;
+
+            var isChunkedWithoutLength =
+                !contentLength.HasValue &&
+                response.Headers.TransferEncodingChunked == true;
+
+            // نكتفي باللي جاي من Content headers
+            var lastModified = response.Content.Headers.LastModified;
+            var contentDispositionName = ExtractFileNameFromContentDisposition(
+                response.Content.Headers.ContentDisposition);
+
+            var info = new HttpResourceInfo
             {
-                // Try HEAD first, fall back to GET when servers don't like HEAD.
-                response = await SendWithFallbackAsync(
-                        uri,
-                        HttpMethod.Head,
-                        extraHeaders,
-                        cancellationToken)
-                    .ConfigureAwait(false);
+                Url = uri,
+                ContentLength = contentLength,
+                SupportsRange = supportsRange,
+                ETag = response.Headers.ETag?.Tag,
+                LastModified = lastModified,
+                IsChunkedWithoutLength = isChunkedWithoutLength,
+                ContentDispositionFileName = contentDispositionName,
+                ContentType = response.Content.Headers.ContentType?.MediaType
+            };
 
-                response.EnsureSuccessStatusCode();
-                var contentLength = response.Content.Headers.ContentLength;
-
-                var supportsRange =
-                    response.Headers.AcceptRanges.Contains("bytes") ||
-                    response.Content.Headers.ContentRange != null;
-
-                var isChunkedWithoutLength =
-                    !contentLength.HasValue &&
-                    response.Headers.TransferEncodingChunked == true;
-
-                // نكتفي باللي جاي من Content headers
-                var lastModified = response.Content.Headers.LastModified;
-                var contentDispositionName = ExtractFileNameFromContentDisposition(
-                    response.Content.Headers.ContentDisposition);
-
-                var info = new HttpResourceInfo
+            _logger.Info(
+                "Probe completed",
+                eventCode: "PROBE_SUCCESS",
+                context: new
                 {
-                    Url = uri,
-                    ContentLength = contentLength,
-                    SupportsRange = supportsRange,
-                    ETag = response.Headers.ETag?.Tag,
-                    LastModified = lastModified,
-                    IsChunkedWithoutLength = isChunkedWithoutLength,
-                    ContentDispositionFileName = contentDispositionName,
-                    ContentType = response.Content.Headers.ContentType?.MediaType
-                };
-
-                _logger.Info(
-                    "Probe completed",
-                    eventCode: "PROBE_SUCCESS",
-                    context: new
-                    {
-                        Url = url,
-                        info.ContentLength,
-                        info.IsChunkedWithoutLength,
-                        info.SupportsRange,
-                        info.ETag,
-                        info.LastModified,
-                        info.ContentDispositionFileName
-                    });
+                    Url = url,
+                    info.ContentLength,
+                    info.IsChunkedWithoutLength,
+                    info.SupportsRange,
+                    info.ETag,
+                    info.LastModified,
+                    info.ContentDispositionFileName
+                });
 
             return info;
         }
@@ -185,7 +192,8 @@ public sealed class NetworkClient : INetworkClient
         IProgress<long>? progress = null,
         CancellationToken cancellationToken = default,
         bool allowHtmlFallback = true,
-        IReadOnlyDictionary<string, string>? extraHeaders = null)
+        IReadOnlyDictionary<string, string>? extraHeaders = null,
+        HttpMethod? requestMethod = null)
     {
         if (url is null) throw new ArgumentNullException(nameof(url));
         if (target is null) throw new ArgumentNullException(nameof(target));
@@ -197,7 +205,16 @@ public sealed class NetworkClient : INetworkClient
             eventCode: "DOWNLOAD_RANGE_START",
             context: ctx);
 
-        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        var normalizedMethod = NormalizeHttpMethod(requestMethod);
+        // Only GET can deliver a response body reliably. If the browser used
+        // a different verb (e.g. POST), we still leverage the forwarded
+        // headers/cookies but fall back to GET for the actual transfer.
+        if (normalizedMethod != HttpMethod.Get)
+        {
+            normalizedMethod = HttpMethod.Get;
+        }
+
+        using var request = new HttpRequestMessage(normalizedMethod, url);
         ApplyCommonHeaders(request, url, extraHeaders);
         ApplyExtraHeaders(request, extraHeaders);
 
@@ -216,6 +233,26 @@ public sealed class NetworkClient : INetworkClient
                     HttpCompletionOption.ResponseHeadersRead,
                     cancellationToken)
                 .ConfigureAwait(false);
+
+            if (response.StatusCode == HttpStatusCode.TooManyRequests)
+            {
+                var retryAfter = TryGetRetryAfter(response);
+                var friendly429 = retryAfter.HasValue && retryAfter.Value > TimeSpan.Zero
+                    ? $"Server returned 429 Too Many Requests. Retrying in approximately {retryAfter.Value.TotalSeconds:0} seconds."
+                    : "Server returned 429 Too Many Requests. The server asked us to slow down.";
+
+                var throttled = new HttpRequestException(
+                    friendly429,
+                    null,
+                    HttpStatusCode.TooManyRequests);
+
+                if (retryAfter.HasValue && retryAfter.Value > TimeSpan.Zero)
+                {
+                    throttled.Data[RetryAfterSecondsKey] = retryAfter.Value.TotalSeconds;
+                }
+
+                throw throttled;
+            }
 
             response.EnsureSuccessStatusCode();
 
@@ -270,7 +307,8 @@ public sealed class NetworkClient : INetworkClient
                             progress,
                             cancellationToken,
                             allowHtmlFallback: false,
-                            extraHeaders: extraHeaders)
+                            extraHeaders: extraHeaders,
+                            requestMethod: requestMethod)
                         .ConfigureAwait(false);
 
                     return fallbackMetadata;
@@ -494,6 +532,66 @@ public sealed class NetworkClient : INetworkClient
         {
             // ignore invalid referrer
         }
+    }
+
+    private static HttpMethod NormalizeHttpMethod(HttpMethod? method)
+    {
+        if (method is null)
+        {
+            return HttpMethod.Get;
+        }
+
+        var methodName = method.Method?.Trim();
+        if (string.IsNullOrEmpty(methodName))
+        {
+            return HttpMethod.Get;
+        }
+
+        if (methodName.Equals(HttpMethod.Get.Method, StringComparison.OrdinalIgnoreCase))
+        {
+            return HttpMethod.Get;
+        }
+
+        if (methodName.Equals(HttpMethod.Head.Method, StringComparison.OrdinalIgnoreCase))
+        {
+            return HttpMethod.Head;
+        }
+
+        try
+        {
+            return new HttpMethod(methodName.ToUpperInvariant());
+        }
+        catch
+        {
+            return HttpMethod.Get;
+        }
+    }
+
+    private static TimeSpan? TryGetRetryAfter(HttpResponseMessage response)
+    {
+        if (response is null)
+        {
+            return null;
+        }
+
+        if (response.Headers.RetryAfter is { } retryAfter)
+        {
+            if (retryAfter.Delta.HasValue && retryAfter.Delta.Value > TimeSpan.Zero)
+            {
+                return retryAfter.Delta.Value;
+            }
+
+            if (retryAfter.Date.HasValue)
+            {
+                var delta = retryAfter.Date.Value - DateTimeOffset.UtcNow;
+                if (delta > TimeSpan.Zero)
+                {
+                    return delta;
+                }
+            }
+        }
+
+        return null;
     }
 
     private static void ApplyExtraHeaders(HttpRequestMessage request, IReadOnlyDictionary<string, string>? extraHeaders)
@@ -835,6 +933,7 @@ public sealed class NetworkClient : INetworkClient
     private static async Task<HttpResponseMessage> SendWithFallbackAsync(
         Uri uri,
         HttpMethod primaryMethod,
+        HttpMethod fallbackMethod,
         IReadOnlyDictionary<string, string>? extraHeaders,
         CancellationToken cancellationToken)
     {
@@ -853,19 +952,22 @@ public sealed class NetworkClient : INetworkClient
             response.StatusCode == HttpStatusCode.NotImplemented ||
             response.StatusCode == HttpStatusCode.Forbidden)
         {
-            // Some servers reject HEAD but allow GET – retry with GET.
-            response.Dispose();
+            if (!string.Equals(primaryMethod.Method, fallbackMethod.Method, StringComparison.OrdinalIgnoreCase))
+            {
+                // Some servers reject HEAD but allow an alternate verb – retry with the fallback method.
+                response.Dispose();
 
-            var getRequest = new HttpRequestMessage(HttpMethod.Get, uri);
-            ApplyCommonHeaders(getRequest, uri, extraHeaders);
-            ApplyExtraHeaders(getRequest, extraHeaders);
+                using var fallbackRequest = new HttpRequestMessage(fallbackMethod, uri);
+                ApplyCommonHeaders(fallbackRequest, uri, extraHeaders);
+                ApplyExtraHeaders(fallbackRequest, extraHeaders);
 
-            return await _client
-                .SendAsync(
-                    getRequest,
-                    HttpCompletionOption.ResponseHeadersRead,
-                    cancellationToken)
-                .ConfigureAwait(false);
+                return await _client
+                    .SendAsync(
+                        fallbackRequest,
+                        HttpCompletionOption.ResponseHeadersRead,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
         }
 
         return response;

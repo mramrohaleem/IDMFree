@@ -153,7 +153,7 @@ public class DownloadItemViewModel : INotifyPropertyChanged
         ResumeCapability = task.ResumeCapability;
         if (task.Status == DownloadStatus.Throttled || task.HttpStatusCategory == HttpStatusCategory.TooManyRequests)
         {
-            var message = "Paused (server said: Too Many Requests";
+            var message = "Throttled by server (HTTP 429";
             if (task.NextRetryUtc.HasValue)
             {
                 var retryIn = task.NextRetryUtc.Value - DateTimeOffset.UtcNow;
@@ -163,7 +163,7 @@ public class DownloadItemViewModel : INotifyPropertyChanged
                 }
             }
 
-            message += ", try again after a while)";
+            message += ")";
             StatusText = message;
         }
         else if (task.Status == DownloadStatus.Error && task.LastErrorCode != DownloadErrorCode.None)

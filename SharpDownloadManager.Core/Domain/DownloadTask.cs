@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Net.Http;
 
 namespace SharpDownloadManager.Core.Domain;
 
@@ -16,6 +17,8 @@ public class DownloadTask
     public string SavePath { get; set; } = string.Empty;
 
     public string TempChunkFolderPath { get; set; } = string.Empty;
+
+    public string RequestMethod { get; set; } = HttpMethod.Get.Method;
 
     public DownloadStatus Status { get; set; } = DownloadStatus.Queued;
 

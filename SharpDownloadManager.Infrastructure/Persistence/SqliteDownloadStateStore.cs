@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS Downloads (
     LastErrorCode INTEGER NOT NULL,
     LastErrorMessage TEXT NULL,
     RequestHeaders TEXT NULL,
+    RequestMethod TEXT NOT NULL DEFAULT 'GET',
     TotalActiveSeconds REAL NOT NULL DEFAULT 0,
     LastResumedAt TEXT NULL,
     HttpStatusCategory INTEGER NOT NULL DEFAULT 0,
@@ -120,6 +121,14 @@ CREATE TABLE IF NOT EXISTS Chunks (
                     "Downloads",
                     "RequestHeaders",
                     "TEXT NULL",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "RequestMethod",
+                    "TEXT NOT NULL DEFAULT 'GET'",
                     cancellationToken)
                 .ConfigureAwait(false);
 
@@ -294,6 +303,7 @@ CREATE TABLE IF NOT EXISTS Downloads (
     LastErrorCode INTEGER NOT NULL,
     LastErrorMessage TEXT NULL,
     RequestHeaders TEXT NULL,
+    RequestMethod TEXT NOT NULL DEFAULT 'GET',
     TotalActiveSeconds REAL NOT NULL DEFAULT 0,
     LastResumedAt TEXT NULL,
     HttpStatusCategory INTEGER NOT NULL DEFAULT 0,
@@ -348,6 +358,14 @@ CREATE TABLE IF NOT EXISTS Chunks (
                     cancellationToken)
                 .ConfigureAwait(false);
 
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "RequestMethod",
+                    "TEXT NOT NULL DEFAULT 'GET'",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
             _logger.Info("SQLite state store recreated after corruption.", eventCode: "STATE_STORE_RESET", context: new { DbPath = _dbPath });
         }
     }
@@ -377,7 +395,7 @@ INSERT INTO Downloads (
     ETag, LastModified,
     TotalDownloadedBytes, BytesWritten, ActualFileSize, ConnectionsCount,
     LastErrorCode, LastErrorMessage,
-    RequestHeaders,
+    RequestHeaders, RequestMethod,
     TotalActiveSeconds, LastResumedAt, HttpStatusCategory,
     TooManyRequestsRetryCount, RetryBackoffSeconds, NextRetryUtc, MaxParallelConnections
 ) VALUES (
@@ -386,7 +404,7 @@ INSERT INTO Downloads (
     $ETag, $LastModified,
     $TotalDownloadedBytes, $BytesWritten, $ActualFileSize, $ConnectionsCount,
     $LastErrorCode, $LastErrorMessage,
-    $RequestHeaders,
+    $RequestHeaders, $RequestMethod,
     $TotalActiveSeconds, $LastResumedAt, $HttpStatusCategory,
     $TooManyRequestsRetryCount, $RetryBackoffSeconds, $NextRetryUtc, $MaxParallelConnections
 )
@@ -410,6 +428,7 @@ ON CONFLICT(Id) DO UPDATE SET
     LastErrorCode = excluded.LastErrorCode,
     LastErrorMessage = excluded.LastErrorMessage,
     RequestHeaders = excluded.RequestHeaders,
+    RequestMethod = excluded.RequestMethod,
     TotalActiveSeconds = excluded.TotalActiveSeconds,
     LastResumedAt = excluded.LastResumedAt,
     HttpStatusCategory = excluded.HttpStatusCategory,
@@ -449,6 +468,10 @@ ON CONFLICT(Id) DO UPDATE SET
                 cmd.Parameters.AddWithValue("$LastErrorMessage", (object?)task.LastErrorMessage ?? DBNull.Value);
                 var headersJson = SerializeHeaders(task.RequestHeaders);
                 cmd.Parameters.AddWithValue("$RequestHeaders", (object?)headersJson ?? DBNull.Value);
+                var methodValue = string.IsNullOrWhiteSpace(task.RequestMethod)
+                    ? "GET"
+                    : task.RequestMethod.ToUpperInvariant();
+                cmd.Parameters.AddWithValue("$RequestMethod", methodValue);
                 cmd.Parameters.AddWithValue("$TotalActiveSeconds", task.TotalActiveTime.TotalSeconds);
                 cmd.Parameters.AddWithValue("$LastResumedAt", task.LastResumedAt?.ToString("o") ?? (object)DBNull.Value);
                 cmd.Parameters.AddWithValue("$HttpStatusCategory", (int)task.HttpStatusCategory);
@@ -635,6 +658,18 @@ INSERT INTO Chunks (
                         var rawHeaders = reader.GetString(reader.GetOrdinal("RequestHeaders"));
                         var headers = DeserializeHeaders(rawHeaders);
                         task.RequestHeaders = headers;
+                    }
+
+                    if (!reader.IsDBNull(reader.GetOrdinal("RequestMethod")))
+                    {
+                        var method = reader.GetString(reader.GetOrdinal("RequestMethod"));
+                        task.RequestMethod = string.IsNullOrWhiteSpace(method)
+                            ? "GET"
+                            : method.ToUpperInvariant();
+                    }
+                    else
+                    {
+                        task.RequestMethod = "GET";
                     }
 
                     // Reset unsafe states to Paused

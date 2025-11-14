@@ -231,6 +231,10 @@ public sealed class BrowserBridgeServer : IDisposable
             }
 
             payload.FileName = FileNameHelper.NormalizeFileName(payload.FileName);
+            if (string.IsNullOrWhiteSpace(payload.Method))
+            {
+                payload.Method = "GET";
+            }
 
             _logger.Info(
                 "Browser API request received.",
