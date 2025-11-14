@@ -13,7 +13,10 @@ public interface INetworkClient
     /// such as Content-Length, ETag, Last-Modified, and whether Range
     /// requests are truly supported.
     /// </summary>
-    Task<HttpResourceInfo> ProbeAsync(string url, CancellationToken cancellationToken = default);
+    Task<HttpResourceInfo> ProbeAsync(
+        string url,
+        IReadOnlyDictionary<string, string>? extraHeaders = null,
+        CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Downloads a byte range [from..to] (inclusive) from the given URL into the destination stream.
@@ -21,7 +24,7 @@ public interface INetworkClient
     /// Reports incremental bytes read via progress (if provided).
     /// Throws on HTTP errors (4xx/5xx) or network failures.
     /// </summary>
-    Task DownloadRangeToStreamAsync(
+    Task<DownloadResponseMetadata> DownloadRangeToStreamAsync(
         Uri url,
         long? from,
         long? to,

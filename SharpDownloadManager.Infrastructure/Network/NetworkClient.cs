@@ -55,6 +55,7 @@ public sealed class NetworkClient : INetworkClient
 
     public async Task<HttpResourceInfo> ProbeAsync(
         string url,
+        IReadOnlyDictionary<string, string>? extraHeaders = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(url))
@@ -77,6 +78,7 @@ public sealed class NetworkClient : INetworkClient
                 response = await SendWithFallbackAsync(
                         uri,
                         HttpMethod.Head,
+                        extraHeaders,
                         cancellationToken)
                     .ConfigureAwait(false);
 
@@ -174,7 +176,7 @@ public sealed class NetworkClient : INetworkClient
         }
     }
 
-    public async Task DownloadRangeToStreamAsync(
+    public async Task<DownloadResponseMetadata> DownloadRangeToStreamAsync(
         Uri url,
         long? from,
         long? to,
@@ -216,6 +218,8 @@ public sealed class NetworkClient : INetworkClient
 
             response.EnsureSuccessStatusCode();
 
+            var metadata = CreateDownloadResponseMetadata(response, from.HasValue || to.HasValue);
+
             var mediaType = response.Content.Headers.ContentType?.MediaType;
             using var responseStream = await response.Content
                 .ReadAsStreamAsync(cancellationToken)
@@ -256,7 +260,7 @@ public sealed class NetworkClient : INetworkClient
                     responseStream.Dispose();
                     response.Dispose();
 
-                    await DownloadRangeToStreamAsync(
+                    var fallbackMetadata = await DownloadRangeToStreamAsync(
                             fallbackUrl,
                             null,
                             null,
@@ -267,7 +271,7 @@ public sealed class NetworkClient : INetworkClient
                             extraHeaders: extraHeaders)
                         .ConfigureAwait(false);
 
-                    return;
+                    return fallbackMetadata;
                 }
 
                 var safeSnippet = snippet.Length > 1000 ? snippet[..1000] : snippet;
@@ -324,6 +328,8 @@ public sealed class NetworkClient : INetworkClient
                 "Completed range download",
                 eventCode: "DOWNLOAD_RANGE_SUCCESS",
                 context: ctx);
+
+            return metadata;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -448,6 +454,21 @@ public sealed class NetworkClient : INetworkClient
             return;
         }
 
+        static bool ShouldSkipHeader(string headerName)
+        {
+            return headerName.Equals("Host", StringComparison.OrdinalIgnoreCase) ||
+                   headerName.Equals("Content-Length", StringComparison.OrdinalIgnoreCase) ||
+                   headerName.Equals("Range", StringComparison.OrdinalIgnoreCase) ||
+                   headerName.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
+                   headerName.Equals("Proxy-Connection", StringComparison.OrdinalIgnoreCase) ||
+                   headerName.Equals("Keep-Alive", StringComparison.OrdinalIgnoreCase) ||
+                   headerName.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase) ||
+                   headerName.Equals("TE", StringComparison.OrdinalIgnoreCase) ||
+                   headerName.Equals("Trailer", StringComparison.OrdinalIgnoreCase) ||
+                   headerName.Equals("Upgrade", StringComparison.OrdinalIgnoreCase) ||
+                   headerName.Equals("Expect", StringComparison.OrdinalIgnoreCase);
+        }
+
         foreach (var kvp in extraHeaders)
         {
             var headerName = kvp.Key?.Trim();
@@ -456,9 +477,7 @@ public sealed class NetworkClient : INetworkClient
                 continue;
             }
 
-            if (headerName.Equals("Host", StringComparison.OrdinalIgnoreCase) ||
-                headerName.Equals("Content-Length", StringComparison.OrdinalIgnoreCase) ||
-                headerName.Equals("Range", StringComparison.OrdinalIgnoreCase))
+            if (ShouldSkipHeader(headerName))
             {
                 // Host and Content-Length are managed by HttpClient, Range is managed by downloader.
                 continue;
@@ -483,6 +502,41 @@ public sealed class NetworkClient : INetworkClient
 
             request.Headers.TryAddWithoutValidation(headerName, headerValue);
         }
+    }
+
+    private static DownloadResponseMetadata CreateDownloadResponseMetadata(
+        HttpResponseMessage response,
+        bool isRangeRequest)
+    {
+        if (response is null)
+        {
+            throw new ArgumentNullException(nameof(response));
+        }
+
+        var supportsRange = response.Headers.AcceptRanges.Contains("bytes") ||
+                            response.Content.Headers.ContentRange is not null;
+
+        long? resourceLength = null;
+        var contentRange = response.Content.Headers.ContentRange;
+        if (contentRange is not null && contentRange.Length.HasValue)
+        {
+            resourceLength = contentRange.Length.Value;
+        }
+        else if (!isRangeRequest)
+        {
+            resourceLength = response.Content.Headers.ContentLength;
+        }
+
+        var contentDispositionName = ExtractFileNameFromContentDisposition(
+            response.Content.Headers.ContentDisposition);
+
+        return new DownloadResponseMetadata(
+            response.Content.Headers.ContentLength,
+            resourceLength,
+            supportsRange,
+            response.Headers.ETag?.Tag,
+            response.Content.Headers.LastModified,
+            contentDispositionName);
     }
 
     // HTML helper regexes for fallback download URL extraction
@@ -726,10 +780,12 @@ public sealed class NetworkClient : INetworkClient
     private static async Task<HttpResponseMessage> SendWithFallbackAsync(
         Uri uri,
         HttpMethod primaryMethod,
+        IReadOnlyDictionary<string, string>? extraHeaders,
         CancellationToken cancellationToken)
     {
         using var request = new HttpRequestMessage(primaryMethod, uri);
         ApplyCommonHeaders(request, uri);
+        ApplyExtraHeaders(request, extraHeaders);
 
         var response = await _client
             .SendAsync(
@@ -747,6 +803,7 @@ public sealed class NetworkClient : INetworkClient
 
             var getRequest = new HttpRequestMessage(HttpMethod.Get, uri);
             ApplyCommonHeaders(getRequest, uri);
+            ApplyExtraHeaders(getRequest, extraHeaders);
 
             return await _client
                 .SendAsync(
