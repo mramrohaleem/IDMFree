@@ -320,7 +320,7 @@ public sealed class NetworkClient : INetworkClient
                 eventCode: "DOWNLOAD_RANGE_SUCCESS",
                 context: ctx);
         }
-        catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             _logger.Info(
                 "Range download canceled by request.",

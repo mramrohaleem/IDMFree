@@ -304,7 +304,8 @@ INSERT INTO Chunks (
 
             transaction.Commit();
 
-            _logger.Info("Download state saved.", eventCode: "STATE_STORE_SAVE", downloadId: task.Id, context: new { task.Status, task.Mode, ChunkCount = task.Chunks.Count });
+            var chunkCount = task.Chunks?.Count ?? 0;
+            _logger.Info("Download state saved.", eventCode: "STATE_STORE_SAVE", downloadId: task.Id, context: new { task.Status, task.Mode, ChunkCount = chunkCount });
         }
         catch (SqliteException ex) when (IsCorruptionError(ex))
         {

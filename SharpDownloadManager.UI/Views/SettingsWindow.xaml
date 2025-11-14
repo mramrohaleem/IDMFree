@@ -12,7 +12,7 @@
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <StackPanel Orientation="Vertical" Spacing="8">
+        <StackPanel Orientation="Vertical">
             <CheckBox Content="Show notification when a download completes"
                       IsChecked="{Binding AreCompletionNotificationsEnabled, Mode=TwoWay}" />
         </StackPanel>
