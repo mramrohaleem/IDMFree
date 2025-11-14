@@ -9,6 +9,7 @@ using SharpDownloadManager.Core.Abstractions;
 using SharpDownloadManager.Core.Domain;
 using SharpDownloadManager.Infrastructure.Logging;
 using SharpDownloadManager.UI.Views;
+using Application = System.Windows.Application;
 
 namespace SharpDownloadManager.UI.Services;
 
@@ -41,10 +42,12 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
             throw new ArgumentNullException(nameof(request));
         }
 
-        BrowserDownloadPrompt? prompt = await _dispatcher.InvokeAsync(
+        var operation = _dispatcher.InvokeAsync(
             () => ShowDialog(request),
             DispatcherPriority.Normal,
-            cancellationToken).ConfigureAwait(false);
+            cancellationToken);
+
+        BrowserDownloadPrompt? prompt = await operation.Task.ConfigureAwait(false);
 
         if (prompt is null)
         {

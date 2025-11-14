@@ -1,6 +1,7 @@
 using System;
 using System.Globalization;
 using System.Windows.Data;
+using Binding = System.Windows.Data.Binding;
 
 namespace SharpDownloadManager.UI.Converters;
 
