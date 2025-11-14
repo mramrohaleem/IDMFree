@@ -25,6 +25,7 @@ public class DownloadEngine : IDownloadEngine
     private readonly Dictionary<Guid, Task> _activeDownloadTasks = new();
     private readonly Dictionary<Guid, DownloadCancellationReason> _cancellationReasons = new();
     private readonly Dictionary<Guid, CancellationTokenSource> _scheduledRetryTokens = new();
+    private readonly Dictionary<Guid, ProgressTracker> _progressTrackers = new();
     private readonly string _tempRootFolder;
 
     private enum DownloadCancellationReason
@@ -42,6 +43,19 @@ public class DownloadEngine : IDownloadEngine
             : base(message, innerException)
         {
         }
+    }
+
+    private sealed class ProgressTracker
+    {
+        public double? LastLoggedPercent { get; set; }
+
+        public long LastLoggedBytes { get; set; }
+
+        public DateTimeOffset LastLogAt { get; set; }
+
+        public long LastPersistedBytes { get; set; }
+
+        public DateTimeOffset LastPersistedAt { get; set; }
     }
 
     public DownloadEngine(
@@ -67,6 +81,7 @@ public class DownloadEngine : IDownloadEngine
             _activeDownloadTasks.Clear();
             foreach (var task in persistedDownloads)
             {
+                EnsureResumeCapability(task, logChange: false);
                 _downloads[task.Id] = task;
             }
         }
@@ -111,11 +126,27 @@ public class DownloadEngine : IDownloadEngine
             normalizedHeaders = new Dictionary<string, string>(requestHeaders, StringComparer.OrdinalIgnoreCase);
         }
 
+        var id = Guid.NewGuid();
+
         var resourceInfo = await _networkClient
             .ProbeAsync(url, normalizedHeaders, cancellationToken)
             .ConfigureAwait(false);
 
-        var id = Guid.NewGuid();
+        _logger.Info(
+            "Detected download capabilities.",
+            downloadId: id,
+            eventCode: "DOWNLOAD_CAPABILITIES_DETECTED",
+            context: new
+            {
+                Url = resourceInfo.Url.ToString(),
+                resourceInfo.ContentLength,
+                resourceInfo.SupportsRange,
+                resourceInfo.IsChunkedWithoutLength,
+                HasContentDisposition = !string.IsNullOrWhiteSpace(resourceInfo.ContentDispositionFileName),
+                resourceInfo.ContentDispositionFileName,
+                resourceInfo.ContentType
+            });
+
         var fileName = ResolveFileName(
             suggestedFileName,
             resourceInfo.ContentDispositionFileName,
@@ -145,6 +176,7 @@ public class DownloadEngine : IDownloadEngine
         var connectionsCount = DetermineConnectionsCount(mode, resourceInfo);
         task.InitializeChunks(connectionsCount);
         task.MaxParallelConnections = connectionsCount;
+        EnsureResumeCapability(task);
 
         await _stateStore.SaveDownloadAsync(task, cancellationToken).ConfigureAwait(false);
 
@@ -158,7 +190,7 @@ public class DownloadEngine : IDownloadEngine
             "Download enqueued.",
             downloadId: task.Id,
             eventCode: "DOWNLOAD_ENQUEUED",
-            context: new { task.Url, task.FileName, task.Mode, task.ContentLength });
+            context: new { task.Url, task.FileName, task.Mode, task.ContentLength, task.SupportsRange, task.ResumeCapability });
 
         return task;
     }
@@ -167,12 +199,28 @@ public class DownloadEngine : IDownloadEngine
     {
         DownloadTask? task;
         bool shouldPersist = false;
+        string? taskUrl = null;
+        DownloadResumeCapability resumeCapability = DownloadResumeCapability.Unknown;
+        bool supportsRange = false;
+        long alreadyDownloaded = 0;
+        long? knownLength = null;
+        long? nextRangeStart = null;
 
         lock (_syncRoot)
         {
             if (!_downloads.TryGetValue(downloadId, out task))
             {
                 return;
+            }
+
+            taskUrl = task.Url;
+            resumeCapability = task.ResumeCapability;
+            supportsRange = task.SupportsRange;
+            alreadyDownloaded = task.TotalDownloadedBytes;
+            knownLength = task.ContentLength;
+            if (task.SupportsRange)
+            {
+                nextRangeStart = CalculateNextRangeStart(task);
             }
 
             if (task.Status == DownloadStatus.Completed)
@@ -200,6 +248,38 @@ public class DownloadEngine : IDownloadEngine
             }
 
             TryScheduleDownloads_NoLock();
+        }
+
+        if (task is not null)
+        {
+            _logger.Info(
+                "Resume requested.",
+                downloadId: downloadId,
+                eventCode: "DOWNLOAD_RESUME_REQUESTED",
+                context: new
+                {
+                    Url = taskUrl,
+                    ResumeCapability = resumeCapability.ToString(),
+                    SupportsRange = supportsRange,
+                    AlreadyDownloadedBytes = alreadyDownloaded,
+                    KnownContentLength = knownLength,
+                    RangeStart = nextRangeStart
+                });
+
+            if (resumeCapability == DownloadResumeCapability.RestartRequired)
+            {
+                _logger.Warn(
+                    "Server does not support range requests. Resume will restart from the beginning.",
+                    downloadId: downloadId,
+                    eventCode: "DOWNLOAD_RESUME_RESTART",
+                    context: new
+                    {
+                        Url = taskUrl,
+                        SupportsRange = supportsRange,
+                        AlreadyDownloadedBytes = alreadyDownloaded,
+                        KnownContentLength = knownLength
+                    });
+            }
         }
 
         if (shouldPersist && task is not null)
@@ -292,6 +372,7 @@ public class DownloadEngine : IDownloadEngine
         }
 
         ctsToCancel?.Cancel();
+        ResetProgressTracker(downloadId);
 
         await _stateStore.DeleteDownloadAsync(downloadId, cancellationToken).ConfigureAwait(false);
 
@@ -347,6 +428,7 @@ public class DownloadEngine : IDownloadEngine
 
             SyncChunkProgressFromDisk(task);
             task.UpdateProgressFromChunks();
+            ReportProgress(task);
             await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
 
             using var chunkCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -457,6 +539,18 @@ public class DownloadEngine : IDownloadEngine
             task.BytesWritten = finalLength;
             task.TotalDownloadedBytes = finalLength;
             task.ActualFileSize = finalLength;
+
+            if (!task.HasKnownContentLength && finalLength > 0)
+            {
+                task.ContentLength = finalLength;
+                _logger.Info(
+                    "Content length discovered from finalized file size.",
+                    downloadId: task.Id,
+                    eventCode: "CONTENT_LENGTH_DISCOVERED_LATE",
+                    context: new { task.Url, task.ContentLength });
+            }
+
+            ReportProgress(task);
 
             if (task.ContentLength.HasValue)
             {
@@ -590,6 +684,7 @@ public class DownloadEngine : IDownloadEngine
                 _cancellationReasons.Remove(task.Id);
                 CancelScheduledRetry_NoLock(task.Id);
             }
+            ResetProgressTracker(task.Id);
             _logger.Info("Download finished.", downloadId: task.Id, eventCode: "DOWNLOAD_RUN_FINISHED");
         }
 
@@ -629,6 +724,12 @@ public class DownloadEngine : IDownloadEngine
                 catch
                 {
                 }
+
+                _logger.Warn(
+                    "Server does not support range requests. Restarting download from zero.",
+                    downloadId: task.Id,
+                    eventCode: "DOWNLOAD_CHUNK_RESTART_NO_RANGE",
+                    context: new { task.Url });
             }
 
             if (expectedLength.HasValue && chunk.DownloadedBytes >= expectedLength.Value)
@@ -637,6 +738,7 @@ public class DownloadEngine : IDownloadEngine
                 chunk.LastErrorCode = null;
                 chunk.LastErrorMessage = null;
                 task.UpdateProgressFromChunks();
+                ReportProgress(task);
                 await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
                 return;
             }
@@ -657,6 +759,7 @@ public class DownloadEngine : IDownloadEngine
                     chunk.LastErrorCode = null;
                     chunk.LastErrorMessage = null;
                     task.UpdateProgressFromChunks();
+                    ReportProgress(task);
                     await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
                     return;
                 }
@@ -689,6 +792,7 @@ public class DownloadEngine : IDownloadEngine
                     }
 
                     task.UpdateProgressFromChunks();
+                    ReportProgress(task);
                 });
 
                 var allowFallback = !from.HasValue && !to.HasValue;
@@ -710,6 +814,7 @@ public class DownloadEngine : IDownloadEngine
                 chunk.LastErrorCode = null;
                 chunk.LastErrorMessage = null;
                 task.UpdateProgressFromChunks();
+                ReportProgress(task);
                 await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
             }
             catch (OperationCanceledException ex)
@@ -720,6 +825,7 @@ public class DownloadEngine : IDownloadEngine
                     chunk.LastErrorCode = DownloadErrorCode.Unknown;
                     chunk.LastErrorMessage = ex.Message;
                     task.UpdateProgressFromChunks();
+                    ReportProgress(task);
                     await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
                     throw;
                 }
@@ -737,6 +843,7 @@ public class DownloadEngine : IDownloadEngine
 
                 chunk.LastErrorMessage = null;
                 task.UpdateProgressFromChunks();
+                ReportProgress(task);
                 await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
                 throw;
             }
@@ -747,6 +854,7 @@ public class DownloadEngine : IDownloadEngine
                 chunk.LastErrorMessage = httpEx.Message;
                 task.HttpStatusCategory = HttpStatusCategory.TooManyRequests;
                 task.UpdateProgressFromChunks();
+                ReportProgress(task);
                 await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
                 throw new TooManyRequestsException(httpEx.Message, httpEx);
             }
@@ -776,6 +884,7 @@ public class DownloadEngine : IDownloadEngine
                 }
 
                 task.UpdateProgressFromChunks();
+                ReportProgress(task);
                 await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
                 throw;
             }
@@ -785,6 +894,7 @@ public class DownloadEngine : IDownloadEngine
                 chunk.LastErrorCode = DownloadErrorCode.Unknown;
                 chunk.LastErrorMessage = ex.Message;
                 task.UpdateProgressFromChunks();
+                ReportProgress(task);
                 await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
                 throw;
             }
@@ -865,6 +975,7 @@ public class DownloadEngine : IDownloadEngine
         }
 
         task.UpdateProgressFromChunks();
+        ReportProgress(task);
     }
 
     private async Task<bool> TryHandleTooManyRequestsAsync(
@@ -943,6 +1054,7 @@ public class DownloadEngine : IDownloadEngine
         }
 
         task.UpdateProgressFromChunks();
+        ReportProgress(task);
 
         await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
 
@@ -1195,6 +1307,250 @@ public class DownloadEngine : IDownloadEngine
         return fallback;
     }
 
+    private void EnsureResumeCapability(DownloadTask task, bool logChange = true)
+    {
+        if (task is null)
+        {
+            return;
+        }
+
+        var newCapability = task.SupportsRange
+            ? DownloadResumeCapability.Supported
+            : DownloadResumeCapability.RestartRequired;
+
+        if (task.ResumeCapability == newCapability)
+        {
+            return;
+        }
+
+        var previous = task.ResumeCapability;
+        task.ResumeCapability = newCapability;
+
+        if (!logChange && previous == DownloadResumeCapability.Unknown)
+        {
+            return;
+        }
+
+        _logger.Info(
+            "Resume capability updated.",
+            downloadId: task.Id,
+            eventCode: "DOWNLOAD_RESUME_CAPABILITY_CHANGED",
+            context: new
+            {
+                task.Url,
+                Previous = previous.ToString(),
+                Current = newCapability.ToString(),
+                task.SupportsRange
+            });
+    }
+
+    private void ReportProgress(DownloadTask task)
+    {
+        if (task is null)
+        {
+            return;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        ProgressTracker tracker;
+        lock (_syncRoot)
+        {
+            if (!_progressTrackers.TryGetValue(task.Id, out tracker))
+            {
+                tracker = new ProgressTracker
+                {
+                    LastLoggedBytes = task.TotalDownloadedBytes,
+                    LastLoggedPercent = null,
+                    LastLogAt = now,
+                    LastPersistedAt = now,
+                    LastPersistedBytes = task.TotalDownloadedBytes
+                };
+
+                if (task.HasKnownContentLength && task.ContentLength!.Value > 0)
+                {
+                    tracker.LastLoggedPercent =
+                        Math.Clamp((double)task.TotalDownloadedBytes / task.ContentLength.Value * 100d, 0d, 100d);
+                }
+
+                _progressTrackers[task.Id] = tracker;
+            }
+        }
+
+        double? percentForLog = null;
+        bool shouldLog = false;
+        string? logReason = null;
+        bool shouldPersist = false;
+        long totalBytes = task.TotalDownloadedBytes;
+        long? knownLength = task.ContentLength;
+
+        lock (tracker)
+        {
+            totalBytes = task.TotalDownloadedBytes;
+            if (task.HasKnownContentLength && knownLength.HasValue && knownLength.Value > 0)
+            {
+                var percent = (double)totalBytes / knownLength.Value * 100d;
+                var clamped = Math.Clamp(percent, 0d, 100d);
+                percentForLog = Math.Round(percent, 2);
+
+                if (!tracker.LastLoggedPercent.HasValue ||
+                    clamped - tracker.LastLoggedPercent.Value >= 5d ||
+                    now - tracker.LastLogAt >= TimeSpan.FromSeconds(30) ||
+                    clamped >= 100d)
+                {
+                    shouldLog = true;
+                    logReason = "percentage";
+                    tracker.LastLoggedPercent = clamped;
+                    tracker.LastLoggedBytes = totalBytes;
+                    tracker.LastLogAt = now;
+                }
+            }
+            else
+            {
+                percentForLog = null;
+                if (totalBytes - tracker.LastLoggedBytes >= 10L * 1024 * 1024 ||
+                    now - tracker.LastLogAt >= TimeSpan.FromSeconds(30))
+                {
+                    shouldLog = true;
+                    logReason = "bytes";
+                    tracker.LastLoggedBytes = totalBytes;
+                    tracker.LastLogAt = now;
+                }
+            }
+
+            if (now - tracker.LastPersistedAt >= TimeSpan.FromSeconds(15) ||
+                totalBytes - tracker.LastPersistedBytes >= 25L * 1024 * 1024)
+            {
+                tracker.LastPersistedAt = now;
+                tracker.LastPersistedBytes = totalBytes;
+                shouldPersist = true;
+            }
+        }
+
+        if (shouldLog)
+        {
+            _logger.Info(
+                percentForLog.HasValue
+                    ? "Download progress update."
+                    : "Download progress update (total size unknown).",
+                downloadId: task.Id,
+                eventCode: percentForLog.HasValue ? "DOWNLOAD_PROGRESS_PERCENT" : "DOWNLOAD_PROGRESS_BYTES",
+                context: new
+                {
+                    task.Url,
+                    DownloadedBytes = totalBytes,
+                    ContentLength = knownLength,
+                    Percent = percentForLog,
+                    task.ResumeCapability,
+                    Reason = logReason
+                });
+        }
+
+        if (shouldPersist)
+        {
+            var saveTask = SaveStateAsync(task, CancellationToken.None);
+            _ = saveTask.ContinueWith(
+                t =>
+                {
+                    if (t.IsFaulted && t.Exception is not null)
+                    {
+                        _logger.Warn(
+                            "Failed to persist download progress.",
+                            downloadId: task.Id,
+                            eventCode: "DOWNLOAD_PROGRESS_PERSIST_FAILED",
+                            context: new
+                            {
+                                task.Url,
+                                Error = t.Exception.GetBaseException().Message
+                            });
+                    }
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+    }
+
+    private void ResetProgressTracker(Guid downloadId)
+    {
+        lock (_syncRoot)
+        {
+            _progressTrackers.Remove(downloadId);
+        }
+    }
+
+    private static long? CalculateNextRangeStart(DownloadTask task)
+    {
+        if (task is null || !task.SupportsRange || task.Chunks is null || task.Chunks.Count == 0)
+        {
+            return null;
+        }
+
+        long? min = null;
+        foreach (var chunk in task.Chunks)
+        {
+            if (chunk.Status == ChunkStatus.Completed)
+            {
+                continue;
+            }
+
+            var start = chunk.StartByte + Math.Max(0, chunk.DownloadedBytes);
+            if (min is null || start < min.Value)
+            {
+                min = start;
+            }
+        }
+
+        return min;
+    }
+
+    private void TryRenameSaveFile(string? oldPath, string? newPath, Guid downloadId)
+    {
+        if (string.IsNullOrWhiteSpace(oldPath) || string.IsNullOrWhiteSpace(newPath))
+        {
+            return;
+        }
+
+        if (string.Equals(oldPath, newPath, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        if (!File.Exists(oldPath))
+        {
+            return;
+        }
+
+        try
+        {
+            var newDirectory = Path.GetDirectoryName(newPath);
+            if (!string.IsNullOrEmpty(newDirectory))
+            {
+                Directory.CreateDirectory(newDirectory);
+            }
+
+            if (File.Exists(newPath))
+            {
+                _logger.Warn(
+                    "Skipping file rename because target already exists.",
+                    downloadId: downloadId,
+                    eventCode: "DOWNLOAD_FILENAME_RENAME_SKIPPED",
+                    context: new { OldPath = oldPath, NewPath = newPath });
+                return;
+            }
+
+            File.Move(oldPath, newPath);
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn(
+                "Failed to rename download file to updated name.",
+                downloadId: downloadId,
+                eventCode: "DOWNLOAD_FILENAME_RENAME_FAILED",
+                exception: ex,
+                context: new { OldPath = oldPath, NewPath = newPath });
+        }
+    }
+
     private void TryUpdateTaskMetadataFromResponse(DownloadTask task, DownloadResponseMetadata metadata)
     {
         if (task is null || metadata is null)
@@ -1202,12 +1558,16 @@ public class DownloadEngine : IDownloadEngine
             return;
         }
 
+        var previouslyKnownLength = task.HasKnownContentLength;
+        bool lengthChanged = false;
+
         if (metadata.ResourceLength.HasValue)
         {
             var length = metadata.ResourceLength.Value;
-            if (!task.ContentLength.HasValue || task.ContentLength.Value != length)
+            if (length > 0 && (!task.ContentLength.HasValue || task.ContentLength.Value != length))
             {
                 task.ContentLength = length;
+                lengthChanged = true;
 
                 if (task.Chunks.Count == 1)
                 {
@@ -1225,6 +1585,7 @@ public class DownloadEngine : IDownloadEngine
             if (responseLength > 0 && (!task.ContentLength.HasValue || task.ContentLength.Value != responseLength))
             {
                 task.ContentLength = responseLength;
+                lengthChanged = true;
 
                 if (task.Chunks.Count == 1)
                 {
@@ -1237,10 +1598,18 @@ public class DownloadEngine : IDownloadEngine
             }
         }
 
-        if (metadata.SupportsRange && !task.SupportsRange)
+        if (lengthChanged && !previouslyKnownLength && task.HasKnownContentLength)
         {
-            task.SupportsRange = true;
+            _logger.Info(
+                "Content length discovered from response.",
+                downloadId: task.Id,
+                eventCode: "CONTENT_LENGTH_DISCOVERED_LATE",
+                context: new { task.Url, task.ContentLength });
         }
+
+        var previousSupportsRange = task.SupportsRange;
+        task.SupportsRange = metadata.SupportsRange;
+        EnsureResumeCapability(task, logChange: previousSupportsRange != task.SupportsRange);
 
         if (!string.IsNullOrEmpty(metadata.ETag) && string.IsNullOrEmpty(task.ETag))
         {
@@ -1268,14 +1637,17 @@ public class DownloadEngine : IDownloadEngine
                     var directory = Path.GetDirectoryName(task.SavePath);
                     if (!string.IsNullOrEmpty(directory))
                     {
+                        var oldFileName = task.FileName;
+                        var oldSavePath = task.SavePath;
                         var newSavePath = Path.Combine(directory, resolvedName);
 
                         _logger.Info(
                             "Updating file name based on server response metadata.",
                             downloadId: task.Id,
                             eventCode: "DOWNLOAD_FILENAME_UPDATED",
-                            context: new { Old = task.FileName, New = resolvedName });
+                            context: new { Old = oldFileName, New = resolvedName });
 
+                        TryRenameSaveFile(oldSavePath, newSavePath, task.Id);
                         task.FileName = resolvedName;
                         task.FinalFileName = resolvedName;
                         task.SavePath = newSavePath;

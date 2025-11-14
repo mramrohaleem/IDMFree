@@ -57,3 +57,10 @@ public enum HttpStatusCategory
     ServerError,
     TooManyRequests
 }
+
+public enum DownloadResumeCapability
+{
+    Unknown = 0,
+    RestartRequired,
+    Supported
+}
