@@ -8,4 +8,5 @@ public sealed record DownloadResponseMetadata(
     bool SupportsRange,
     string? ETag,
     DateTimeOffset? LastModified,
-    string? ContentDispositionFileName);
+    string? ContentDispositionFileName,
+    string? ContentType);

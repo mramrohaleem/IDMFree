@@ -5,6 +5,7 @@ public enum DownloadStatus
     Queued,
     Downloading,
     Paused,
+    Throttled,
     Completed,
     Error,
     Merging,
@@ -22,6 +23,7 @@ public enum ChunkStatus
     Pending,
     Downloading,
     Paused,
+    Throttled,
     Completed,
     Error
 }
@@ -33,6 +35,7 @@ public enum DownloadErrorCode
     ServerError,
     Http4xx,
     Http5xx,
+    Http429,
     ContentLengthChanged,
     RangeNotSupported,
     ChunkedNoLength,
@@ -45,4 +48,12 @@ public enum DownloadErrorCode
     HtmlResponse,
     ValidationMismatch,
     ZeroBytes
+}
+
+public enum HttpStatusCategory
+{
+    None = 0,
+    ClientError,
+    ServerError,
+    TooManyRequests
 }

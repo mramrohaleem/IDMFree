@@ -20,4 +20,6 @@ public class HttpResourceInfo
     public bool IsChunkedWithoutLength { get; init; }
 
     public string? ContentDispositionFileName { get; init; }
+
+    public string? ContentType { get; init; }
 }

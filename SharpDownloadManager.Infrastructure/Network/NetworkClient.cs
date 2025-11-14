@@ -106,7 +106,8 @@ public sealed class NetworkClient : INetworkClient
                     ETag = response.Headers.ETag?.Tag,
                     LastModified = lastModified,
                     IsChunkedWithoutLength = isChunkedWithoutLength,
-                    ContentDispositionFileName = contentDispositionName
+                    ContentDispositionFileName = contentDispositionName,
+                    ContentType = response.Content.Headers.ContentType?.MediaType
                 };
 
                 _logger.Info(
@@ -197,7 +198,7 @@ public sealed class NetworkClient : INetworkClient
             context: ctx);
 
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        ApplyCommonHeaders(request, url);
+        ApplyCommonHeaders(request, url, extraHeaders);
         ApplyExtraHeaders(request, extraHeaders);
 
         if (from.HasValue)
@@ -406,23 +407,53 @@ public sealed class NetworkClient : INetworkClient
         }
     }
 
-    private static void ApplyCommonHeaders(HttpRequestMessage request, Uri uri)
+    private static void ApplyCommonHeaders(
+        HttpRequestMessage request,
+        Uri uri,
+        IReadOnlyDictionary<string, string>? extraHeaders = null)
     {
         if (request is null) throw new ArgumentNullException(nameof(request));
 
         try
         {
-            request.Headers.UserAgent.Clear();
-            request.Headers.UserAgent.ParseAdd(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-                "AppleWebKit/537.36 (KHTML, like Gecko) " +
-                "Chrome/120.0.0.0 Safari/537.36");
+            static bool HasHeader(IReadOnlyDictionary<string, string>? headers, string name)
+            {
+                if (headers is null)
+                {
+                    return false;
+                }
 
-            request.Headers.Accept.Clear();
-            request.Headers.Accept.ParseAdd("*/*");
+                foreach (var key in headers.Keys)
+                {
+                    if (string.Equals(key, name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
 
-            request.Headers.AcceptLanguage.Clear();
-            request.Headers.AcceptLanguage.ParseAdd("en-US,en;q=0.9");
+                return false;
+            }
+
+            if (!HasHeader(extraHeaders, "User-Agent"))
+            {
+                request.Headers.UserAgent.Clear();
+                request.Headers.UserAgent.ParseAdd(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                    "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                    "Chrome/120.0.0.0 Safari/537.36");
+            }
+
+            if (!HasHeader(extraHeaders, "Accept"))
+            {
+                request.Headers.Accept.Clear();
+                request.Headers.Accept.ParseAdd("*/*");
+            }
+
+            if (!HasHeader(extraHeaders, "Accept-Language"))
+            {
+                request.Headers.AcceptLanguage.Clear();
+                request.Headers.AcceptLanguage.ParseAdd("en-US,en;q=0.9");
+            }
 
             if (uri.Host.EndsWith("gofile.io", StringComparison.OrdinalIgnoreCase) &&
                 !uri.Host.Equals("gofile.io", StringComparison.OrdinalIgnoreCase))
@@ -432,8 +463,11 @@ public sealed class NetworkClient : INetworkClient
             }
             else
             {
-                var origin = new Uri($"{uri.Scheme}://{uri.Host}/");
-                request.Headers.Referrer = origin;
+                if (!HasHeader(extraHeaders, "Referer"))
+                {
+                    var origin = new Uri($"{uri.Scheme}://{uri.Host}/");
+                    request.Headers.Referrer = origin;
+                }
             }
         }
         catch
@@ -536,7 +570,8 @@ public sealed class NetworkClient : INetworkClient
             supportsRange,
             response.Headers.ETag?.Tag,
             response.Content.Headers.LastModified,
-            contentDispositionName);
+            contentDispositionName,
+            response.Content.Headers.ContentType?.MediaType);
     }
 
     // HTML helper regexes for fallback download URL extraction
@@ -784,7 +819,7 @@ public sealed class NetworkClient : INetworkClient
         CancellationToken cancellationToken)
     {
         using var request = new HttpRequestMessage(primaryMethod, uri);
-        ApplyCommonHeaders(request, uri);
+        ApplyCommonHeaders(request, uri, extraHeaders);
         ApplyExtraHeaders(request, extraHeaders);
 
         var response = await _client

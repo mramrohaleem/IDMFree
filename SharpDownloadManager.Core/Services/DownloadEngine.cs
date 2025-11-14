@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using SharpDownloadManager.Core.Abstractions;
@@ -23,6 +24,7 @@ public class DownloadEngine : IDownloadEngine
     private readonly Dictionary<Guid, CancellationTokenSource> _activeTokens = new();
     private readonly Dictionary<Guid, Task> _activeDownloadTasks = new();
     private readonly Dictionary<Guid, DownloadCancellationReason> _cancellationReasons = new();
+    private readonly Dictionary<Guid, CancellationTokenSource> _scheduledRetryTokens = new();
     private readonly string _tempRootFolder;
 
     private enum DownloadCancellationReason
@@ -30,7 +32,16 @@ public class DownloadEngine : IDownloadEngine
         Unknown,
         UserPause,
         UserDelete,
-        EngineShutdown
+        EngineShutdown,
+        TooManyRequestsBackoff
+    }
+
+    private sealed class TooManyRequestsException : Exception
+    {
+        public TooManyRequestsException(string message, Exception? innerException = null)
+            : base(message, innerException)
+        {
+        }
     }
 
     public DownloadEngine(
@@ -105,7 +116,11 @@ public class DownloadEngine : IDownloadEngine
             .ConfigureAwait(false);
 
         var id = Guid.NewGuid();
-        var fileName = ResolveFileName(suggestedFileName, resourceInfo.ContentDispositionFileName, resourceInfo.Url);
+        var fileName = ResolveFileName(
+            suggestedFileName,
+            resourceInfo.ContentDispositionFileName,
+            resourceInfo.ContentType,
+            resourceInfo.Url);
         var savePath = Path.Combine(saveFolderPath, fileName);
         var tempFolderPath = Path.Combine(_tempRootFolder, id.ToString("N"));
 
@@ -114,8 +129,9 @@ public class DownloadEngine : IDownloadEngine
             Id = id,
             Url = url,
             FileName = fileName,
+            FinalFileName = fileName,
             SavePath = savePath,
-            TempFolderPath = tempFolderPath,
+            TempChunkFolderPath = tempFolderPath,
             Status = DownloadStatus.Queued,
             Mode = mode,
             ContentLength = resourceInfo.ContentLength,
@@ -128,6 +144,7 @@ public class DownloadEngine : IDownloadEngine
 
         var connectionsCount = DetermineConnectionsCount(mode, resourceInfo);
         task.InitializeChunks(connectionsCount);
+        task.MaxParallelConnections = connectionsCount;
 
         await _stateStore.SaveDownloadAsync(task, cancellationToken).ConfigureAwait(false);
 
@@ -166,6 +183,15 @@ public class DownloadEngine : IDownloadEngine
             if (task.Status != DownloadStatus.Queued)
             {
                 task.Status = DownloadStatus.Queued;
+                task.NextRetryUtc = null;
+                task.RetryBackoff = TimeSpan.Zero;
+                CancelScheduledRetry_NoLock(downloadId);
+                if (task.HttpStatusCategory == HttpStatusCategory.TooManyRequests)
+                {
+                    task.HttpStatusCategory = HttpStatusCategory.None;
+                    task.LastErrorCode = DownloadErrorCode.None;
+                    task.LastErrorMessage = null;
+                }
                 shouldPersist = true;
             }
             else if (task.Status == DownloadStatus.Queued)
@@ -204,6 +230,16 @@ public class DownloadEngine : IDownloadEngine
             if (task.Status != DownloadStatus.Paused)
             {
                 task.Status = DownloadStatus.Paused;
+                task.MarkDownloadSuspended();
+                CancelScheduledRetry_NoLock(downloadId);
+                task.NextRetryUtc = null;
+                task.RetryBackoff = TimeSpan.Zero;
+                if (task.HttpStatusCategory == HttpStatusCategory.TooManyRequests)
+                {
+                    task.HttpStatusCategory = HttpStatusCategory.None;
+                    task.LastErrorCode = DownloadErrorCode.None;
+                    task.LastErrorMessage = null;
+                }
                 shouldPersist = true;
             }
 
@@ -238,7 +274,7 @@ public class DownloadEngine : IDownloadEngine
             if (_downloads.TryGetValue(downloadId, out var existing))
             {
                 savePath = existing.SavePath;
-                tempFolderPath = existing.TempFolderPath;
+                tempFolderPath = existing.TempChunkFolderPath;
             }
 
             removed = _downloads.Remove(downloadId);
@@ -251,6 +287,8 @@ public class DownloadEngine : IDownloadEngine
             {
                 _cancellationReasons.Remove(downloadId);
             }
+
+            CancelScheduledRetry_NoLock(downloadId);
         }
 
         ctsToCancel?.Cancel();
@@ -278,10 +316,15 @@ public class DownloadEngine : IDownloadEngine
         {
             task.LastErrorCode = DownloadErrorCode.None;
             task.LastErrorMessage = null;
+            task.HttpStatusCategory = HttpStatusCategory.None;
             task.Status = DownloadStatus.Downloading;
+            CancelScheduledRetry(task.Id);
+            task.MarkDownloadResumed();
             await SaveStateAsync(task, cancellationToken).ConfigureAwait(false);
 
-            Directory.CreateDirectory(task.TempFolderPath);
+            Directory.CreateDirectory(task.TempChunkFolderPath);
+            TryEnsureChunkFolderHidden(task.TempChunkFolderPath);
+
             var taskUri = new Uri(task.Url);
 
             if (task.Chunks.Count == 0)
@@ -298,180 +341,73 @@ public class DownloadEngine : IDownloadEngine
 
                 var connections = DetermineConnectionsCount(task.Mode, info);
                 task.InitializeChunks(connections);
+                task.MaxParallelConnections = connections;
                 await SaveStateAsync(task, cancellationToken).ConfigureAwait(false);
             }
 
-            async Task DownloadChunkAsync(Chunk chunk, CancellationToken ct)
+            SyncChunkProgressFromDisk(task);
+            task.UpdateProgressFromChunks();
+            await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
+
+            using var chunkCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var chunkToken = chunkCts.Token;
+            var parallelLimit = Math.Max(1, GetParallelChunkLimit(task));
+            using var semaphore = new SemaphoreSlim(parallelLimit);
+
+            var chunkTasks = new List<Task>();
+            foreach (var chunk in task.Chunks)
             {
-                var chunkPath = Path.Combine(task.TempFolderPath, $"{chunk.Index}.part");
-                bool resume = false;
-
-                if (File.Exists(chunkPath))
+                if (chunk.Status == ChunkStatus.Completed)
                 {
-                    var fileInfo = new FileInfo(chunkPath);
-                    if (task.SupportsRange && chunk.DownloadedBytes > 0 && fileInfo.Length == chunk.DownloadedBytes)
-                    {
-                        resume = true;
-                    }
-                    else
-                    {
-                        chunk.DownloadedBytes = 0;
-                        try
-                        {
-                            File.Delete(chunkPath);
-                        }
-                        catch
-                        {
-                            // Ignore failures deleting temp chunk files; they will be overwritten.
-                        }
-                    }
-                }
-                else if (chunk.DownloadedBytes > 0)
-                {
-                    chunk.DownloadedBytes = 0;
+                    continue;
                 }
 
-                if (chunk.EndByte >= 0)
+                var chunkTask = Task.Run(async () =>
                 {
-                    var chunkLength = chunk.EndByte - chunk.StartByte + 1;
-                    if (chunk.DownloadedBytes >= chunkLength)
+                    await semaphore.WaitAsync(chunkToken).ConfigureAwait(false);
+                    try
                     {
-                        chunk.Status = ChunkStatus.Completed;
-                        chunk.LastErrorCode = null;
-                        chunk.LastErrorMessage = null;
-                        task.UpdateProgressFromChunks();
-                        await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
-                        return;
+                        await DownloadChunkAsync(chunk, chunkToken).ConfigureAwait(false);
                     }
-                }
-
-                chunk.Status = ChunkStatus.Downloading;
-
-                long? from = null;
-                long? to = null;
-                if (task.SupportsRange && chunk.EndByte >= 0)
-                {
-                    var start = chunk.StartByte + chunk.DownloadedBytes;
-                    var end = chunk.EndByte;
-                    if (start > end)
+                    finally
                     {
-                        chunk.Status = ChunkStatus.Completed;
-                        chunk.LastErrorCode = null;
-                        chunk.LastErrorMessage = null;
-                        task.UpdateProgressFromChunks();
-                        await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
-                        return;
+                        semaphore.Release();
                     }
+                }, chunkToken);
 
-                    from = start;
-                    to = end;
-                }
+                chunkTasks.Add(chunkTask);
+            }
 
-                var fileMode = resume ? FileMode.Append : FileMode.Create;
-
+            if (chunkTasks.Count > 0)
+            {
                 try
                 {
-                    using var fileStream = new FileStream(chunkPath, fileMode, FileAccess.Write, FileShare.Read);
-                    var progress = new Progress<long>(delta =>
-                    {
-                        if (delta <= 0)
-                        {
-                            return;
-                        }
-
-                        chunk.DownloadedBytes += delta;
-                        task.UpdateProgressFromChunks();
-                    });
-
-                    var allowFallback = !from.HasValue && !to.HasValue;
-
-                    var responseMetadata = await _networkClient.DownloadRangeToStreamAsync(
-                            taskUri,
-                            from,
-                            to,
-                            fileStream,
-                            progress,
-                            ct,
-                            allowFallback,
-                            task.RequestHeaders)
-                        .ConfigureAwait(false);
-
-                    TryUpdateTaskMetadataFromResponse(task, responseMetadata);
-
-                    chunk.Status = ChunkStatus.Completed;
-                    chunk.LastErrorCode = null;
-                    chunk.LastErrorMessage = null;
-                    task.UpdateProgressFromChunks();
-                    await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException ex)
-                {
-                    if (!ct.IsCancellationRequested)
-                    {
-                        chunk.Status = ChunkStatus.Error;
-                        chunk.LastErrorCode = DownloadErrorCode.Unknown;
-                        chunk.LastErrorMessage = ex.Message;
-                        task.UpdateProgressFromChunks();
-                        await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
-                        throw;
-                    }
-
-                    chunk.Status = ChunkStatus.Paused;
-                    chunk.LastErrorCode = null;
-                    chunk.LastErrorMessage = null;
-                    task.UpdateProgressFromChunks();
-                    await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
-                    throw;
-                }
-                catch (HttpRequestException httpEx)
-                {
-                    chunk.Status = ChunkStatus.Error;
-                    chunk.LastErrorMessage = httpEx.Message;
-                    if (httpEx.StatusCode.HasValue)
-                    {
-                        if ((int)httpEx.StatusCode.Value >= 400 && (int)httpEx.StatusCode.Value < 500)
-                        {
-                            chunk.LastErrorCode = DownloadErrorCode.Http4xx;
-                        }
-                        else if ((int)httpEx.StatusCode.Value >= 500)
-                        {
-                            chunk.LastErrorCode = DownloadErrorCode.Http5xx;
-                        }
-                        else
-                        {
-                            chunk.LastErrorCode = DownloadErrorCode.ServerError;
-                        }
-                    }
-                    else
-                    {
-                        chunk.LastErrorCode = DownloadErrorCode.ServerError;
-                    }
-
-                    task.UpdateProgressFromChunks();
-                    await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
-                    throw;
+                    await Task.WhenAll(chunkTasks).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
-                    chunk.Status = ChunkStatus.Error;
-                    chunk.LastErrorCode = DownloadErrorCode.Unknown;
-                    chunk.LastErrorMessage = ex.Message;
-                    task.UpdateProgressFromChunks();
-                    await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
+                    if (await TryHandleTooManyRequestsAsync(ex, task, chunkCts, chunkTasks, cancellationToken).ConfigureAwait(false))
+                    {
+                        return;
+                    }
+
                     throw;
                 }
             }
 
-            var chunkTasks = task.Chunks.Select(chunk => DownloadChunkAsync(chunk, cancellationToken)).ToList();
-            await Task.WhenAll(chunkTasks).ConfigureAwait(false);
-
             if (cancellationToken.IsCancellationRequested)
             {
-                task.Status = DownloadStatus.Paused;
+                task.MarkDownloadSuspended();
+                if (task.Status != DownloadStatus.Completed && task.Status != DownloadStatus.Error)
+                {
+                    task.Status = DownloadStatus.Paused;
+                }
+
                 await SaveStateAsync(task, cancellationToken, ignoreCancellation: true).ConfigureAwait(false);
                 return;
             }
 
+            task.MarkDownloadSuspended();
             task.Status = DownloadStatus.Merging;
             await SaveStateAsync(task, cancellationToken).ConfigureAwait(false);
 
@@ -487,7 +423,7 @@ public class DownloadEngine : IDownloadEngine
                 {
                     cancellationToken.ThrowIfCancellationRequested();
 
-                    var chunkPath = Path.Combine(task.TempFolderPath, $"{chunk.Index}.part");
+                    var chunkPath = Path.Combine(task.TempChunkFolderPath, $"{chunk.Index}.part");
                     if (!File.Exists(chunkPath))
                     {
                         throw new IOException($"Missing chunk file {chunkPath} for merge.");
@@ -500,7 +436,7 @@ public class DownloadEngine : IDownloadEngine
 
             foreach (var chunk in task.Chunks)
             {
-                var chunkPath = Path.Combine(task.TempFolderPath, $"{chunk.Index}.part");
+                var chunkPath = Path.Combine(task.TempChunkFolderPath, $"{chunk.Index}.part");
                 if (File.Exists(chunkPath))
                 {
                     try
@@ -514,7 +450,7 @@ public class DownloadEngine : IDownloadEngine
                 }
             }
 
-            TryDeleteDirectory(task.TempFolderPath);
+            TryDeleteDirectory(task.TempChunkFolderPath);
 
             var finalFileInfo = new FileInfo(task.SavePath);
             var finalLength = finalFileInfo.Length;
@@ -530,9 +466,10 @@ public class DownloadEngine : IDownloadEngine
                         $"Downloaded size does not match Content-Length. Expected {task.ContentLength.Value} bytes but received {finalLength} bytes.";
 
                     task.MarkAsError(DownloadErrorCode.ValidationMismatch, message);
+                    task.MarkDownloadSuspended();
                     task.ActualFileSize = null;
                     TryDeleteFile(task.SavePath);
-                    TryDeleteDirectory(task.TempFolderPath);
+                    TryDeleteDirectory(task.TempChunkFolderPath);
                     await SaveStateAsync(task, cancellationToken).ConfigureAwait(false);
 
                     _logger.Error(
@@ -553,9 +490,10 @@ public class DownloadEngine : IDownloadEngine
             {
                 const string zeroMessage = "Download completed with zero bytes written.";
                 task.MarkAsError(DownloadErrorCode.ZeroBytes, zeroMessage);
+                task.MarkDownloadSuspended();
                 task.ActualFileSize = null;
                 TryDeleteFile(task.SavePath);
-                TryDeleteDirectory(task.TempFolderPath);
+                TryDeleteDirectory(task.TempChunkFolderPath);
                 await SaveStateAsync(task, cancellationToken).ConfigureAwait(false);
 
                 _logger.Error(
@@ -575,6 +513,7 @@ public class DownloadEngine : IDownloadEngine
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            task.MarkDownloadSuspended();
             if (task.Status != DownloadStatus.Completed && task.Status != DownloadStatus.Error)
             {
                 task.Status = DownloadStatus.Paused;
@@ -590,6 +529,7 @@ public class DownloadEngine : IDownloadEngine
         }
         catch (HttpRequestException httpEx)
         {
+            task.MarkDownloadSuspended();
             DownloadErrorCode code;
 
             if (httpEx.Data.Contains("CustomErrorCode") &&
@@ -620,6 +560,7 @@ public class DownloadEngine : IDownloadEngine
         }
         catch (Exception ex)
         {
+            task.MarkDownloadSuspended();
             var code = ex switch
             {
                 UnauthorizedAccessException => DownloadErrorCode.DiskPermissionDenied,
@@ -647,8 +588,509 @@ public class DownloadEngine : IDownloadEngine
             lock (_syncRoot)
             {
                 _cancellationReasons.Remove(task.Id);
+                CancelScheduledRetry_NoLock(task.Id);
             }
             _logger.Info("Download finished.", downloadId: task.Id, eventCode: "DOWNLOAD_RUN_FINISHED");
+        }
+
+        async Task DownloadChunkAsync(Chunk chunk, CancellationToken ct)
+        {
+            var chunkPath = Path.Combine(task.TempChunkFolderPath, $"{chunk.Index}.part");
+            var expectedLength = chunk.EndByte >= 0 ? chunk.EndByte - chunk.StartByte + 1 : (long?)null;
+
+            long existingLength = 0;
+            if (File.Exists(chunkPath))
+            {
+                existingLength = new FileInfo(chunkPath).Length;
+                if (expectedLength.HasValue && existingLength > expectedLength.Value)
+                {
+                    using var truncate = new FileStream(chunkPath, FileMode.Open, FileAccess.Write, FileShare.Read);
+                    truncate.SetLength(expectedLength.Value);
+                    existingLength = expectedLength.Value;
+                }
+            }
+
+            if (task.SupportsRange && existingLength > 0 && existingLength != chunk.DownloadedBytes)
+            {
+                chunk.DownloadedBytes = existingLength;
+            }
+
+            if (!task.SupportsRange && chunk.Index == 0 && chunk.DownloadedBytes > 0)
+            {
+                chunk.DownloadedBytes = 0;
+                existingLength = 0;
+                try
+                {
+                    if (File.Exists(chunkPath))
+                    {
+                        File.Delete(chunkPath);
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            if (expectedLength.HasValue && chunk.DownloadedBytes >= expectedLength.Value)
+            {
+                chunk.Status = ChunkStatus.Completed;
+                chunk.LastErrorCode = null;
+                chunk.LastErrorMessage = null;
+                task.UpdateProgressFromChunks();
+                await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
+                return;
+            }
+
+            chunk.Status = ChunkStatus.Downloading;
+            chunk.LastErrorCode = null;
+            chunk.LastErrorMessage = null;
+
+            long? from = null;
+            long? to = null;
+            if (task.SupportsRange && chunk.EndByte >= 0)
+            {
+                var start = chunk.StartByte + chunk.DownloadedBytes;
+                var end = chunk.EndByte;
+                if (start > end)
+                {
+                    chunk.Status = ChunkStatus.Completed;
+                    chunk.LastErrorCode = null;
+                    chunk.LastErrorMessage = null;
+                    task.UpdateProgressFromChunks();
+                    await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
+                    return;
+                }
+
+                from = start;
+                to = end;
+            }
+
+            var fileMode = chunk.DownloadedBytes > 0 ? FileMode.Append : FileMode.Create;
+
+            try
+            {
+                using var fileStream = new FileStream(chunkPath, fileMode, FileAccess.Write, FileShare.Read);
+                if (fileMode == FileMode.Append)
+                {
+                    fileStream.Seek(0, SeekOrigin.End);
+                }
+
+                var progress = new Progress<long>(delta =>
+                {
+                    if (delta <= 0)
+                    {
+                        return;
+                    }
+
+                    chunk.DownloadedBytes += delta;
+                    if (expectedLength.HasValue && chunk.DownloadedBytes > expectedLength.Value)
+                    {
+                        chunk.DownloadedBytes = expectedLength.Value;
+                    }
+
+                    task.UpdateProgressFromChunks();
+                });
+
+                var allowFallback = !from.HasValue && !to.HasValue;
+
+                var responseMetadata = await _networkClient.DownloadRangeToStreamAsync(
+                        taskUri,
+                        from,
+                        to,
+                        fileStream,
+                        progress,
+                        ct,
+                        allowFallback,
+                        task.RequestHeaders)
+                    .ConfigureAwait(false);
+
+                TryUpdateTaskMetadataFromResponse(task, responseMetadata);
+
+                chunk.Status = ChunkStatus.Completed;
+                chunk.LastErrorCode = null;
+                chunk.LastErrorMessage = null;
+                task.UpdateProgressFromChunks();
+                await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException ex)
+            {
+                if (!ct.IsCancellationRequested)
+                {
+                    chunk.Status = ChunkStatus.Error;
+                    chunk.LastErrorCode = DownloadErrorCode.Unknown;
+                    chunk.LastErrorMessage = ex.Message;
+                    task.UpdateProgressFromChunks();
+                    await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
+                    throw;
+                }
+
+                if (task.HttpStatusCategory == HttpStatusCategory.TooManyRequests)
+                {
+                    chunk.Status = ChunkStatus.Throttled;
+                    chunk.LastErrorCode = DownloadErrorCode.Http429;
+                }
+                else
+                {
+                    chunk.Status = ChunkStatus.Paused;
+                    chunk.LastErrorCode = null;
+                }
+
+                chunk.LastErrorMessage = null;
+                task.UpdateProgressFromChunks();
+                await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
+                throw;
+            }
+            catch (HttpRequestException httpEx) when (httpEx.StatusCode == HttpStatusCode.TooManyRequests)
+            {
+                chunk.Status = ChunkStatus.Throttled;
+                chunk.LastErrorCode = DownloadErrorCode.Http429;
+                chunk.LastErrorMessage = httpEx.Message;
+                task.HttpStatusCategory = HttpStatusCategory.TooManyRequests;
+                task.UpdateProgressFromChunks();
+                await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
+                throw new TooManyRequestsException(httpEx.Message, httpEx);
+            }
+            catch (HttpRequestException httpEx)
+            {
+                chunk.Status = ChunkStatus.Error;
+                chunk.LastErrorMessage = httpEx.Message;
+                if (httpEx.StatusCode.HasValue)
+                {
+                    var statusValue = (int)httpEx.StatusCode.Value;
+                    if (statusValue >= 400 && statusValue < 500)
+                    {
+                        chunk.LastErrorCode = DownloadErrorCode.Http4xx;
+                    }
+                    else if (statusValue >= 500)
+                    {
+                        chunk.LastErrorCode = DownloadErrorCode.Http5xx;
+                    }
+                    else
+                    {
+                        chunk.LastErrorCode = DownloadErrorCode.ServerError;
+                    }
+                }
+                else
+                {
+                    chunk.LastErrorCode = DownloadErrorCode.ServerError;
+                }
+
+                task.UpdateProgressFromChunks();
+                await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                chunk.Status = ChunkStatus.Error;
+                chunk.LastErrorCode = DownloadErrorCode.Unknown;
+                chunk.LastErrorMessage = ex.Message;
+                task.UpdateProgressFromChunks();
+                await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
+                throw;
+            }
+        }
+    }
+
+    private static int GetParallelChunkLimit(DownloadTask task)
+    {
+        if (task is null)
+        {
+            return 1;
+        }
+
+        var limit = task.MaxParallelConnections ?? task.ConnectionsCount;
+        if (limit <= 0)
+        {
+            limit = task.ConnectionsCount;
+        }
+
+        return limit > 0 ? limit : 1;
+    }
+
+    private void SyncChunkProgressFromDisk(DownloadTask task)
+    {
+        if (task is null)
+        {
+            return;
+        }
+
+        foreach (var chunk in task.Chunks)
+        {
+            try
+            {
+                var chunkPath = Path.Combine(task.TempChunkFolderPath, $"{chunk.Index}.part");
+                if (!File.Exists(chunkPath))
+                {
+                    if (chunk.Status is ChunkStatus.Error or ChunkStatus.Paused or ChunkStatus.Throttled)
+                    {
+                        chunk.Status = ChunkStatus.Pending;
+                        chunk.LastErrorCode = null;
+                        chunk.LastErrorMessage = null;
+                    }
+
+                    continue;
+                }
+
+                var fileInfo = new FileInfo(chunkPath);
+                var length = fileInfo.Length;
+                var expectedLength = chunk.EndByte >= 0 ? chunk.EndByte - chunk.StartByte + 1 : (long?)null;
+                if (expectedLength.HasValue && length > expectedLength.Value)
+                {
+                    length = expectedLength.Value;
+                }
+
+                chunk.DownloadedBytes = length;
+
+                if (expectedLength.HasValue && chunk.DownloadedBytes >= expectedLength.Value)
+                {
+                    chunk.Status = ChunkStatus.Completed;
+                    chunk.LastErrorCode = null;
+                    chunk.LastErrorMessage = null;
+                }
+                else if (chunk.Status is ChunkStatus.Error or ChunkStatus.Paused or ChunkStatus.Throttled)
+                {
+                    chunk.Status = ChunkStatus.Pending;
+                    chunk.LastErrorCode = null;
+                    chunk.LastErrorMessage = null;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn(
+                    "Failed to synchronize chunk progress from disk.",
+                    downloadId: task.Id,
+                    eventCode: "CHUNK_SYNC_FAILED",
+                    context: new { chunk.Index, ex.Message });
+            }
+        }
+
+        task.UpdateProgressFromChunks();
+    }
+
+    private async Task<bool> TryHandleTooManyRequestsAsync(
+        Exception exception,
+        DownloadTask task,
+        CancellationTokenSource chunkCancellation,
+        IReadOnlyList<Task> chunkTasks,
+        CancellationToken cancellationToken)
+    {
+        if (exception is null)
+        {
+            return false;
+        }
+
+        var aggregate = exception as AggregateException ?? new AggregateException(exception);
+        TooManyRequestsException? throttled = null;
+        foreach (var inner in aggregate.Flatten().InnerExceptions)
+        {
+            if (inner is TooManyRequestsException tooManyRequestsException)
+            {
+                throttled = tooManyRequestsException;
+                break;
+            }
+        }
+
+        if (throttled is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            chunkCancellation.Cancel();
+        }
+        catch
+        {
+        }
+
+        if (chunkTasks is not null)
+        {
+            try
+            {
+                await Task.WhenAll(chunkTasks).ConfigureAwait(false);
+            }
+            catch
+            {
+            }
+        }
+
+        task.MarkDownloadSuspended();
+        task.Status = DownloadStatus.Throttled;
+        task.HttpStatusCategory = HttpStatusCategory.TooManyRequests;
+        task.LastErrorCode = DownloadErrorCode.Http429;
+        var message = string.IsNullOrWhiteSpace(throttled.Message)
+            ? "Server returned 429 Too Many Requests. Waiting before retrying."
+            : throttled.Message;
+        task.LastErrorMessage = message;
+
+        task.TooManyRequestsRetryCount++;
+        var attempt = Math.Max(1, task.TooManyRequestsRetryCount);
+        var delaySeconds = (int)Math.Min(300, 30 * Math.Pow(2, Math.Max(0, attempt - 1)));
+        task.RetryBackoff = TimeSpan.FromSeconds(delaySeconds);
+        task.NextRetryUtc = DateTimeOffset.UtcNow + task.RetryBackoff;
+        task.MaxParallelConnections = 1;
+
+        foreach (var chunk in task.Chunks)
+        {
+            if (chunk.Status == ChunkStatus.Completed)
+            {
+                continue;
+            }
+
+            chunk.Status = ChunkStatus.Throttled;
+            chunk.LastErrorCode = DownloadErrorCode.Http429;
+            chunk.LastErrorMessage = message;
+        }
+
+        task.UpdateProgressFromChunks();
+
+        await SaveStateAsync(task, CancellationToken.None).ConfigureAwait(false);
+
+        _logger.Warn(
+            "Download temporarily throttled by remote server (HTTP 429).",
+            downloadId: task.Id,
+            eventCode: "DOWNLOAD_TOO_MANY_REQUESTS",
+            context: new
+            {
+                task.Url,
+                RetryInSeconds = delaySeconds
+            });
+
+        ScheduleRetryAfterBackoff(task);
+
+        return true;
+    }
+
+    private void ScheduleRetryAfterBackoff(DownloadTask task)
+    {
+        if (task is null)
+        {
+            return;
+        }
+
+        var delay = task.RetryBackoff;
+        if (delay <= TimeSpan.Zero)
+        {
+            delay = TimeSpan.FromSeconds(30);
+        }
+
+        var downloadId = task.Id;
+        CancellationTokenSource retryCts;
+
+        lock (_syncRoot)
+        {
+            CancelScheduledRetry_NoLock(downloadId);
+            retryCts = new CancellationTokenSource();
+            _scheduledRetryTokens[downloadId] = retryCts;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(delay, retryCts.Token).ConfigureAwait(false);
+
+                DownloadTask? target = null;
+                lock (_syncRoot)
+                {
+                    _scheduledRetryTokens.Remove(downloadId);
+                    if (_downloads.TryGetValue(downloadId, out target))
+                    {
+                        if (target.Status == DownloadStatus.Throttled)
+                        {
+                            target.Status = DownloadStatus.Queued;
+                            target.LastErrorMessage = null;
+                            target.LastErrorCode = DownloadErrorCode.None;
+                            target.HttpStatusCategory = HttpStatusCategory.None;
+                            target.NextRetryUtc = null;
+                            target.RetryBackoff = TimeSpan.Zero;
+                            _cancellationReasons[downloadId] = DownloadCancellationReason.TooManyRequestsBackoff;
+                            TryScheduleDownloads_NoLock();
+                        }
+                        else
+                        {
+                            target = null;
+                        }
+                    }
+                }
+
+                if (target is not null)
+                {
+                    try
+                    {
+                        await SaveStateAsync(target, CancellationToken.None).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Warn(
+                            "Failed to persist retry state after HTTP 429 backoff.",
+                            downloadId: downloadId,
+                            eventCode: "DOWNLOAD_RETRY_STATE_SAVE_FAILED",
+                            context: new { ex.Message });
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                lock (_syncRoot)
+                {
+                    _scheduledRetryTokens.Remove(downloadId);
+                }
+            }
+            finally
+            {
+                retryCts.Dispose();
+            }
+        });
+    }
+
+    private void CancelScheduledRetry(Guid downloadId)
+    {
+        lock (_syncRoot)
+        {
+            CancelScheduledRetry_NoLock(downloadId);
+        }
+    }
+
+    private void CancelScheduledRetry_NoLock(Guid downloadId)
+    {
+        if (_scheduledRetryTokens.TryGetValue(downloadId, out var cts))
+        {
+            _scheduledRetryTokens.Remove(downloadId);
+            try
+            {
+                cts.Cancel();
+            }
+            catch
+            {
+            }
+
+            cts.Dispose();
+        }
+    }
+
+    private void TryEnsureChunkFolderHidden(string folderPath)
+    {
+        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        {
+            return;
+        }
+
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return;
+        }
+
+        try
+        {
+            var directoryInfo = new DirectoryInfo(folderPath);
+            if (!directoryInfo.Attributes.HasFlag(FileAttributes.Hidden))
+            {
+                directoryInfo.Attributes |= FileAttributes.Hidden;
+            }
+        }
+        catch
+        {
         }
     }
 
@@ -696,6 +1138,8 @@ public class DownloadEngine : IDownloadEngine
             return;
         }
 
+        CancelScheduledRetry_NoLock(task.Id);
+
         var cts = new CancellationTokenSource();
         _activeTokens[task.Id] = cts;
 
@@ -727,25 +1171,26 @@ public class DownloadEngine : IDownloadEngine
 
     private string InitializeTempRootFolder()
     {
-        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-        if (!string.IsNullOrWhiteSpace(appData))
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (!string.IsNullOrWhiteSpace(localAppData))
         {
-            var candidate = Path.Combine(appData, "SharpDownloadManager", "Temp");
+            var candidate = Path.Combine(localAppData, "SharpDownloadManager", "chunks");
             try
             {
                 Directory.CreateDirectory(candidate);
+                TryEnsureChunkFolderHidden(candidate);
                 return candidate;
             }
             catch (Exception ex)
             {
                 _logger.Warn(
-                    "Failed to prepare AppData temp folder. Falling back to system temp.",
+                    "Failed to prepare LocalAppData chunk folder. Falling back to system temp.",
                     eventCode: "TEMP_ROOT_FALLBACK",
                     context: new { candidate, ex.Message });
             }
         }
 
-        var fallback = Path.Combine(Path.GetTempPath(), "SharpDownloadManager", "Temp");
+        var fallback = Path.Combine(Path.GetTempPath(), "SharpDownloadManager", "chunks");
         Directory.CreateDirectory(fallback);
         return fallback;
     }
@@ -790,26 +1235,43 @@ public class DownloadEngine : IDownloadEngine
             task.LastModified = metadata.LastModified;
         }
 
-        if (!string.IsNullOrWhiteSpace(metadata.ContentDispositionFileName))
+        if (!string.IsNullOrWhiteSpace(metadata.ContentDispositionFileName) ||
+            !string.IsNullOrWhiteSpace(metadata.ContentType))
         {
-            var normalized = FileNameHelper.NormalizeFileName(metadata.ContentDispositionFileName);
-            if (!string.IsNullOrWhiteSpace(normalized) &&
-                !string.Equals(task.FileName, normalized, StringComparison.Ordinal))
+            try
             {
-                var directory = Path.GetDirectoryName(task.SavePath);
-                if (!string.IsNullOrEmpty(directory))
+                var resolvedName = ResolveFileName(
+                    task.FileName,
+                    metadata.ContentDispositionFileName,
+                    metadata.ContentType,
+                    new Uri(task.Url));
+
+                if (!string.Equals(task.FileName, resolvedName, StringComparison.Ordinal))
                 {
-                    var newSavePath = Path.Combine(directory, normalized);
+                    var directory = Path.GetDirectoryName(task.SavePath);
+                    if (!string.IsNullOrEmpty(directory))
+                    {
+                        var newSavePath = Path.Combine(directory, resolvedName);
 
-                    _logger.Info(
-                        "Updating file name based on server response metadata.",
-                        downloadId: task.Id,
-                        eventCode: "DOWNLOAD_FILENAME_UPDATED",
-                        context: new { Old = task.FileName, New = normalized });
+                        _logger.Info(
+                            "Updating file name based on server response metadata.",
+                            downloadId: task.Id,
+                            eventCode: "DOWNLOAD_FILENAME_UPDATED",
+                            context: new { Old = task.FileName, New = resolvedName });
 
-                    task.FileName = normalized;
-                    task.SavePath = newSavePath;
+                        task.FileName = resolvedName;
+                        task.FinalFileName = resolvedName;
+                        task.SavePath = newSavePath;
+                    }
                 }
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn(
+                    "Failed to adjust file name from response metadata.",
+                    downloadId: task.Id,
+                    eventCode: "DOWNLOAD_FILENAME_UPDATE_FAILED",
+                    context: new { ex.Message });
             }
         }
     }
@@ -901,7 +1363,39 @@ public class DownloadEngine : IDownloadEngine
         return 4;
     }
 
-    private static string ResolveFileName(string? browserFileName, string? contentDispositionFileName, Uri resourceUri)
+    private static readonly Dictionary<string, string> KnownContentTypeExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["application/zip"] = ".zip",
+        ["application/x-zip-compressed"] = ".zip",
+        ["application/x-rar-compressed"] = ".rar",
+        ["application/vnd.rar"] = ".rar",
+        ["application/pdf"] = ".pdf",
+        ["application/msword"] = ".doc",
+        ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"] = ".docx",
+        ["application/vnd.ms-excel"] = ".xls",
+        ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"] = ".xlsx",
+        ["application/vnd.ms-powerpoint"] = ".ppt",
+        ["application/vnd.openxmlformats-officedocument.presentationml.presentation"] = ".pptx",
+        ["application/octet-stream"] = ".bin",
+        ["application/x-msdownload"] = ".exe",
+        ["application/x-7z-compressed"] = ".7z",
+        ["application/gzip"] = ".gz",
+        ["application/x-tar"] = ".tar",
+        ["application/json"] = ".json",
+        ["text/plain"] = ".txt",
+        ["image/jpeg"] = ".jpg",
+        ["image/png"] = ".png",
+        ["image/gif"] = ".gif",
+        ["image/webp"] = ".webp",
+        ["video/mp4"] = ".mp4",
+        ["audio/mpeg"] = ".mp3"
+    };
+
+    private static string ResolveFileName(
+        string? browserFileName,
+        string? contentDispositionFileName,
+        string? contentType,
+        Uri resourceUri)
     {
         var candidate =
             FileNameHelper.NormalizeFileName(contentDispositionFileName) ??
@@ -910,9 +1404,39 @@ public class DownloadEngine : IDownloadEngine
 
         if (string.IsNullOrWhiteSpace(candidate))
         {
-            return "download.bin";
+            candidate = "download";
+        }
+
+        var extension = Path.GetExtension(candidate);
+        if (string.IsNullOrWhiteSpace(extension) || extension.Equals(".", StringComparison.Ordinal))
+        {
+            var resolvedExtension = TryResolveExtensionFromContentType(contentType);
+            if (!string.IsNullOrEmpty(resolvedExtension))
+            {
+                candidate = candidate.TrimEnd('.') + resolvedExtension;
+            }
+            else if (!candidate.Contains('.', StringComparison.Ordinal))
+            {
+                candidate += ".bin";
+            }
         }
 
         return candidate;
+    }
+
+    private static string? TryResolveExtensionFromContentType(string? contentType)
+    {
+        if (string.IsNullOrWhiteSpace(contentType))
+        {
+            return null;
+        }
+
+        var normalized = contentType.Split(';')[0].Trim();
+        if (KnownContentTypeExtensions.TryGetValue(normalized, out var extension))
+        {
+            return extension;
+        }
+
+        return null;
     }
 }

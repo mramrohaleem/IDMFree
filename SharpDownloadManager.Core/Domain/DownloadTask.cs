@@ -11,9 +11,11 @@ public class DownloadTask
 
     public string FileName { get; set; } = string.Empty;
 
+    public string FinalFileName { get; set; } = string.Empty;
+
     public string SavePath { get; set; } = string.Empty;
 
-    public string TempFolderPath { get; set; } = string.Empty;
+    public string TempChunkFolderPath { get; set; } = string.Empty;
 
     public DownloadStatus Status { get; set; } = DownloadStatus.Queued;
 
@@ -34,6 +36,20 @@ public class DownloadTask
     public long? ActualFileSize { get; set; }
 
     public int ConnectionsCount { get; set; }
+
+    public int? MaxParallelConnections { get; set; }
+
+    public TimeSpan TotalActiveTime { get; set; }
+
+    public DateTimeOffset? LastResumedAt { get; set; }
+
+    public HttpStatusCategory HttpStatusCategory { get; set; } = HttpStatusCategory.None;
+
+    public int TooManyRequestsRetryCount { get; set; }
+
+    public TimeSpan RetryBackoff { get; set; } = TimeSpan.Zero;
+
+    public DateTimeOffset? NextRetryUtc { get; set; }
 
     public List<Chunk> Chunks { get; set; } = new List<Chunk>();
 
@@ -119,6 +135,13 @@ public class DownloadTask
         ConnectionsCount = Chunks.Count;
         TotalDownloadedBytes = 0;
         BytesWritten = 0;
+        TotalActiveTime = TimeSpan.Zero;
+        LastResumedAt = null;
+        TooManyRequestsRetryCount = 0;
+        RetryBackoff = TimeSpan.Zero;
+        NextRetryUtc = null;
+        HttpStatusCategory = HttpStatusCategory.None;
+        MaxParallelConnections = null;
     }
 
     public void UpdateProgressFromChunks()
@@ -138,5 +161,58 @@ public class DownloadTask
         Status = DownloadStatus.Error;
         LastErrorCode = code;
         LastErrorMessage = message;
+    }
+
+    public void MarkDownloadResumed(DateTimeOffset? resumeTimestamp = null)
+    {
+        var now = resumeTimestamp ?? DateTimeOffset.UtcNow;
+        if (!LastResumedAt.HasValue)
+        {
+            LastResumedAt = now;
+        }
+    }
+
+    public void MarkDownloadSuspended(DateTimeOffset? suspendTimestamp = null)
+    {
+        if (!LastResumedAt.HasValue)
+        {
+            return;
+        }
+
+        var now = suspendTimestamp ?? DateTimeOffset.UtcNow;
+        if (now < LastResumedAt.Value)
+        {
+            LastResumedAt = null;
+            return;
+        }
+
+        TotalActiveTime += now - LastResumedAt.Value;
+        LastResumedAt = null;
+    }
+
+    public double GetAverageSpeedBytesPerSecond(DateTimeOffset? now = null)
+    {
+        var totalSeconds = GetActiveSeconds(now);
+        if (totalSeconds <= 0)
+        {
+            return 0d;
+        }
+
+        return TotalDownloadedBytes / totalSeconds;
+    }
+
+    public double GetActiveSeconds(DateTimeOffset? now = null)
+    {
+        var seconds = TotalActiveTime.TotalSeconds;
+        if (LastResumedAt.HasValue)
+        {
+            var reference = now ?? DateTimeOffset.UtcNow;
+            if (reference > LastResumedAt.Value)
+            {
+                seconds += (reference - LastResumedAt.Value).TotalSeconds;
+            }
+        }
+
+        return seconds;
     }
 }

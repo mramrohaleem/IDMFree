@@ -5,21 +5,23 @@ namespace SharpDownloadManager.UI.Services;
 
 public sealed record BrowserDownloadResult(
     bool Success,
-    bool Handled,
     HttpStatusCode StatusCode,
     DownloadTask? Task,
     string? Error,
-    bool UserDeclined)
+    bool UserDeclined,
+    string Status)
 {
+    public bool Handled => string.Equals(Status, "accepted", StringComparison.OrdinalIgnoreCase);
+
     public static BrowserDownloadResult Accepted(DownloadTask task) =>
-        new(true, true, HttpStatusCode.Accepted, task, null, false);
+        new(true, HttpStatusCode.Accepted, task, null, false, "accepted");
 
     public static BrowserDownloadResult Declined(string? message) =>
-        new(false, true, HttpStatusCode.Conflict, null, message, true);
+        new(false, HttpStatusCode.OK, null, message, true, "fallback");
 
-    public static BrowserDownloadResult Failed(
-        HttpStatusCode statusCode,
-        string? message,
-        bool handled = false) =>
-        new(false, handled, statusCode, null, message, false);
+    public static BrowserDownloadResult Fallback(HttpStatusCode statusCode, string? message) =>
+        new(false, statusCode, null, message, false, "fallback");
+
+    public static BrowserDownloadResult Failed(HttpStatusCode statusCode, string? message) =>
+        new(false, statusCode, null, message, false, "error");
 }

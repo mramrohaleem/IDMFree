@@ -111,7 +111,7 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
                 eventCode: "BROWSER_DOWNLOAD_DIALOG_HTTP_ERROR",
                 context: new { request.Url, Status = (int)status, httpEx.Message });
 
-            return BrowserDownloadResult.Failed(status, httpEx.Message);
+            return BrowserDownloadResult.Fallback(status, httpEx.Message);
         }
         catch (Exception ex)
         {
@@ -133,7 +133,7 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
                 });
             }
 
-            return BrowserDownloadResult.Failed(HttpStatusCode.InternalServerError, ex.Message);
+            return BrowserDownloadResult.Fallback(HttpStatusCode.InternalServerError, ex.Message);
         }
     }
 
