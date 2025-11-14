@@ -480,19 +480,23 @@ public sealed class NetworkClient : INetworkClient
         }
     }
 
+    // HTML helper regexes for fallback download URL extraction
     private static readonly Regex MetaRefreshRegex = new(
-        @"<meta\s+[^>]*http-equiv\s*=\s*['\"]?refresh['\"]?[^>]*content\s*=\s*(?<quote>['\"])(?<content>.*?)\k<quote>[^>]*>",
-        RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
+        @"<meta\s+http-equiv\s*=\s*[""']refresh[""'][^>]*url=(?<url>[^""'>\s]+)[^>]*>",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-    private static readonly Regex AnchorRegex = new(
-        @"<a\s+[^>]*href\s*=\s*(?<quote>['\"])(?<url>[^'\"]+)\k<quote>[^>]*>(?<text>.*?)</a>",
-        RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex AnchorLinkRegex = new(
+        @"<a\s+[^>]*href\s*=\s*[""'](?<url>[^""'#>]+)[""'][^>]*>(?<text>.*?)</a>",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.Singleline);
 
+    // Keywords we look for inside the anchor text to decide if it's a likely download link
     private static readonly string[] AnchorKeywords =
     {
         "download",
         "click here",
         "direct link",
+        "download now",
+        "start download",
         "get file"
     };
 
@@ -550,25 +554,12 @@ public sealed class NetworkClient : INetworkClient
 
         foreach (Match match in MetaRefreshRegex.Matches(htmlSnippet))
         {
-            var contentValue = match.Groups["content"].Value;
-            if (string.IsNullOrWhiteSpace(contentValue))
+            var candidateString = match.Groups["url"].Value;
+            if (string.IsNullOrWhiteSpace(candidateString))
             {
                 continue;
             }
 
-            var urlIndex = contentValue.IndexOf("url", StringComparison.OrdinalIgnoreCase);
-            if (urlIndex < 0)
-            {
-                continue;
-            }
-
-            var equalsIndex = contentValue.IndexOf('=', urlIndex);
-            if (equalsIndex < 0 || equalsIndex + 1 >= contentValue.Length)
-            {
-                continue;
-            }
-
-            var candidateString = contentValue[(equalsIndex + 1)..].Trim();
             candidateString = candidateString.Trim('\'', '"');
 
             if (!TryBuildCandidateUrl(candidateString, originalUrl, out var candidate))
@@ -592,7 +583,7 @@ public sealed class NetworkClient : INetworkClient
     {
         downloadUrl = null;
 
-        foreach (Match match in AnchorRegex.Matches(htmlSnippet))
+        foreach (Match match in AnchorLinkRegex.Matches(htmlSnippet))
         {
             var href = match.Groups["url"].Value;
             if (!TryBuildCandidateUrl(href, originalUrl, out var candidate) || candidate is null)
