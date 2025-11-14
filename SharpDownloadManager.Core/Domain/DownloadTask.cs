@@ -29,6 +29,8 @@ public class DownloadTask
 
     public long TotalDownloadedBytes { get; set; }
 
+    public long BytesWritten { get; set; }
+
     public int ConnectionsCount { get; set; }
 
     public List<Chunk> Chunks { get; set; } = new List<Chunk>();
@@ -36,6 +38,8 @@ public class DownloadTask
     public DownloadErrorCode LastErrorCode { get; set; } = DownloadErrorCode.None;
 
     public string? LastErrorMessage { get; set; }
+
+    public IReadOnlyDictionary<string, string>? RequestHeaders { get; set; }
 
     public void InitializeChunks(int desiredConnectionsCount)
     {
@@ -112,6 +116,7 @@ public class DownloadTask
 
         ConnectionsCount = Chunks.Count;
         TotalDownloadedBytes = 0;
+        BytesWritten = 0;
     }
 
     public void UpdateProgressFromChunks()
@@ -123,6 +128,7 @@ public class DownloadTask
         }
 
         TotalDownloadedBytes = total;
+        BytesWritten = total;
     }
 
     public void MarkAsError(DownloadErrorCode code, string message)

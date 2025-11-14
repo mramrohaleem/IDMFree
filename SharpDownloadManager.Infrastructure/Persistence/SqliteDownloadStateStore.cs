@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
@@ -54,9 +55,11 @@ CREATE TABLE IF NOT EXISTS Downloads (
     ETag TEXT NULL,
     LastModified TEXT NULL,
     TotalDownloadedBytes INTEGER NOT NULL,
+    BytesWritten INTEGER NOT NULL DEFAULT 0,
     ConnectionsCount INTEGER NOT NULL,
     LastErrorCode INTEGER NOT NULL,
-    LastErrorMessage TEXT NULL
+    LastErrorMessage TEXT NULL,
+    RequestHeaders TEXT NULL
 );";
 
             var createChunks = @"
@@ -86,6 +89,22 @@ CREATE TABLE IF NOT EXISTS Chunks (
                 await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "BytesWritten",
+                    "INTEGER NOT NULL DEFAULT 0",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "RequestHeaders",
+                    "TEXT NULL",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
             _logger.Info("SQLite state store initialized successfully.", eventCode: "STATE_STORE_INIT", context: new { DbPath = _dbPath });
         }
         catch (SqliteException ex) when (IsCorruptionError(ex))
@@ -114,9 +133,11 @@ CREATE TABLE IF NOT EXISTS Downloads (
     ETag TEXT NULL,
     LastModified TEXT NULL,
     TotalDownloadedBytes INTEGER NOT NULL,
+    BytesWritten INTEGER NOT NULL DEFAULT 0,
     ConnectionsCount INTEGER NOT NULL,
     LastErrorCode INTEGER NOT NULL,
-    LastErrorMessage TEXT NULL
+    LastErrorMessage TEXT NULL,
+    RequestHeaders TEXT NULL
 );";
                 await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
@@ -139,6 +160,22 @@ CREATE TABLE IF NOT EXISTS Chunks (
 );";
                 await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "BytesWritten",
+                    "INTEGER NOT NULL DEFAULT 0",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "RequestHeaders",
+                    "TEXT NULL",
+                    cancellationToken)
+                .ConfigureAwait(false);
 
             _logger.Info("SQLite state store recreated after corruption.", eventCode: "STATE_STORE_RESET", context: new { DbPath = _dbPath });
         }
@@ -167,14 +204,16 @@ INSERT INTO Downloads (
     Id, Url, FileName, SavePath, TempFolderPath,
     Status, Mode, ContentLength, SupportsRange,
     ETag, LastModified,
-    TotalDownloadedBytes, ConnectionsCount,
-    LastErrorCode, LastErrorMessage
+    TotalDownloadedBytes, BytesWritten, ConnectionsCount,
+    LastErrorCode, LastErrorMessage,
+    RequestHeaders
 ) VALUES (
     $Id, $Url, $FileName, $SavePath, $TempFolderPath,
     $Status, $Mode, $ContentLength, $SupportsRange,
     $ETag, $LastModified,
-    $TotalDownloadedBytes, $ConnectionsCount,
-    $LastErrorCode, $LastErrorMessage
+    $TotalDownloadedBytes, $BytesWritten, $ConnectionsCount,
+    $LastErrorCode, $LastErrorMessage,
+    $RequestHeaders
 )
 ON CONFLICT(Id) DO UPDATE SET
     Url = excluded.Url,
@@ -188,9 +227,11 @@ ON CONFLICT(Id) DO UPDATE SET
     ETag = excluded.ETag,
     LastModified = excluded.LastModified,
     TotalDownloadedBytes = excluded.TotalDownloadedBytes,
+    BytesWritten = excluded.BytesWritten,
     ConnectionsCount = excluded.ConnectionsCount,
     LastErrorCode = excluded.LastErrorCode,
-    LastErrorMessage = excluded.LastErrorMessage;
+    LastErrorMessage = excluded.LastErrorMessage,
+    RequestHeaders = excluded.RequestHeaders;
 ";
 
                 cmd.Parameters.AddWithValue("$Id", task.Id.ToString());
@@ -208,9 +249,12 @@ ON CONFLICT(Id) DO UPDATE SET
                 cmd.Parameters.AddWithValue("$ETag", (object?)task.ETag ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$LastModified", task.LastModified?.ToString("o") ?? (object)DBNull.Value);
                 cmd.Parameters.AddWithValue("$TotalDownloadedBytes", task.TotalDownloadedBytes);
+                cmd.Parameters.AddWithValue("$BytesWritten", task.BytesWritten);
                 cmd.Parameters.AddWithValue("$ConnectionsCount", task.ConnectionsCount);
                 cmd.Parameters.AddWithValue("$LastErrorCode", (int)task.LastErrorCode);
                 cmd.Parameters.AddWithValue("$LastErrorMessage", (object?)task.LastErrorMessage ?? DBNull.Value);
+                var headersJson = SerializeHeaders(task.RequestHeaders);
+                cmd.Parameters.AddWithValue("$RequestHeaders", (object?)headersJson ?? DBNull.Value);
 
                 await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
@@ -314,12 +358,20 @@ INSERT INTO Chunks (
                             ? null
                             : DateTimeOffset.Parse(reader.GetString(reader.GetOrdinal("LastModified"))),
                         TotalDownloadedBytes = reader.GetInt64(reader.GetOrdinal("TotalDownloadedBytes")),
+                        BytesWritten = reader.GetInt64(reader.GetOrdinal("BytesWritten")),
                         ConnectionsCount = reader.GetInt32(reader.GetOrdinal("ConnectionsCount")),
                         LastErrorCode = (DownloadErrorCode)reader.GetInt32(reader.GetOrdinal("LastErrorCode")),
                         LastErrorMessage = reader.IsDBNull(reader.GetOrdinal("LastErrorMessage"))
                             ? null
                             : reader.GetString(reader.GetOrdinal("LastErrorMessage"))
                     };
+
+                    if (!reader.IsDBNull(reader.GetOrdinal("RequestHeaders")))
+                    {
+                        var rawHeaders = reader.GetString(reader.GetOrdinal("RequestHeaders"));
+                        var headers = DeserializeHeaders(rawHeaders);
+                        task.RequestHeaders = headers;
+                    }
 
                     // Reset unsafe states to Paused
                     if (task.Status == DownloadStatus.Downloading
@@ -426,6 +478,71 @@ INSERT INTO Chunks (
 
             TryArchiveCorruptedDb();
             throw;
+        }
+    }
+
+    private static async Task EnsureColumnExistsAsync(
+        SqliteConnection connection,
+        string table,
+        string column,
+        string definition,
+        CancellationToken cancellationToken)
+    {
+        using var pragma = connection.CreateCommand();
+        pragma.CommandText = $"PRAGMA table_info({table});";
+
+        using var reader = await pragma.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            var existingName = reader.GetString(reader.GetOrdinal("name"));
+            if (string.Equals(existingName, column, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+        }
+
+        using var alter = connection.CreateCommand();
+        alter.CommandText = $"ALTER TABLE {table} ADD COLUMN {column} {definition};";
+        await alter.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static string? SerializeHeaders(IReadOnlyDictionary<string, string>? headers)
+    {
+        if (headers is null || headers.Count == 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            return JsonSerializer.Serialize(headers);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static IReadOnlyDictionary<string, string>? DeserializeHeaders(string json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return null;
+        }
+
+        try
+        {
+            var headers = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+            if (headers is null || headers.Count == 0)
+            {
+                return null;
+            }
+
+            return new Dictionary<string, string>(headers, StringComparer.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return null;
         }
     }
 

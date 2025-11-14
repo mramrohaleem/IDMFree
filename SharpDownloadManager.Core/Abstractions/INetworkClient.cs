@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -27,5 +28,6 @@ public interface INetworkClient
         Stream destination,
         IProgress<long>? progress = null,
         CancellationToken cancellationToken = default,
-        bool allowHtmlFallback = true);
+        bool allowHtmlFallback = true,
+        IReadOnlyDictionary<string, string>? extraHeaders = null);
 }

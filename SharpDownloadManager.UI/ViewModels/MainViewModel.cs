@@ -349,7 +349,8 @@ public class MainViewModel : INotifyPropertyChanged
                 Mode = DownloadMode.Normal,
                 Status = DownloadStatus.Downloading,
                 ContentLength = 1_000_000,
-                TotalDownloadedBytes = 250_000
+                TotalDownloadedBytes = 250_000,
+                BytesWritten = 250_000
             },
             new DownloadTask
             {
@@ -359,7 +360,8 @@ public class MainViewModel : INotifyPropertyChanged
                 Mode = DownloadMode.SafeMode,
                 Status = DownloadStatus.Paused,
                 ContentLength = 500_000,
-                TotalDownloadedBytes = 100_000
+                TotalDownloadedBytes = 100_000,
+                BytesWritten = 100_000
             }
         };
 
@@ -373,6 +375,7 @@ public class MainViewModel : INotifyPropertyChanged
             string? suggestedFileName,
             string saveFolderPath,
             DownloadMode mode = DownloadMode.Normal,
+            IReadOnlyDictionary<string, string>? requestHeaders = null,
             CancellationToken cancellationToken = default)
         {
             var resolvedFileName = string.IsNullOrWhiteSpace(suggestedFileName)
@@ -388,7 +391,9 @@ public class MainViewModel : INotifyPropertyChanged
                 Mode = mode,
                 Status = DownloadStatus.Queued,
                 ContentLength = 1_000_000,
-                TotalDownloadedBytes = 0
+                TotalDownloadedBytes = 0,
+                BytesWritten = 0,
+                RequestHeaders = requestHeaders
             };
             _tasks.Add(task);
             return Task.FromResult(task);
