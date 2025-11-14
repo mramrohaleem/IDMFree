@@ -96,4 +96,4 @@ internal static class BrowserDownloadSafetyInspector
     }
 }
 
-internal sealed record BrowserDownloadPromptMessage(string Message, bool IsWarning);
+public sealed record BrowserDownloadPromptMessage(string Message, bool IsWarning);
