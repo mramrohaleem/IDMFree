@@ -5,6 +5,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -640,6 +641,7 @@ public class MainViewModel : INotifyPropertyChanged
             string saveFolderPath,
             DownloadMode mode = DownloadMode.Normal,
             IReadOnlyDictionary<string, string>? requestHeaders = null,
+            string? requestMethod = null,
             CancellationToken cancellationToken = default)
         {
             var resolvedFileName = string.IsNullOrWhiteSpace(suggestedFileName)
@@ -657,7 +659,10 @@ public class MainViewModel : INotifyPropertyChanged
                 ContentLength = 1_000_000,
                 TotalDownloadedBytes = 0,
                 BytesWritten = 0,
-                RequestHeaders = requestHeaders
+                RequestHeaders = requestHeaders,
+                RequestMethod = string.IsNullOrWhiteSpace(requestMethod)
+                    ? HttpMethod.Get.Method
+                    : requestMethod
             };
             _tasks.Add(task);
             return Task.FromResult(task);
