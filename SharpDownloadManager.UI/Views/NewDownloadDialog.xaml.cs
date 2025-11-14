@@ -2,6 +2,8 @@ using System;
 using System.IO;
 using System.Windows;
 using System.Windows.Media;
+using WpfColor = System.Windows.Media.Color;
+using WpfColors = System.Windows.Media.Colors;
 using SharpDownloadManager.Core.Utilities;
 using SharpDownloadManager.UI.Services;
 using MessageBox = System.Windows.MessageBox;
@@ -33,11 +35,11 @@ public partial class NewDownloadDialog : Window
             PromptBorder.Visibility = Visibility.Visible;
             PromptTextBlock.Text = promptMessage.Message;
             PromptTextBlock.Foreground = promptMessage.IsWarning
-                ? new SolidColorBrush(System.Windows.Media.Colors.OrangeRed)
-                : new SolidColorBrush(System.Windows.Media.Color.FromRgb(33, 150, 243));
+                ? new SolidColorBrush(WpfColors.OrangeRed)
+                : new SolidColorBrush(WpfColor.FromRgb(33, 150, 243));
             PromptBorder.Background = promptMessage.IsWarning
-                ? new SolidColorBrush(System.Windows.Media.Color.FromArgb(24, 255, 69, 0))
-                : new SolidColorBrush(System.Windows.Media.Color.FromArgb(18, 33, 150, 243));
+                ? new SolidColorBrush(WpfColor.FromArgb(24, 255, 69, 0))
+                : new SolidColorBrush(WpfColor.FromArgb(18, 33, 150, 243));
         }
         else
         {
