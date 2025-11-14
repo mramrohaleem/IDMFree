@@ -1,13 +1,13 @@
 using System;
 using System.Drawing;
-using System.Windows.Forms;
-using SharpDownloadManager.Infrastructure.Logging;
+using SharpDownloadManager.Core.Abstractions;
+using WinForms = System.Windows.Forms;
 
 namespace SharpDownloadManager.UI.Services;
 
 public sealed class NotificationService : INotificationService
 {
-    private readonly NotifyIcon _notifyIcon;
+    private readonly WinForms.NotifyIcon _notifyIcon;
     private readonly ILogger _logger;
     private bool _disposed;
 
@@ -15,7 +15,7 @@ public sealed class NotificationService : INotificationService
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
-        _notifyIcon = new NotifyIcon
+        _notifyIcon = new WinForms.NotifyIcon
         {
             Visible = true,
             Icon = SystemIcons.Application,

@@ -9,7 +9,7 @@ using SharpDownloadManager.UI.Services;
 
 namespace SharpDownloadManager.UI;
 
-public partial class App : Application
+public partial class App : System.Windows.Application
 {
     private BrowserBridgeServer? _browserBridge;
     private INotificationService? _notificationService;
