@@ -2,6 +2,7 @@ using System;
 using System.Windows;
 using SharpDownloadManager.UI.ViewModels;
 using SharpDownloadManager.UI.Views;
+using Application = System.Windows.Application;
 
 namespace SharpDownloadManager.UI.Services;
 

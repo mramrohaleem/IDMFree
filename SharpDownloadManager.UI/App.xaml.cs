@@ -6,6 +6,7 @@ using SharpDownloadManager.Infrastructure.Persistence;
 using SharpDownloadManager.UI.ViewModels;
 using SharpDownloadManager.UI.Views;
 using SharpDownloadManager.UI.Services;
+using MessageBox = System.Windows.MessageBox;
 
 namespace SharpDownloadManager.UI;
 

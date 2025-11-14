@@ -14,6 +14,7 @@ using System.Windows.Threading;
 using SharpDownloadManager.Core.Abstractions;
 using SharpDownloadManager.Core.Domain;
 using SharpDownloadManager.UI.Services;
+using MessageBox = System.Windows.MessageBox;
 
 namespace SharpDownloadManager.UI.ViewModels;
 
