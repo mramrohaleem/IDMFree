@@ -31,7 +31,7 @@ const CUSTOM_DOWNLOAD_HINT_ATTRIBUTES = [
   "data-idmfree-download",
 ];
 
-const INTENT_RESPONSE_TIMEOUT_MS = 1500;
+const INTENT_RESPONSE_TIMEOUT_MS = 1000;
 const FALLBACK_DELAY_MS = 20;
 
 const DEBUG_LOGGING_ENABLED = true;
@@ -244,7 +244,7 @@ function handlePointerEvent(event) {
 
   const correlationId = generateCorrelationId();
 
-  logDebug("CS: intercepted download click", {
+  logDebug("CS: click captured", {
     correlationId,
     url: candidate.url,
     eventType: event.type,
@@ -280,38 +280,73 @@ function handlePointerEvent(event) {
   };
 
   let settled = false;
-  const finalize = (handled) => {
+  const finalize = (strategy, details = {}) => {
     if (settled) {
       return;
     }
     settled = true;
     clearTimeout(timeoutId);
-    if (!handled) {
-      logDebug("CS: initiating browser fallback", { correlationId, url: candidate.url });
-      fallbackToBrowser(candidate);
+    if (strategy === "external") {
+      logDebug("CS: strategy=external, suppressing browser", {
+        correlationId,
+        url: candidate.url,
+        reason: details.reason || null,
+      });
+      return;
     }
+    const reason = details.reason || "strategy-browser";
+    logDebug("CS: strategy=browser, allowing native download", {
+      correlationId,
+      url: candidate.url,
+      reason,
+    });
+    fallbackToBrowser(candidate);
   };
 
-  const timeoutId = setTimeout(() => finalize(false), INTENT_RESPONSE_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => {
+    logDebug("CS: background timeout, falling back to browser", {
+      correlationId,
+      url: candidate.url,
+      timeoutMs: INTENT_RESPONSE_TIMEOUT_MS,
+    });
+    finalize("browser", { reason: "timeout" });
+  }, INTENT_RESPONSE_TIMEOUT_MS);
 
   logDebug("CS: sending download intent to background", { correlationId, url: candidate.url });
 
   chrome.runtime
     .sendMessage({ type: "idmfree:download-intent", payload })
     .then((response) => {
+      if (!response) {
+        logDebug("CS: download intent response missing", {
+          correlationId,
+          url: candidate.url,
+        });
+        finalize("browser", { reason: "no-response" });
+        return;
+      }
+
+      const { strategy, reason, status } = response;
       logDebug("CS: download intent response received", {
         correlationId,
-        handled: Boolean(response && response.handled),
-        status: response?.status || null,
+        strategy: strategy || null,
+        status: status || null,
+        reason: reason || null,
       });
-      finalize(Boolean(response && response.handled));
+
+      if (strategy === "external") {
+        finalize("external", { reason: reason || null });
+        return;
+      }
+
+      finalize("browser", { reason: reason || "strategy-browser", status: status || null });
     })
     .catch((err) => {
       logDebug("CS: download intent send failed", {
         correlationId,
         error: err?.message || String(err),
       });
-      finalize(false);
+      finalize("browser", { reason: "send-error", error: err?.message || String(err) });
     });
 }
 
