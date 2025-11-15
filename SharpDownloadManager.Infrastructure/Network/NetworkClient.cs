@@ -771,7 +771,9 @@ public sealed class NetworkClient : INetworkClient
                 var sharedUri = BuildCookieScopeUri(requestUri, sharedHost);
                 foreach (var (name, value) in parsed)
                 {
-                    var domain = sharedHost.StartsWith('.', StringComparison.Ordinal) ? sharedHost : "." + sharedHost;
+                    var domain = sharedHost.StartsWith(".", StringComparison.Ordinal)
+                        ? sharedHost
+                        : "." + sharedHost;
                     TryAddCookie(sharedUri, name, value, domain);
                 }
             }
