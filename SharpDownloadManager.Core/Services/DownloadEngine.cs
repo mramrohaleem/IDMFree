@@ -150,34 +150,68 @@ public class DownloadEngine : IDownloadEngine
             .ProbeAsync(url, normalizedHeaders, normalizedMethod, cancellationToken)
             .ConfigureAwait(false);
 
-        _logger.Info(
-            "Detected download capabilities.",
-            downloadId: id,
-            eventCode: "DOWNLOAD_CAPABILITIES_DETECTED",
-            context: new
-            {
-                Url = resourceInfo.Url.ToString(),
-                HttpMethod = normalizedMethod.Method,
-                resourceInfo.ContentLength,
-                resourceInfo.SupportsRange,
-                resourceInfo.IsChunkedWithoutLength,
-                HasContentDisposition = !string.IsNullOrWhiteSpace(resourceInfo.ContentDispositionFileName),
-                resourceInfo.ContentDispositionFileName,
-                resourceInfo.ContentType
-            });
-
         var normalizedSuggested = FileNameHelper.NormalizeFileName(suggestedFileName);
-        var fileName = ResolveFileName(
+        var requestedUri = resourceInfo.RequestedUrl ?? new Uri(url);
+        var finalUri = resourceInfo.FinalUrl ?? resourceInfo.Url ?? requestedUri;
+
+        var candidateFileName = ResolveFileName(
             normalizedSuggested,
             resourceInfo.ContentDispositionFileName,
             resourceInfo.ContentType,
-            resourceInfo.Url);
+            finalUri);
+        var fileName = EnsureUniqueFileName(saveFolderPath, candidateFileName, id);
         var displayName = SelectDisplayName(
             normalizedSuggested,
             resourceInfo.ContentDispositionFileName,
             fileName);
         var savePath = Path.Combine(saveFolderPath, fileName);
         var tempFolderPath = Path.Combine(_tempRootFolder, id.ToString("N"));
+
+        var session = new DownloadSession
+        {
+            DownloadId = id,
+            RequestedUrl = resourceInfo.RequestedUrl ?? requestedUri,
+            NormalizedUrl = resourceInfo.NormalizedUrl ?? resourceInfo.RequestedUrl ?? requestedUri,
+            FinalUrl = finalUri,
+            HttpMethodUsedForProbe = resourceInfo.ProbeMethod.Method,
+            StatusCodeProbe = resourceInfo.ProbeStatusCode,
+            ContentLengthHeaderRaw = resourceInfo.ContentLengthHeaderRaw,
+            ContentRangeHeaderRaw = resourceInfo.ContentRangeHeaderRaw,
+            AcceptRangesHeader = resourceInfo.AcceptRangesHeader,
+            ContentType = resourceInfo.ContentType,
+            SupportsResume = resourceInfo.SupportsResume,
+            IsChunkedTransfer = resourceInfo.IsChunkedTransfer,
+            ReportedFileSizeBytes = resourceInfo.ReportedFileSize,
+            FileSizeSource = resourceInfo.FileSizeSource,
+            TargetDirectory = saveFolderPath,
+            PlannedFileName = fileName,
+            FinalFileName = displayName,
+            FinalFilePath = savePath,
+            TemporaryFileName = fileName + ".part",
+            BytesDownloadedSoFar = 0
+        };
+
+        _logger.Info(
+            "Detected download capabilities.",
+            downloadId: id,
+            eventCode: "DOWNLOAD_CAPABILITIES_DETECTED",
+            context: new
+            {
+                RequestedUrl = session.RequestedUrl?.ToString(),
+                NormalizedUrl = session.NormalizedUrl?.ToString(),
+                FinalUrl = session.FinalUrl?.ToString(),
+                HttpMethod = session.HttpMethodUsedForProbe,
+                session.StatusCodeProbe,
+                session.ContentLengthHeaderRaw,
+                session.ContentRangeHeaderRaw,
+                session.AcceptRangesHeader,
+                session.ContentType,
+                session.SupportsResume,
+                session.IsChunkedTransfer,
+                session.FileSizeSource,
+                session.ReportedFileSizeBytes,
+                PlannedFileName = session.PlannedFileName
+            });
 
         var task = new DownloadTask
         {
@@ -187,6 +221,7 @@ public class DownloadEngine : IDownloadEngine
             FinalFileName = displayName,
             SavePath = savePath,
             TempChunkFolderPath = tempFolderPath,
+            Session = session,
             Status = DownloadStatus.Queued,
             Mode = mode,
             ContentLength = resourceInfo.ContentLength,
@@ -224,7 +259,11 @@ public class DownloadEngine : IDownloadEngine
                 task.ContentLength,
                 task.SupportsRange,
                 task.ResumeCapability,
-                RequestMethod = task.RequestMethod
+                RequestMethod = task.RequestMethod,
+                session.TargetDirectory,
+                PlannedFileName = session.PlannedFileName,
+                session.ReportedFileSizeBytes,
+                session.FileSizeSource
             });
 
         return task;
@@ -283,6 +322,10 @@ public class DownloadEngine : IDownloadEngine
             supportsRange = task.SupportsRange;
             alreadyDownloaded = task.TotalDownloadedBytes;
             knownLength = task.ContentLength;
+            if (task.Session is not null)
+            {
+                task.Session.WasResumed = task.Session.WasResumed || alreadyDownloaded > 0;
+            }
             if (task.SupportsRange)
             {
                 nextRangeStart = CalculateNextRangeStart(task);
@@ -478,10 +521,44 @@ public class DownloadEngine : IDownloadEngine
 
     private async Task RunDownloadAsync(DownloadTask task, CancellationToken cancellationToken)
     {
-        _logger.Info("Starting download.", downloadId: task.Id, eventCode: "DOWNLOAD_RUN_START");
+        var session = task.Session;
+        if (session is not null)
+        {
+            session.WasResumed = session.WasResumed || task.TotalDownloadedBytes > 0;
+            session.TemporaryFileName ??= task.FileName + ".part";
+            session.FinalFilePath ??= task.SavePath;
+            session.TargetDirectory ??= Path.GetDirectoryName(task.SavePath);
+        }
+
+        _logger.Info(
+            "Starting download.",
+            downloadId: task.Id,
+            eventCode: "DOWNLOAD_RUN_START",
+            context: new
+            {
+                RequestedUrl = session?.RequestedUrl?.ToString() ?? task.Url,
+                NormalizedUrl = session?.NormalizedUrl?.ToString(),
+                FinalUrl = session?.FinalUrl?.ToString(),
+                HttpMethodProbe = session?.HttpMethodUsedForProbe ?? task.RequestMethod,
+                ProbeStatusCode = session?.StatusCodeProbe,
+                session?.ContentLengthHeaderRaw,
+                session?.ContentRangeHeaderRaw,
+                session?.AcceptRangesHeader,
+                session?.ContentType,
+                session?.SupportsResume,
+                session?.IsChunkedTransfer,
+                FileSizeSource = session?.FileSizeSource,
+                ReportedFileSizeBytes = session?.ReportedFileSizeBytes ?? task.ContentLength,
+                TargetDirectory = session?.TargetDirectory,
+                PlannedFileName = session?.PlannedFileName ?? task.FileName,
+                task.ConnectionsCount,
+                ResumeCapability = task.ResumeCapability.ToString(),
+                WasResumed = session?.WasResumed ?? false
+            });
 
         var taskUri = new Uri(task.Url);
         var requestHttpMethod = ResolveHttpMethod(task.RequestMethod);
+        var currentStage = "prepare";
 
         try
         {
@@ -514,6 +591,7 @@ public class DownloadEngine : IDownloadEngine
                 await SaveStateAsync(task, cancellationToken).ConfigureAwait(false);
             }
 
+            currentStage = "segment-download";
             SyncChunkProgressFromDisk(task);
             task.UpdateProgressFromChunks();
             ReportProgress(task);
@@ -578,6 +656,7 @@ public class DownloadEngine : IDownloadEngine
             }
 
             task.MarkDownloadSuspended();
+            currentStage = "merge-segments";
             task.Status = DownloadStatus.Merging;
             await SaveStateAsync(task, cancellationToken).ConfigureAwait(false);
 
@@ -628,6 +707,18 @@ public class DownloadEngine : IDownloadEngine
             task.TotalDownloadedBytes = finalLength;
             task.ActualFileSize = finalLength;
 
+            if (task.Session is not null)
+            {
+                task.Session.BytesDownloadedSoFar = finalLength;
+                task.Session.FinalSizeBytes = finalLength;
+                task.Session.ReportedFileSizeBytes = finalLength;
+                task.Session.FileSizeSource = DownloadFileSizeSource.DiskFinal;
+                task.Session.FinalFilePath = task.SavePath;
+                task.Session.FinalFileName = task.FileName;
+                task.Session.CompletedAt = DateTimeOffset.UtcNow;
+            }
+
+            currentStage = "final-validation";
             if (!task.HasKnownContentLength && finalLength > 0)
             {
                 task.ContentLength = finalLength;
@@ -662,7 +753,8 @@ public class DownloadEngine : IDownloadEngine
                         {
                             task.Url,
                             Expected = task.ContentLength.Value,
-                            Actual = finalLength
+                            Actual = finalLength,
+                            Stage = currentStage
                         });
 
                     return;
@@ -682,7 +774,7 @@ public class DownloadEngine : IDownloadEngine
                     "Download validation failed due to zero-byte file.",
                     downloadId: task.Id,
                     eventCode: "DOWNLOAD_VALIDATION_ZERO_BYTES",
-                    context: new { task.Url });
+                    context: new { task.Url, Stage = currentStage });
 
                 return;
             }
@@ -691,7 +783,24 @@ public class DownloadEngine : IDownloadEngine
             task.LastErrorMessage = null;
             task.Status = DownloadStatus.Completed;
             await SaveStateAsync(task, cancellationToken).ConfigureAwait(false);
-            _logger.Info("Download completed.", downloadId: task.Id, eventCode: "DOWNLOAD_RUN_COMPLETED");
+            var durationSeconds = task.GetActiveSeconds(DateTimeOffset.UtcNow);
+            currentStage = "completed";
+            _logger.Info(
+                "Download completed.",
+                downloadId: task.Id,
+                eventCode: "DOWNLOAD_RUN_COMPLETED",
+                context: new
+                {
+                    FinalUrl = session?.FinalUrl?.ToString() ?? task.Url,
+                    FinalFilePath = task.SavePath,
+                    FinalFileName = task.FinalFileName,
+                    FinalSizeBytes = finalLength,
+                    FilesizeSourceFinal = session?.FileSizeSource,
+                    DurationSeconds = durationSeconds,
+                    WasResumed = session?.WasResumed ?? false,
+                    ConnectionsUsed = task.ConnectionsCount,
+                    TotalBytesWritten = task.BytesWritten
+                });
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -737,7 +846,8 @@ public class DownloadEngine : IDownloadEngine
                 {
                     Url = task.Url,
                     StatusCode = (int?)httpEx.StatusCode,
-                    ErrorCode = code.ToString()
+                    ErrorCode = code.ToString(),
+                    Stage = currentStage
                 });
         }
         catch (Exception ex)
@@ -762,7 +872,8 @@ public class DownloadEngine : IDownloadEngine
                 context: new
                 {
                     Url = task.Url,
-                    ErrorCode = code.ToString()
+                    ErrorCode = code.ToString(),
+                    Stage = currentStage
                 });
         }
         finally
@@ -1477,6 +1588,11 @@ public class DownloadEngine : IDownloadEngine
             ? DownloadResumeCapability.Supported
             : DownloadResumeCapability.RestartRequired;
 
+        if (task.Session is not null)
+        {
+            task.Session.SupportsResume = newCapability == DownloadResumeCapability.Supported;
+        }
+
         if (task.ResumeCapability == newCapability)
         {
             return;
@@ -1511,6 +1627,7 @@ public class DownloadEngine : IDownloadEngine
         }
 
         var now = DateTimeOffset.UtcNow;
+        var session = task.Session;
         ProgressTracker tracker;
         lock (_syncRoot)
         {
@@ -1585,6 +1702,23 @@ public class DownloadEngine : IDownloadEngine
             }
         }
 
+        if (session is not null)
+        {
+            session.BytesDownloadedSoFar = totalBytes;
+            if (!session.ReportedFileSizeBytes.HasValue && knownLength.HasValue && knownLength.Value > 0)
+            {
+                session.ReportedFileSizeBytes = knownLength.Value;
+            }
+        }
+
+        var averageSpeed = task.GetAverageSpeedBytesPerSecond(now);
+        TimeSpan? eta = null;
+        if (knownLength.HasValue && knownLength.Value > 0 && averageSpeed > 0)
+        {
+            var remainingBytes = Math.Max(0, knownLength.Value - totalBytes);
+            eta = TimeSpan.FromSeconds(remainingBytes / averageSpeed);
+        }
+
         if (shouldLog)
         {
             _logger.Info(
@@ -1600,7 +1734,11 @@ public class DownloadEngine : IDownloadEngine
                     ContentLength = knownLength,
                     Percent = percentForLog,
                     task.ResumeCapability,
-                    Reason = logReason
+                    Reason = logReason,
+                    SegmentCount = task.Chunks.Count,
+                    ReportedTotalSizeBytes = knownLength,
+                    CurrentSpeedBytesPerSecond = Math.Round(averageSpeed, 2),
+                    EtaSeconds = eta?.TotalSeconds
                 });
         }
 
@@ -1775,6 +1913,45 @@ public class DownloadEngine : IDownloadEngine
             return;
         }
 
+        var session = task.Session;
+        if (session is not null)
+        {
+            if (!string.IsNullOrEmpty(metadata.ContentRangeHeader))
+            {
+                session.ContentRangeHeaderRaw = metadata.ContentRangeHeader;
+            }
+
+            if (!string.IsNullOrEmpty(metadata.AcceptRangesHeader))
+            {
+                session.AcceptRangesHeader = metadata.AcceptRangesHeader;
+            }
+
+            if (!string.IsNullOrEmpty(metadata.ContentType))
+            {
+                session.ContentType = metadata.ContentType;
+            }
+
+            session.IsChunkedTransfer = metadata.IsChunkedTransfer;
+
+            if (metadata.ReportedFileSize.HasValue && metadata.ReportedFileSize.Value > 0)
+            {
+                session.ReportedFileSizeBytes = metadata.ReportedFileSize;
+                if (!string.IsNullOrEmpty(metadata.FileSizeSource))
+                {
+                    session.FileSizeSource = metadata.FileSizeSource;
+                }
+            }
+            else if (metadata.ResponseContentLength.HasValue && metadata.ResponseContentLength.Value > 0 &&
+                     !session.ReportedFileSizeBytes.HasValue)
+            {
+                session.ReportedFileSizeBytes = metadata.ResponseContentLength.Value;
+                if (session.FileSizeSource == DownloadFileSizeSource.Unknown)
+                {
+                    session.FileSizeSource = DownloadFileSizeSource.HttpHeaders;
+                }
+            }
+        }
+
         var previouslyKnownLength = task.HasKnownContentLength;
         bool lengthChanged = false;
 
@@ -1828,6 +2005,11 @@ public class DownloadEngine : IDownloadEngine
         task.SupportsRange = metadata.SupportsRange;
         EnsureResumeCapability(task, logChange: previousSupportsRange != task.SupportsRange);
 
+        if (session is not null)
+        {
+            session.SupportsResume = task.ResumeCapability == DownloadResumeCapability.Supported;
+        }
+
         if (!string.IsNullOrEmpty(metadata.ETag) && string.IsNullOrEmpty(task.ETag))
         {
             task.ETag = metadata.ETag;
@@ -1849,6 +2031,11 @@ public class DownloadEngine : IDownloadEngine
                     metadata.ContentType,
                     new Uri(task.Url));
 
+                if (!string.IsNullOrEmpty(session?.TargetDirectory))
+                {
+                    resolvedName = EnsureUniqueFileName(session.TargetDirectory, resolvedName, task.Id);
+                }
+
                 if (!string.Equals(task.FileName, resolvedName, StringComparison.Ordinal))
                 {
                     var directory = Path.GetDirectoryName(task.SavePath);
@@ -1867,6 +2054,11 @@ public class DownloadEngine : IDownloadEngine
                         TryRenameSaveFile(oldSavePath, newSavePath, task.Id);
                         task.FileName = resolvedName;
                         task.SavePath = newSavePath;
+                        if (session is not null)
+                        {
+                            session.PlannedFileName = resolvedName;
+                            session.FinalFilePath = newSavePath;
+                        }
                     }
                 }
             }
@@ -1889,6 +2081,19 @@ public class DownloadEngine : IDownloadEngine
         if (!string.Equals(task.FinalFileName, updatedDisplay, StringComparison.Ordinal))
         {
             task.FinalFileName = updatedDisplay;
+            if (session is not null)
+            {
+                session.FinalFileName = updatedDisplay;
+            }
+        }
+
+        if (session is not null && task.ContentLength.HasValue && task.ContentLength.Value > 0)
+        {
+            session.ReportedFileSizeBytes = task.ContentLength.Value;
+            if (!string.IsNullOrEmpty(metadata.FileSizeSource) && metadata.FileSizeSource != DownloadFileSizeSource.Unknown)
+            {
+                session.FileSizeSource = metadata.FileSizeSource;
+            }
         }
     }
 
@@ -1992,7 +2197,7 @@ public class DownloadEngine : IDownloadEngine
         string? contentDispositionFileName,
         string resolvedFileName)
     {
-        var dispositionName = FileNameHelper.NormalizeFileName(contentDispositionFileName);
+        var dispositionName = FileNameHelper.NormalizeContentDispositionFileName(contentDispositionFileName);
 
         if (!string.IsNullOrWhiteSpace(normalizedSuggested) &&
             !FileNameHelper.LooksLikePlaceholderName(normalizedSuggested))
@@ -2012,6 +2217,54 @@ public class DownloadEngine : IDownloadEngine
         }
 
         return normalizedSuggested ?? dispositionName ?? resolvedFileName;
+    }
+
+    private string EnsureUniqueFileName(string directory, string candidate, Guid downloadId)
+    {
+        var normalized = FileNameHelper.NormalizeFileName(candidate) ?? "download";
+        var extension = Path.GetExtension(normalized);
+        if (string.IsNullOrEmpty(extension) || extension == ".")
+        {
+            extension = string.Empty;
+        }
+
+        var baseName = Path.GetFileNameWithoutExtension(normalized);
+        if (string.IsNullOrWhiteSpace(baseName))
+        {
+            baseName = "download";
+        }
+
+        var index = 0;
+        while (true)
+        {
+            var candidateName = index == 0
+                ? normalized
+                : $"{baseName} ({index}){extension}";
+            var fullPath = Path.Combine(directory, candidateName);
+
+            var collision = File.Exists(fullPath);
+            if (!collision)
+            {
+                lock (_syncRoot)
+                {
+                    collision = _downloads.Values.Any(t =>
+                        t.Id != downloadId &&
+                        string.Equals(t.SavePath, fullPath, StringComparison.OrdinalIgnoreCase));
+                }
+            }
+
+            if (!collision)
+            {
+                return candidateName;
+            }
+
+            index++;
+
+            if (index > 500)
+            {
+                return $"{baseName}-{Guid.NewGuid():N}{extension}";
+            }
+        }
     }
 
     private static int DetermineConnectionsCount(DownloadMode mode, HttpResourceInfo info)
@@ -2068,40 +2321,53 @@ public class DownloadEngine : IDownloadEngine
         string? contentType,
         Uri resourceUri)
     {
-        var normalizedDisposition = FileNameHelper.NormalizeFileName(contentDispositionFileName);
-        var normalizedBrowser = FileNameHelper.NormalizeFileName(browserFileName);
-        var normalizedFromUrl = FileNameHelper.TryExtractFileNameFromUrl(resourceUri);
+        var fromDisposition = FileNameHelper.NormalizeContentDispositionFileName(contentDispositionFileName);
+        var fromUrl = FileNameHelper.TryExtractFileNameFromUrl(resourceUri);
+        var fromBrowser = FileNameHelper.NormalizeFileName(browserFileName);
 
-        var candidate = normalizedDisposition ?? normalizedBrowser;
+        string? candidate = null;
 
-        if (FileNameHelper.LooksLikePlaceholderName(candidate) &&
-            !FileNameHelper.LooksLikePlaceholderName(normalizedFromUrl))
+        if (!string.IsNullOrWhiteSpace(fromDisposition) && !FileNameHelper.LooksLikePlaceholderName(fromDisposition))
         {
-            candidate = normalizedFromUrl;
+            candidate = fromDisposition;
+        }
+        else if (!string.IsNullOrWhiteSpace(fromUrl) && !FileNameHelper.LooksLikePlaceholderName(fromUrl))
+        {
+            candidate = fromUrl;
+        }
+        else if (!string.IsNullOrWhiteSpace(fromBrowser) && !FileNameHelper.LooksLikePlaceholderName(fromBrowser))
+        {
+            candidate = fromBrowser;
+        }
+        else
+        {
+            candidate = fromDisposition ?? fromUrl ?? fromBrowser ?? "download";
         }
 
-        candidate ??= normalizedFromUrl;
-
-        if (string.IsNullOrWhiteSpace(candidate))
-        {
-            candidate = "download";
-        }
+        candidate ??= "download";
 
         var extension = Path.GetExtension(candidate);
-        if (string.IsNullOrWhiteSpace(extension) || extension.Equals(".", StringComparison.Ordinal))
+        var resolvedExtension = TryResolveExtensionFromContentType(contentType);
+        var shouldReplaceExtension = string.IsNullOrWhiteSpace(extension) || extension.Equals(".", StringComparison.Ordinal) ||
+                                     string.Equals(extension, ".bin", StringComparison.OrdinalIgnoreCase) ||
+                                     string.Equals(extension, ".tmp", StringComparison.OrdinalIgnoreCase);
+
+        if (!string.IsNullOrEmpty(resolvedExtension) && shouldReplaceExtension)
         {
-            var resolvedExtension = TryResolveExtensionFromContentType(contentType);
-            if (!string.IsNullOrEmpty(resolvedExtension))
+            var baseName = Path.GetFileNameWithoutExtension(candidate);
+            if (string.IsNullOrWhiteSpace(baseName))
             {
-                candidate = candidate.TrimEnd('.') + resolvedExtension;
+                baseName = "download";
             }
-            else if (!candidate.Contains('.', StringComparison.Ordinal))
-            {
-                candidate += ".bin";
-            }
+
+            candidate = baseName + resolvedExtension;
+        }
+        else if (string.IsNullOrEmpty(extension) || extension == ".")
+        {
+            candidate = candidate.TrimEnd('.') + (resolvedExtension ?? ".bin");
         }
 
-        return candidate;
+        return FileNameHelper.NormalizeFileName(candidate) ?? "download";
     }
 
     private static string? TryResolveExtensionFromContentType(string? contentType)

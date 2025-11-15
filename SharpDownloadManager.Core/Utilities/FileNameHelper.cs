@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -53,6 +54,17 @@ public static class FileNameHelper
         if (candidate.EndsWith(".crdownload", StringComparison.OrdinalIgnoreCase))
         {
             candidate = candidate[..^".crdownload".Length];
+        }
+
+        if (candidate.Contains('%'))
+        {
+            try
+            {
+                candidate = Uri.UnescapeDataString(candidate);
+            }
+            catch
+            {
+            }
         }
 
         candidate = candidate.Trim();
@@ -184,6 +196,96 @@ public static class FileNameHelper
             }
         }
 
-        return NormalizeFileName(Path.GetFileName(uri.AbsolutePath));
+        var fileName = Path.GetFileName(uri.AbsolutePath);
+        if (!string.IsNullOrEmpty(fileName))
+        {
+            try
+            {
+                fileName = Uri.UnescapeDataString(fileName);
+            }
+            catch
+            {
+            }
+        }
+
+        return NormalizeFileName(fileName);
+    }
+
+    public static string? NormalizeContentDispositionFileName(string? input)
+    {
+        if (string.IsNullOrWhiteSpace(input))
+        {
+            return null;
+        }
+
+        var trimmed = input.Trim().Trim('"');
+        if (string.IsNullOrWhiteSpace(trimmed))
+        {
+            return null;
+        }
+
+        if (trimmed.Contains("''", StringComparison.Ordinal))
+        {
+            var parts = trimmed.Split('\'');
+            if (parts.Length >= 3)
+            {
+                var encodingName = parts[0];
+                var encodedValue = string.Join("'", parts.Skip(2));
+                try
+                {
+                    var encoding = string.IsNullOrWhiteSpace(encodingName)
+                        ? Encoding.UTF8
+                        : Encoding.GetEncoding(encodingName);
+                    var decodedBytes = DecodePercentEncodedToBytes(encodedValue);
+                    var decoded = encoding.GetString(decodedBytes);
+                    var normalized = NormalizeFileName(decoded);
+                    if (!string.IsNullOrEmpty(normalized))
+                    {
+                        return normalized;
+                    }
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        try
+        {
+            trimmed = Uri.UnescapeDataString(trimmed);
+        }
+        catch
+        {
+        }
+
+        return NormalizeFileName(trimmed);
+    }
+
+    private static byte[] DecodePercentEncodedToBytes(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return Array.Empty<byte>();
+        }
+
+        using var buffer = new MemoryStream(value.Length);
+        for (int i = 0; i < value.Length; i++)
+        {
+            var ch = value[i];
+            if (ch == '%' && i + 2 < value.Length)
+            {
+                var hex = value.Substring(i + 1, 2);
+                if (byte.TryParse(hex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var b))
+                {
+                    buffer.WriteByte(b);
+                    i += 2;
+                    continue;
+                }
+            }
+
+            buffer.WriteByte((byte)ch);
+        }
+
+        return buffer.ToArray();
     }
 }

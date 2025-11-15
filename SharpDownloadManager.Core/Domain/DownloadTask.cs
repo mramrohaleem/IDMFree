@@ -18,6 +18,8 @@ public class DownloadTask
 
     public string TempChunkFolderPath { get; set; } = string.Empty;
 
+    public DownloadSession Session { get; set; } = new();
+
     public string RequestMethod { get; set; } = HttpMethod.Get.Method;
 
     public DownloadStatus Status { get; set; } = DownloadStatus.Queued;
