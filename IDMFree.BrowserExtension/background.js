@@ -1,4 +1,5 @@
 const LOG_PREFIX = "[IDMFree]";
+const NATIVE_HOST_NAME = "com.idmfree.bridge";
 const CONTEXT_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const MAX_CONTEXT_ENTRIES = 400;
 const FALLBACK_TTL_MS = 3 * 60 * 1000; // 3 minutes
@@ -55,6 +56,44 @@ function now() {
 
 function logEvent(event, context = {}) {
   console.debug(`${LOG_PREFIX} ${event}`, context);
+}
+
+function sendNativeBridgeMessage(message) {
+  return new Promise((resolve, reject) => {
+    try {
+      chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, message, (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message || "native_messaging_failed"));
+          return;
+        }
+        resolve(response || null);
+      });
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+async function dispatchDownloadToNative(kind, payload) {
+  try {
+    const response = await sendNativeBridgeMessage({
+      type: "idmfree.download",
+      kind,
+      payload,
+    });
+    const status = response && typeof response.status === "string" ? response.status : null;
+    return {
+      accepted: status === "accepted",
+      status: status || null,
+      response,
+    };
+  } catch (err) {
+    return {
+      accepted: false,
+      status: "error",
+      error: err?.message || String(err),
+    };
+  }
 }
 
 function normalizeExtension(ext) {
@@ -419,13 +458,23 @@ function shouldInterceptClick(message) {
   if (!settings.captureDownloads || !settings.interceptClicks) {
     return { intercept: false };
   }
-  const { url, downloadAttribute, hasDownloadAttribute, extensionHint, buttonLabel } = message;
+  const {
+    url,
+    downloadAttribute,
+    hasDownloadAttribute,
+    extensionHint,
+    buttonLabel,
+    customDownloadHint,
+  } = message;
   if (!url || shouldBypassBridge(url) || isExcludedDomain(url)) {
     return { intercept: false };
   }
   const ext = extensionHint || getExtensionFromUrl(url);
   if (hasDownloadAttribute) {
     return { intercept: true, reason: "download-attribute" };
+  }
+  if (customDownloadHint) {
+    return { intercept: true, reason: "custom-hint" };
   }
   if (isExtensionExplicitlyAllowed(ext)) {
     return { intercept: true, reason: "extension-whitelist" };
@@ -442,30 +491,115 @@ function shouldInterceptClick(message) {
   return { intercept: false };
 }
 
+async function processDownloadIntent(payload, sender) {
+  if (!payload || !payload.url) {
+    return { handled: false, reason: "invalid-payload" };
+  }
+  if (!settings.captureDownloads || !settings.interceptClicks) {
+    return { handled: false, reason: "capture-disabled" };
+  }
+  if (shouldBypassBridge(payload.url) || isExcludedDomain(payload.url)) {
+    logEvent("download_intent_bypassed", { url: payload.url });
+    return { handled: false, reason: "bypass" };
+  }
+
+  const decision = shouldInterceptClick({
+    url: payload.url,
+    downloadAttribute: payload.hints?.downloadAttribute ?? null,
+    hasDownloadAttribute: Boolean(payload.hints?.hasDownloadAttribute),
+    extensionHint: payload.hints?.extensionHint ?? null,
+    buttonLabel: payload.hints?.buttonLabel ?? null,
+    customDownloadHint: Boolean(payload.hints?.customDownloadHint),
+  });
+
+  if (!decision.intercept) {
+    logEvent("download_intent_declined", {
+      url: payload.url,
+      reason: decision.reason || "policy-declined",
+    });
+    return { handled: false, reason: "policy-declined" };
+  }
+
+  const tabId = sender.tab?.id ?? -1;
+  const frameId = sender.frameId ?? 0;
+  const intent = {
+    url: payload.url,
+    referrer: payload.referrer || sender.url || null,
+    pageUrl: payload.pageUrl || sender.url || null,
+    pageTitle: payload.pageTitle || null,
+    tabId,
+    frameId,
+    suggestedFileName: payload.suggestedFileName || null,
+    hints: {
+      downloadAttribute: payload.hints?.downloadAttribute ?? null,
+      hasDownloadAttribute: Boolean(payload.hints?.hasDownloadAttribute),
+      extensionHint: payload.hints?.extensionHint ?? null,
+      customDownloadHint: Boolean(payload.hints?.customDownloadHint),
+      buttonLabel: payload.hints?.buttonLabel || null,
+    },
+  };
+
+  if (payload.navigation) {
+    intent.navigation = {
+      target: payload.navigation.target || null,
+      rel: payload.navigation.rel || null,
+      openInNewTab: Boolean(payload.navigation.openInNewTab),
+      eventButton: payload.navigation.eventButton ?? 0,
+      modifiers: payload.navigation.modifiers || {},
+    };
+  }
+
+  logEvent("download_flow_click_intent", {
+    url: intent.url,
+    tabId,
+    frameId,
+    reason: decision.reason,
+  });
+
+  const nativeResult = await dispatchDownloadToNative("click-intent", intent);
+
+  if (nativeResult.accepted) {
+    logEvent("download_flow_click_forwarded", {
+      url: intent.url,
+      tabId,
+      frameId,
+      status: nativeResult.status || "accepted",
+      finalOwner: "idm",
+    });
+    return { handled: true, status: nativeResult.status || "accepted" };
+  }
+
+  rememberFallbackHost(intent.url);
+
+  logEvent("download_flow_click_fallback", {
+    url: intent.url,
+    tabId,
+    frameId,
+    status: nativeResult.status || "error",
+    error: nativeResult.error || null,
+    finalOwner: "browser",
+  });
+
+  return {
+    handled: false,
+    status: nativeResult.status || "error",
+    error: nativeResult.error || null,
+  };
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (!message || message.type !== "idmfree:candidate-download") {
+  if (!message || message.type !== "idmfree:download-intent") {
     return;
   }
-  const tabId = sender.tab?.id;
-  const decision = shouldInterceptClick(message);
-  if (decision.intercept && tabId != null && tabId >= 0) {
-    rememberClickHint(tabId, message.url, {
-      reason: decision.reason,
-      downloadAttribute: message.hasDownloadAttribute
-        ? (message.downloadAttribute || "")
-        : null,
-      hasDownloadAttribute: Boolean(message.hasDownloadAttribute),
-      buttonLabel: message.buttonLabel || null,
-      frameId: sender.frameId ?? 0,
+  processDownloadIntent(message.payload || {}, sender)
+    .then((result) => {
+      sendResponse(result);
+    })
+    .catch((err) => {
+      console.warn(`${LOG_PREFIX} Failed to process download intent`, err);
+      sendResponse({ handled: false, status: "error", error: "internal-error" });
     });
-    logEvent("download_click_intercepted_at_content_script", {
-      url: message.url,
-      tabId,
-      frameId: sender.frameId ?? 0,
-      reason: decision.reason,
-    });
-  }
-  sendResponse({ intercept: Boolean(decision.intercept) });
+  return true;
 });
 
 function ensureRequestContext(details) {
@@ -638,39 +772,33 @@ async function delegateToManager(context) {
     layer: context.interceptLayer,
     reason: context.interceptReason,
   });
-  let handledByManager = false;
-  try {
-    const response = await fetch("http://127.0.0.1:5454/api/downloads", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+
+  const nativeResult = await dispatchDownloadToNative("network-intercept", payload);
+
+  if (nativeResult.accepted) {
+    logEvent("download_flow_network_forwarded", {
+      url: context.url,
+      layer: context.interceptLayer,
+      reason: context.interceptReason,
+      status: nativeResult.status || "accepted",
+      finalOwner: "idm",
     });
-    let body = null;
-    try {
-      body = await response.json();
-    } catch (jsonError) {
-      console.warn(`${LOG_PREFIX} Failed to parse bridge response`, jsonError);
-    }
-    const bridgeStatus = body && typeof body.status === "string" ? body.status : null;
-    handledByManager = bridgeStatus === "accepted";
-    if (bridgeStatus === "fallback") {
-      rememberFallbackHost(context.url);
-    } else if (bridgeStatus === "error") {
-      rememberFallbackHost(context.url);
-    }
-    if (!handledByManager && response.status >= 500) {
-      rememberFallbackHost(context.url);
-    }
-    if (!handledByManager) {
-      console.debug(`${LOG_PREFIX} Desktop manager declined download`, body?.error || bridgeStatus);
-    }
-  } catch (err) {
-    console.warn(`${LOG_PREFIX} Failed to reach desktop manager`, err);
-    rememberFallbackHost(context.url);
+    cleanupRequestContext(context.id);
+    return;
   }
-  if (!handledByManager) {
-    await fallbackToBrowser(context);
-  }
+
+  rememberFallbackHost(context.url);
+
+  logEvent("download_flow_network_fallback", {
+    url: context.url,
+    layer: context.interceptLayer,
+    reason: context.interceptReason,
+    status: nativeResult.status || "error",
+    error: nativeResult.error || null,
+    finalOwner: "browser",
+  });
+
+  await fallbackToBrowser(context);
   cleanupRequestContext(context.id);
 }
 
@@ -788,30 +916,6 @@ function normalizeFileName(filePath) {
   return base || null;
 }
 
-function pauseDownload(downloadId) {
-  return new Promise((resolve) => {
-    chrome.downloads.pause(downloadId, () => {
-      if (chrome.runtime.lastError) {
-        resolve(false);
-        return;
-      }
-      resolve(true);
-    });
-  });
-}
-
-function resumeDownload(downloadId) {
-  return new Promise((resolve) => {
-    chrome.downloads.resume(downloadId, () => {
-      if (chrome.runtime.lastError) {
-        resolve(false);
-        return;
-      }
-      resolve(true);
-    });
-  });
-}
-
 function cancelAndErase(downloadId) {
   return new Promise((resolve) => {
     chrome.downloads.cancel(downloadId, () => {
@@ -830,69 +934,73 @@ function cancelAndErase(downloadId) {
   });
 }
 
-async function handleDownloadsApiIntercept(item) {
+async function handleDownloadsApiCreated(item) {
   if (!settings.captureDownloads || !settings.interceptDownloadsApi) {
     return;
   }
   if (!item || !item.url || shouldBypassBridge(item.url) || isExcludedDomain(item.url)) {
     return;
   }
-  logEvent("download_intercepted_at_downloads_api_layer", {
+
+  logEvent("download_flow_downloads_api_created", {
     url: item.url,
     id: item.id,
   });
+
+  const cancelStartedAt = now();
+  const cancelled = await cancelAndErase(item.id);
+  const cancelDurationMs = now() - cancelStartedAt;
+
+  logEvent("download_flow_downloads_api_cancelled", {
+    url: item.url,
+    id: item.id,
+    cancelled,
+    durationMs: cancelDurationMs,
+  });
+
   const cached = recentRequestsByUrl.get(item.url) || null;
   const payload = {
     url: item.url,
-    fileName: normalizeFileName(item.filename) || guessFileNameFromUrl(item.url),
+    finalUrl: item.finalUrl || item.url,
+    fileName:
+      normalizeFileName(item.filename) ||
+      guessFileNameFromUrl(item.finalUrl || item.url) ||
+      null,
+    mime: item.mime || null,
+    referrer: item.referrer || null,
     method: cached ? cached.method : "GET",
+    tabId: item.tabId ?? -1,
+    danger: item.danger || null,
+    totalBytes: Number.isFinite(item.totalBytes) ? item.totalBytes : null,
+    bytesReceived: Number.isFinite(item.bytesReceived) ? item.bytesReceived : null,
   };
   if (cached && cached.requestHeaders) {
     payload.headers = buildHeadersObject(cached.requestHeaders);
   }
-  const wasPaused = await pauseDownload(item.id);
-  let handledByManager = false;
-  try {
-    const response = await fetch("http://127.0.0.1:5454/api/downloads", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    let body = null;
-    try {
-      body = await response.json();
-    } catch (jsonError) {
-      console.warn(`${LOG_PREFIX} Failed to parse bridge response`, jsonError);
-    }
-    const bridgeStatus = body && typeof body.status === "string" ? body.status : null;
-    handledByManager = bridgeStatus === "accepted";
-    if (bridgeStatus === "fallback") {
-      rememberFallbackHost(item.url);
-    } else if (bridgeStatus === "error") {
-      rememberFallbackHost(item.url);
-    }
-  } catch (err) {
-    console.warn(`${LOG_PREFIX} Failed to reach desktop manager`, err);
-    rememberFallbackHost(item.url);
-  }
-  if (handledByManager) {
-    await cancelAndErase(item.id);
-    logEvent("download_forwarded_to_native_manager", {
+
+  const nativeResult = await dispatchDownloadToNative("downloads-api", payload);
+
+  if (nativeResult.accepted) {
+    logEvent("download_flow_downloads_api_forwarded", {
       url: item.url,
-      layer: "downloads-api",
+      status: nativeResult.status || "accepted",
+      finalOwner: "idm",
     });
     return;
   }
-  if (wasPaused) {
-    const resumed = await resumeDownload(item.id);
-    if (!resumed) {
-      console.warn(`${LOG_PREFIX} Failed to resume browser download`, item.id);
-    }
-  }
+
+  rememberFallbackHost(item.url);
+
+  logEvent("download_flow_downloads_api_fallback", {
+    url: item.url,
+    status: nativeResult.status || "error",
+    error: nativeResult.error || null,
+    finalOwner: "browser",
+  });
 }
 
 chrome.downloads.onCreated.addListener((item) => {
-  handleDownloadsApiIntercept(item);
+  handleDownloadsApiCreated(item);
 });
 
 chrome.downloads.onDeterminingFilename?.addListener((item, suggest) => {

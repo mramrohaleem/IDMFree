@@ -8,11 +8,11 @@
     "webRequest",
     "webRequestBlocking",
     "storage",
-    "contextMenus"
+    "contextMenus",
+    "nativeMessaging"
   ],
   "host_permissions": [
-    "<all_urls>",
-    "http://127.0.0.1:5454/*"
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "background.js"
