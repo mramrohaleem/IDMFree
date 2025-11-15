@@ -1008,6 +1008,7 @@ function rememberRecentRequest(context) {
     timestamp: now(),
     correlationId: context.correlationId || context.fromClick?.correlationId || null,
     initiator: context.initiator || null,
+    delegated: Boolean(context.delegated),
   });
   pruneMap(recentRequestsByUrl, CONTEXT_TTL_MS);
 }
@@ -1053,6 +1054,7 @@ async function delegateToManager(context) {
     return;
   }
   context.delegated = true;
+  rememberRecentRequest(context);
   const correlationId = ensureContextCorrelationId(context);
   const headers = buildHeadersObject(context.requestHeaders);
   const clickDownloadName =
@@ -1293,6 +1295,16 @@ async function handleDownloadsApiCreated(item) {
 
   const cached = recentRequestsByUrl.get(item.url) || null;
   const correlationId = cached?.correlationId || generateCorrelationId();
+
+  if (cached?.delegated) {
+    logEvent("BG: downloads.onCreated ignored", {
+      correlationId,
+      url: item.url,
+      id: item.id,
+      reason: "already-delegated",
+    });
+    return;
+  }
 
   logEvent("BG: downloads.onCreated triggered", {
     correlationId,
