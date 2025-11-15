@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Net.Http;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -70,7 +71,8 @@ CREATE TABLE IF NOT EXISTS Downloads (
     TooManyRequestsRetryCount INTEGER NOT NULL DEFAULT 0,
     RetryBackoffSeconds REAL NOT NULL DEFAULT 0,
     NextRetryUtc TEXT NULL,
-    MaxParallelConnections INTEGER NULL
+    MaxParallelConnections INTEGER NULL,
+    SessionMetadata TEXT NULL
 );";
 
             var createChunks = @"
@@ -207,6 +209,14 @@ CREATE TABLE IF NOT EXISTS Chunks (
             await EnsureColumnExistsAsync(
                     connection,
                     "Downloads",
+                    "SessionMetadata",
+                    "TEXT NULL",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
                     "FinalFileName",
                     "TEXT NOT NULL DEFAULT ''",
                     cancellationToken)
@@ -310,7 +320,8 @@ CREATE TABLE IF NOT EXISTS Downloads (
     TooManyRequestsRetryCount INTEGER NOT NULL DEFAULT 0,
     RetryBackoffSeconds REAL NOT NULL DEFAULT 0,
     NextRetryUtc TEXT NULL,
-    MaxParallelConnections INTEGER NULL
+    MaxParallelConnections INTEGER NULL,
+    SessionMetadata TEXT NULL
 );";
                 await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
@@ -366,6 +377,14 @@ CREATE TABLE IF NOT EXISTS Chunks (
                     cancellationToken)
                 .ConfigureAwait(false);
 
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "SessionMetadata",
+                    "TEXT NULL",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
             _logger.Info("SQLite state store recreated after corruption.", eventCode: "STATE_STORE_RESET", context: new { DbPath = _dbPath });
         }
     }
@@ -397,7 +416,7 @@ INSERT INTO Downloads (
     LastErrorCode, LastErrorMessage,
     RequestHeaders, RequestMethod,
     TotalActiveSeconds, LastResumedAt, HttpStatusCategory,
-    TooManyRequestsRetryCount, RetryBackoffSeconds, NextRetryUtc, MaxParallelConnections
+    TooManyRequestsRetryCount, RetryBackoffSeconds, NextRetryUtc, MaxParallelConnections, SessionMetadata
 ) VALUES (
     $Id, $Url, $FileName, $FinalFileName, $SavePath, $TempFolderPath,
     $Status, $Mode, $ContentLength, $SupportsRange, $ResumeCapability,
@@ -406,7 +425,7 @@ INSERT INTO Downloads (
     $LastErrorCode, $LastErrorMessage,
     $RequestHeaders, $RequestMethod,
     $TotalActiveSeconds, $LastResumedAt, $HttpStatusCategory,
-    $TooManyRequestsRetryCount, $RetryBackoffSeconds, $NextRetryUtc, $MaxParallelConnections
+    $TooManyRequestsRetryCount, $RetryBackoffSeconds, $NextRetryUtc, $MaxParallelConnections, $SessionMetadata
 )
 ON CONFLICT(Id) DO UPDATE SET
     Url = excluded.Url,
@@ -435,7 +454,8 @@ ON CONFLICT(Id) DO UPDATE SET
     TooManyRequestsRetryCount = excluded.TooManyRequestsRetryCount,
     RetryBackoffSeconds = excluded.RetryBackoffSeconds,
     NextRetryUtc = excluded.NextRetryUtc,
-    MaxParallelConnections = excluded.MaxParallelConnections;
+    MaxParallelConnections = excluded.MaxParallelConnections,
+    SessionMetadata = excluded.SessionMetadata;
 ";
 
                 cmd.Parameters.AddWithValue("$Id", task.Id.ToString());
@@ -486,6 +506,9 @@ ON CONFLICT(Id) DO UPDATE SET
                 {
                     cmd.Parameters.AddWithValue("$MaxParallelConnections", DBNull.Value);
                 }
+
+                var sessionJson = SerializeSession(task.Session);
+                cmd.Parameters.AddWithValue("$SessionMetadata", (object?)sessionJson ?? DBNull.Value);
 
                 await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
@@ -672,6 +695,14 @@ INSERT INTO Chunks (
                         task.RequestMethod = "GET";
                     }
 
+                    string? sessionJson = null;
+                    if (!reader.IsDBNull(reader.GetOrdinal("SessionMetadata")))
+                    {
+                        sessionJson = reader.GetString(reader.GetOrdinal("SessionMetadata"));
+                    }
+
+                    task.Session = DeserializeSession(sessionJson, id, task);
+
                     // Reset unsafe states to Paused
                     if (task.Status == DownloadStatus.Downloading
                         || task.Status == DownloadStatus.Merging
@@ -843,6 +874,69 @@ INSERT INTO Chunks (
         {
             return null;
         }
+    }
+
+    private static string? SerializeSession(DownloadSession? session)
+    {
+        if (session is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return JsonSerializer.Serialize(session);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static DownloadSession DeserializeSession(string? json, Guid downloadId, DownloadTask task)
+    {
+        if (!string.IsNullOrWhiteSpace(json))
+        {
+            try
+            {
+                var session = JsonSerializer.Deserialize<DownloadSession>(json!);
+                if (session is not null)
+                {
+                    session.DownloadId = downloadId;
+                    session.PlannedFileName ??= task.FileName;
+                    session.FinalFileName ??= task.FinalFileName;
+                    session.FinalFilePath ??= task.SavePath;
+                    session.TargetDirectory ??= Path.GetDirectoryName(task.SavePath);
+                    return session;
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        var fallbackSession = new DownloadSession
+        {
+            DownloadId = downloadId,
+            RequestedUrl = Uri.TryCreate(task.Url, UriKind.Absolute, out var requested) ? requested : null,
+            NormalizedUrl = requested,
+            FinalUrl = requested,
+            HttpMethodUsedForProbe = task.RequestMethod ?? HttpMethod.Get.Method,
+            PlannedFileName = task.FileName,
+            FinalFileName = task.FinalFileName,
+            FinalFilePath = task.SavePath,
+            TargetDirectory = Path.GetDirectoryName(task.SavePath),
+            ReportedFileSizeBytes = task.ContentLength,
+            FileSizeSource = task.ContentLength.HasValue ? DownloadFileSizeSource.ContentLength : DownloadFileSizeSource.Unknown,
+            SupportsResume = task.ResumeCapability == DownloadResumeCapability.Supported,
+            AcceptRangesHeader = task.SupportsRange ? "bytes" : null,
+            TemporaryFileName = task.FileName + ".part",
+            BytesDownloadedSoFar = task.TotalDownloadedBytes,
+            ContentLengthHeaderRaw = task.ContentLength?.ToString(),
+            ContentType = null
+        };
+
+        return fallbackSession;
     }
 
     private SqliteConnection CreateConnection()

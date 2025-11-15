@@ -1,4 +1,5 @@
 using System;
+using SharpDownloadManager.Core.Domain;
 
 namespace SharpDownloadManager.Core.Abstractions;
 
@@ -9,4 +10,9 @@ public sealed record DownloadResponseMetadata(
     string? ETag,
     DateTimeOffset? LastModified,
     string? ContentDispositionFileName,
-    string? ContentType);
+    string? ContentType,
+    string? ContentRangeHeader,
+    string? AcceptRangesHeader,
+    bool IsChunkedTransfer,
+    long? ReportedFileSize,
+    string FileSizeSource);

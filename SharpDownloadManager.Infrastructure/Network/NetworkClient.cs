@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -21,6 +22,41 @@ public sealed class NetworkClient : INetworkClient
     private readonly ILogger _logger;
     private static readonly HttpClient _client = CreateClient();
     private const string RetryAfterSecondsKey = "RetryAfterSeconds";
+
+    private sealed class ProbeSnapshot
+    {
+        public HttpMethod Method { get; init; } = HttpMethod.Head;
+
+        public int StatusCode { get; init; }
+
+        public Uri? FinalUri { get; init; }
+
+        public string? ContentLengthHeader { get; init; }
+
+        public string? ContentRangeHeader { get; init; }
+
+        public string? AcceptRanges { get; init; }
+
+        public string? ContentType { get; init; }
+
+        public string? ContentDispositionFileName { get; init; }
+
+        public long? ContentLength { get; init; }
+
+        public long? ContentRangeLength { get; init; }
+
+        public bool SupportsRange { get; init; }
+
+        public bool IsChunkedTransfer { get; init; }
+
+        public string FileSizeSource { get; init; } = DownloadFileSizeSource.Unknown;
+
+        public long? ReportedFileSize { get; init; }
+
+        public string? ETag { get; init; }
+
+        public DateTimeOffset? LastModified { get; init; }
+    }
 
     private static HttpClient CreateClient()
     {
@@ -65,98 +101,68 @@ public sealed class NetworkClient : INetworkClient
             throw new ArgumentException("URL must not be empty.", nameof(url));
         }
 
-        var uri = new Uri(url);
+        var requestedUri = new Uri(url);
+        var normalizedUri = NormalizeForProbe(requestedUri);
 
         _logger.Info(
             "Starting probe",
             eventCode: "PROBE_START",
             context: new { Url = url });
 
-        HttpResponseMessage? response = null;
         var normalizedMethod = NormalizeHttpMethod(preferredMethod);
-        var shouldUseHeadProbe = normalizedMethod == HttpMethod.Get;
+
+        ProbeSnapshot? primarySnapshot = null;
+        ProbeSnapshot? rangeSnapshot = null;
 
         try
         {
-            var primaryMethod = shouldUseHeadProbe ? HttpMethod.Head : normalizedMethod;
-            var fallbackMethod = normalizedMethod == HttpMethod.Head ? HttpMethod.Get : normalizedMethod;
-
-            response = await SendWithFallbackAsync(
-                    uri,
-                    primaryMethod,
-                    fallbackMethod,
+            var (response, methodUsed) = await SendWithFallbackAsync(
+                    requestedUri,
+                    HttpMethod.Head,
+                    normalizedMethod == HttpMethod.Head ? HttpMethod.Get : normalizedMethod,
                     extraHeaders,
-                    cancellationToken)
+                    cancellationToken,
+                    fallbackUsesRangeProbe: true)
                 .ConfigureAwait(false);
 
-            response.EnsureSuccessStatusCode();
-            var contentLength = response.Content.Headers.ContentLength;
-
-            var supportsRange =
-                response.Headers.AcceptRanges.Contains("bytes") ||
-                response.Content.Headers.ContentRange != null;
-
-            var isChunkedWithoutLength =
-                !contentLength.HasValue &&
-                response.Headers.TransferEncodingChunked == true;
-
-            // نكتفي باللي جاي من Content headers
-            var lastModified = response.Content.Headers.LastModified;
-            var contentDispositionName = ExtractFileNameFromContentDisposition(
-                response.Content.Headers.ContentDisposition);
-
-            var info = new HttpResourceInfo
+            using (response)
             {
-                Url = uri,
-                ContentLength = contentLength,
-                SupportsRange = supportsRange,
-                ETag = response.Headers.ETag?.Tag,
-                LastModified = lastModified,
-                IsChunkedWithoutLength = isChunkedWithoutLength,
-                ContentDispositionFileName = contentDispositionName,
-                ContentType = response.Content.Headers.ContentType?.MediaType
-            };
-
-            _logger.Info(
-                "Probe completed",
-                eventCode: "PROBE_SUCCESS",
-                context: new
+                if (!response.IsSuccessStatusCode &&
+                    response.StatusCode != HttpStatusCode.RequestedRangeNotSatisfiable)
                 {
-                    Url = url,
-                    info.ContentLength,
-                    info.IsChunkedWithoutLength,
-                    info.SupportsRange,
-                    info.ETag,
-                    info.LastModified,
-                    info.ContentDispositionFileName
-                });
+                    var friendly = GetFriendlyHttpErrorMessage(response.StatusCode);
+                    var failure = new HttpRequestException(
+                        friendly,
+                        null,
+                        response.StatusCode);
 
-            return info;
+                    throw failure;
+                }
+
+                primarySnapshot = CaptureProbeSnapshot(response, methodUsed);
+
+                if ((primarySnapshot.ReportedFileSize is null ||
+                     primarySnapshot.FileSizeSource == DownloadFileSizeSource.Unknown) &&
+                    methodUsed == HttpMethod.Head)
+                {
+                    rangeSnapshot = await TryProbeWithRangeAsync(
+                            requestedUri,
+                            extraHeaders,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                }
+            }
         }
         catch (HttpRequestException ex) when (ex.StatusCode.HasValue)
         {
             var status = ex.StatusCode.Value;
-            string friendly = status switch
-            {
-                HttpStatusCode.Forbidden =>
-                    "Server returned 403 Forbidden. This usually means the link requires a browser session, login, or an extra confirmation step.",
-                HttpStatusCode.NotFound =>
-                    "Server returned 404 Not Found. The file link is invalid or has expired.",
-                HttpStatusCode.TooManyRequests =>
-                    "Server returned 429 Too Many Requests. You may need to wait or slow down your downloads.",
-                HttpStatusCode.InternalServerError =>
-                    "Server returned 500 Internal Server Error.",
-                _ =>
-                    $"Server returned HTTP {(int)status} ({status})."
-            };
-
             _logger.Error(
                 "Probe failed with HTTP error",
                 eventCode: "PROBE_HTTP_ERROR",
                 exception: ex,
-                context: new { Url = url, Status = status });
+                context: new { Url = url, Status = status, Method = normalizedMethod.Method });
 
-            throw new HttpRequestException(friendly, ex, status);
+            throw new HttpRequestException(ex.Message, ex, status);
         }
         catch (HttpRequestException ex)
         {
@@ -164,7 +170,7 @@ public sealed class NetworkClient : INetworkClient
                 "Probe failed with HTTP error",
                 eventCode: "PROBE_HTTP_ERROR",
                 exception: ex,
-                context: new { Url = url });
+                context: new { Url = url, Method = normalizedMethod.Method });
 
             throw;
         }
@@ -178,10 +184,41 @@ public sealed class NetworkClient : INetworkClient
 
             throw;
         }
-        finally
+
+        if (primarySnapshot is null)
         {
-            response?.Dispose();
+            throw new HttpRequestException("Failed to retrieve any response headers from the server.");
         }
+
+        var info = BuildHttpResourceInfo(
+            requestedUri,
+            normalizedUri,
+            primarySnapshot,
+            rangeSnapshot);
+
+        _logger.Info(
+            "Probe completed",
+            eventCode: "PROBE_SUCCESS",
+            context: new
+            {
+                RequestedUrl = info.RequestedUrl?.ToString(),
+                NormalizedUrl = info.NormalizedUrl?.ToString(),
+                FinalUrl = info.FinalUrl?.ToString(),
+                ProbeMethod = info.ProbeMethod.Method,
+                ProbeStatusCode = info.ProbeStatusCode,
+                info.ContentLength,
+                info.ReportedFileSize,
+                info.FileSizeSource,
+                info.ContentLengthHeaderRaw,
+                info.ContentRangeHeaderRaw,
+                info.AcceptRangesHeader,
+                info.SupportsRange,
+                info.IsChunkedTransfer,
+                info.ContentDispositionFileName,
+                info.ContentType
+            });
+
+        return info;
     }
 
     public async Task<DownloadResponseMetadata> DownloadRangeToStreamAsync(
@@ -668,6 +705,25 @@ public sealed class NetworkClient : INetworkClient
         var supportsRange = response.Headers.AcceptRanges.Contains("bytes") ||
                             response.Content.Headers.ContentRange is not null;
 
+        string? contentLengthHeader = null;
+        if (response.Content.Headers.TryGetValues("Content-Length", out var lengthValues))
+        {
+            contentLengthHeader = string.Join(",", lengthValues);
+        }
+
+        string? contentRangeHeader = response.Content.Headers.ContentRange?.ToString();
+        if (string.IsNullOrEmpty(contentRangeHeader) &&
+            response.Headers.TryGetValues("Content-Range", out var rawRange))
+        {
+            contentRangeHeader = string.Join(",", rawRange);
+        }
+
+        string? acceptRangesHeader = null;
+        if (response.Headers.TryGetValues("Accept-Ranges", out var ranges))
+        {
+            acceptRangesHeader = string.Join(",", ranges);
+        }
+
         long? resourceLength = null;
         var contentRange = response.Content.Headers.ContentRange;
         if (contentRange is not null && contentRange.Length.HasValue)
@@ -677,6 +733,17 @@ public sealed class NetworkClient : INetworkClient
         else if (!isRangeRequest)
         {
             resourceLength = response.Content.Headers.ContentLength;
+        }
+
+        var (reportedSize, sizeSource) = ResolveReportedFileSize(
+            response.Content.Headers.ContentLength,
+            response.Content.Headers.ContentRange?.Length,
+            contentLengthHeader,
+            contentRangeHeader);
+
+        if (!resourceLength.HasValue || resourceLength.Value <= 0)
+        {
+            resourceLength = reportedSize;
         }
 
         var contentDispositionName = ExtractFileNameFromContentDisposition(
@@ -689,7 +756,12 @@ public sealed class NetworkClient : INetworkClient
             response.Headers.ETag?.Tag,
             response.Content.Headers.LastModified,
             contentDispositionName,
-            response.Content.Headers.ContentType?.MediaType);
+            response.Content.Headers.ContentType?.MediaType,
+            contentRangeHeader,
+            acceptRangesHeader,
+            response.Headers.TransferEncodingChunked == true,
+            reportedSize,
+            sizeSource);
     }
 
     // HTML helper regexes for fallback download URL extraction
@@ -767,8 +839,26 @@ public sealed class NetworkClient : INetworkClient
             return null;
         }
 
-        return FileNameHelper.NormalizeFileName(disposition.FileNameStar)
-            ?? FileNameHelper.NormalizeFileName(disposition.FileName);
+        foreach (var parameter in disposition.Parameters)
+        {
+            if (string.Equals(parameter.Name, "filename*", StringComparison.OrdinalIgnoreCase))
+            {
+                var value = parameter.Value?.Trim('"');
+                var decodedStar = FileNameHelper.NormalizeContentDispositionFileName(value);
+                if (!string.IsNullOrEmpty(decodedStar))
+                {
+                    return decodedStar;
+                }
+            }
+        }
+
+        var fromStar = FileNameHelper.NormalizeContentDispositionFileName(disposition.FileNameStar);
+        if (!string.IsNullOrEmpty(fromStar))
+        {
+            return fromStar;
+        }
+
+        return FileNameHelper.NormalizeContentDispositionFileName(disposition.FileName);
     }
 
     private static bool TryExtractFromMetaRefresh(string htmlSnippet, Uri originalUrl, out Uri? downloadUrl)
@@ -930,12 +1020,13 @@ public sealed class NetworkClient : INetworkClient
         return false;
     }
 
-    private static async Task<HttpResponseMessage> SendWithFallbackAsync(
+    private static async Task<(HttpResponseMessage Response, HttpMethod MethodUsed)> SendWithFallbackAsync(
         Uri uri,
         HttpMethod primaryMethod,
         HttpMethod fallbackMethod,
         IReadOnlyDictionary<string, string>? extraHeaders,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool fallbackUsesRangeProbe)
     {
         using var request = new HttpRequestMessage(primaryMethod, uri);
         ApplyCommonHeaders(request, uri, extraHeaders);
@@ -961,16 +1052,266 @@ public sealed class NetworkClient : INetworkClient
                 ApplyCommonHeaders(fallbackRequest, uri, extraHeaders);
                 ApplyExtraHeaders(fallbackRequest, extraHeaders);
 
-                return await _client
+                if (fallbackUsesRangeProbe && fallbackMethod == HttpMethod.Get)
+                {
+                    fallbackRequest.Headers.Range = new RangeHeaderValue(0, 0);
+                }
+
+                var fallbackResponse = await _client
                     .SendAsync(
                         fallbackRequest,
                         HttpCompletionOption.ResponseHeadersRead,
                         cancellationToken)
                     .ConfigureAwait(false);
+
+                return (fallbackResponse, fallbackMethod);
             }
         }
 
-        return response;
+        return (response, primaryMethod);
+    }
+
+    private static Uri NormalizeForProbe(Uri uri)
+    {
+        if (uri is null) throw new ArgumentNullException(nameof(uri));
+
+        var builder = new UriBuilder(uri)
+        {
+            Fragment = string.Empty
+        };
+
+        return builder.Uri;
+    }
+
+    private async Task<ProbeSnapshot?> TryProbeWithRangeAsync(
+        Uri uri,
+        IReadOnlyDictionary<string, string>? extraHeaders,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+            request.Headers.Range = new RangeHeaderValue(0, 0);
+            ApplyCommonHeaders(request, uri, extraHeaders);
+            ApplyExtraHeaders(request, extraHeaders);
+
+            using var response = await _client
+                .SendAsync(
+                    request,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            if (!response.IsSuccessStatusCode &&
+                response.StatusCode != HttpStatusCode.RequestedRangeNotSatisfiable)
+            {
+                return null;
+            }
+
+            return CaptureProbeSnapshot(response, HttpMethod.Get);
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.Warn(
+                "Range probe fallback failed.",
+                eventCode: "PROBE_RANGE_FALLBACK_FAILED",
+                context: new { Url = uri.ToString(), ex.Message });
+            return null;
+        }
+    }
+
+    private static ProbeSnapshot CaptureProbeSnapshot(HttpResponseMessage response, HttpMethod method)
+    {
+        var finalUri = response.RequestMessage?.RequestUri ?? response.Headers.Location ?? response.RequestMessage?.RequestUri;
+
+        string? contentLengthHeader = null;
+        if (response.Content.Headers.TryGetValues("Content-Length", out var lengthValues))
+        {
+            contentLengthHeader = string.Join(",", lengthValues);
+        }
+
+        string? acceptRanges = null;
+        if (response.Headers.TryGetValues("Accept-Ranges", out var ranges))
+        {
+            acceptRanges = string.Join(",", ranges);
+        }
+
+        string? contentRangeHeader = response.Content.Headers.ContentRange?.ToString();
+        if (string.IsNullOrEmpty(contentRangeHeader) &&
+            response.Headers.TryGetValues("Content-Range", out var rawContentRange))
+        {
+            contentRangeHeader = string.Join(",", rawContentRange);
+        }
+
+        var contentLength = response.Content.Headers.ContentLength;
+        var contentRangeLength = response.Content.Headers.ContentRange?.Length;
+
+        var (reportedSize, sizeSource) = ResolveReportedFileSize(
+            contentLength,
+            contentRangeLength,
+            contentLengthHeader,
+            contentRangeHeader);
+
+        var supportsRange = response.Headers.AcceptRanges.Contains("bytes") ||
+                            response.Content.Headers.ContentRange != null ||
+                            response.StatusCode == HttpStatusCode.PartialContent ||
+                            (response.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable && !string.IsNullOrEmpty(contentRangeHeader));
+
+        return new ProbeSnapshot
+        {
+            Method = method,
+            StatusCode = (int)response.StatusCode,
+            FinalUri = finalUri,
+            ContentLengthHeader = contentLengthHeader,
+            ContentRangeHeader = contentRangeHeader,
+            AcceptRanges = acceptRanges,
+            ContentType = response.Content.Headers.ContentType?.MediaType,
+            ContentDispositionFileName = ExtractFileNameFromContentDisposition(response.Content.Headers.ContentDisposition),
+            ContentLength = contentLength,
+            ContentRangeLength = contentRangeLength,
+            SupportsRange = supportsRange,
+            IsChunkedTransfer = response.Headers.TransferEncodingChunked == true,
+            FileSizeSource = sizeSource,
+            ReportedFileSize = reportedSize,
+            ETag = response.Headers.ETag?.Tag,
+            LastModified = response.Content.Headers.LastModified
+        };
+    }
+
+    private static HttpResourceInfo BuildHttpResourceInfo(
+        Uri requestedUrl,
+        Uri normalizedUrl,
+        ProbeSnapshot primary,
+        ProbeSnapshot? secondary)
+    {
+        var snapshots = secondary is null
+            ? new[] { primary }
+            : new[] { primary, secondary };
+
+        ProbeSnapshot? bestSize = snapshots
+            .Where(s => s.ReportedFileSize.HasValue && s.ReportedFileSize.Value > 0)
+            .OrderBy(s => GetFileSizeSourcePriority(s.FileSizeSource))
+            .FirstOrDefault();
+
+        var preferred = bestSize ?? primary;
+
+        long? contentLength = preferred.ContentRangeLength ?? preferred.ContentLength;
+        if (!contentLength.HasValue || contentLength.Value <= 0)
+        {
+            contentLength = preferred.ReportedFileSize;
+        }
+
+        var firstNonEmpty = snapshots
+            .Select(s => s.ContentLengthHeader)
+            .FirstOrDefault(v => !string.IsNullOrEmpty(v));
+
+        var firstContentRange = snapshots
+            .Select(s => s.ContentRangeHeader)
+            .FirstOrDefault(v => !string.IsNullOrEmpty(v));
+
+        var firstAcceptRanges = snapshots
+            .Select(s => s.AcceptRanges)
+            .FirstOrDefault(v => !string.IsNullOrEmpty(v));
+
+        var firstContentType = snapshots
+            .Select(s => s.ContentType)
+            .FirstOrDefault(v => !string.IsNullOrEmpty(v));
+
+        var firstDisposition = snapshots
+            .Select(s => s.ContentDispositionFileName)
+            .FirstOrDefault(v => !string.IsNullOrEmpty(v));
+
+        var firstEtag = snapshots
+            .Select(s => s.ETag)
+            .FirstOrDefault(v => !string.IsNullOrEmpty(v));
+
+        var firstLastModified = snapshots
+            .Select(s => s.LastModified)
+            .FirstOrDefault(v => v.HasValue);
+
+        var finalUri = preferred.FinalUri ?? primary.FinalUri ?? normalizedUrl ?? requestedUrl;
+        var supportsRange = snapshots.Any(s => s.SupportsRange);
+        var isChunked = snapshots.Any(s => s.IsChunkedTransfer);
+        var reportedSize = preferred.ReportedFileSize;
+        var sizeSource = string.IsNullOrWhiteSpace(preferred.FileSizeSource)
+            ? DownloadFileSizeSource.Unknown
+            : preferred.FileSizeSource;
+
+        return new HttpResourceInfo
+        {
+            RequestedUrl = requestedUrl,
+            NormalizedUrl = normalizedUrl,
+            Url = finalUri,
+            FinalUrl = finalUri,
+            ProbeMethod = preferred.Method,
+            ProbeStatusCode = preferred.StatusCode,
+            ContentLengthHeaderRaw = firstNonEmpty,
+            ContentRangeHeaderRaw = firstContentRange,
+            AcceptRangesHeader = firstAcceptRanges,
+            ContentLength = contentLength,
+            SupportsRange = supportsRange,
+            SupportsResume = supportsRange,
+            ETag = firstEtag,
+            LastModified = firstLastModified,
+            IsChunkedWithoutLength = isChunked && (!contentLength.HasValue || contentLength.Value <= 0),
+            ContentDispositionFileName = firstDisposition,
+            ContentType = firstContentType,
+            IsChunkedTransfer = isChunked,
+            ReportedFileSize = reportedSize,
+            FileSizeSource = sizeSource
+        };
+    }
+
+    private static (long? ReportedSize, string Source) ResolveReportedFileSize(
+        long? contentLength,
+        long? contentRangeLength,
+        string? contentLengthRaw,
+        string? contentRangeRaw)
+    {
+        if (contentRangeLength.HasValue && contentRangeLength.Value >= 0)
+        {
+            return (contentRangeLength.Value, DownloadFileSizeSource.ContentRange);
+        }
+
+        if (!string.IsNullOrWhiteSpace(contentRangeRaw))
+        {
+            var slashIndex = contentRangeRaw.LastIndexOf('/');
+            if (slashIndex >= 0 && slashIndex < contentRangeRaw.Length - 1)
+            {
+                var totalPart = contentRangeRaw[(slashIndex + 1)..];
+                if (long.TryParse(totalPart, NumberStyles.Integer, CultureInfo.InvariantCulture, out var rangeTotal) && rangeTotal > 0)
+                {
+                    return (rangeTotal, DownloadFileSizeSource.ContentRange);
+                }
+            }
+        }
+
+        if (contentLength.HasValue && contentLength.Value > 0)
+        {
+            return (contentLength.Value, DownloadFileSizeSource.ContentLength);
+        }
+
+        if (!string.IsNullOrWhiteSpace(contentLengthRaw) &&
+            long.TryParse(contentLengthRaw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedLength) &&
+            parsedLength > 0)
+        {
+            return (parsedLength, DownloadFileSizeSource.HttpHeaders);
+        }
+
+        return (null, DownloadFileSizeSource.Unknown);
+    }
+
+    private static int GetFileSizeSourcePriority(string? source)
+    {
+        return source switch
+        {
+            DownloadFileSizeSource.ContentRange => 0,
+            DownloadFileSizeSource.ContentLength => 1,
+            DownloadFileSizeSource.HttpHeaders => 2,
+            DownloadFileSizeSource.Approximation => 3,
+            DownloadFileSizeSource.DiskFinal => 4,
+            _ => 5
+        };
     }
 
     private static string GetFriendlyHttpErrorMessage(HttpStatusCode statusCode)
