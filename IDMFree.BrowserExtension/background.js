@@ -515,15 +515,29 @@ function shouldInterceptClick(message) {
 }
 
 async function processDownloadIntent(payload, sender) {
+  const correlationId = payload?.correlationId || generateCorrelationId();
+
   if (!payload || !payload.url) {
-    return { handled: false, reason: "invalid-payload" };
+    logEvent("BG: download-intent invalid payload", {
+      correlationId,
+    });
+    return { strategy: "browser", reason: "invalid_payload", correlationId };
   }
   if (!settings.captureDownloads || !settings.interceptClicks) {
-    return { handled: false, reason: "capture-disabled" };
+    logEvent("BG: download-intent capture disabled", {
+      correlationId,
+      url: payload.url,
+      captureDownloads: settings.captureDownloads,
+      interceptClicks: settings.interceptClicks,
+    });
+    return { strategy: "browser", reason: "capture_disabled", correlationId };
   }
   if (shouldBypassBridge(payload.url) || isExcludedDomain(payload.url)) {
-    logEvent("download_intent_bypassed", { url: payload.url });
-    return { handled: false, reason: "bypass" };
+    logEvent("BG: download-intent bypassed", {
+      correlationId,
+      url: payload.url,
+    });
+    return { strategy: "browser", reason: "capture_off_or_app_unreachable", correlationId };
   }
 
   const decision = shouldInterceptClick({
@@ -539,13 +553,23 @@ async function processDownloadIntent(payload, sender) {
     logEvent("BG: download-intent declined", {
       url: payload.url,
       reason: decision.reason || "policy-declined",
+      correlationId,
     });
-    return { handled: false, reason: "policy-declined" };
+    const policyReason = decision.reason
+      ? `policy_${String(decision.reason)
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "_")
+          .replace(/^_+|_+$/g, "")}`
+      : "policy_declined";
+    return {
+      strategy: "browser",
+      reason: policyReason,
+      correlationId,
+    };
   }
 
   const tabId = sender.tab?.id ?? -1;
   const frameId = sender.frameId ?? 0;
-  const correlationId = payload.correlationId || generateCorrelationId();
   const intent = {
     url: payload.url,
     referrer: payload.referrer || sender.url || null,
@@ -609,7 +633,7 @@ async function processDownloadIntent(payload, sender) {
       frameId,
       status: nativeResult.status || "accepted",
     });
-    return { handled: true, status: nativeResult.status || "accepted", correlationId };
+    return { strategy: "external", status: nativeResult.status || "accepted", correlationId };
   }
 
   logEvent("BG: app delegation FAILED", {
@@ -635,10 +659,11 @@ async function processDownloadIntent(payload, sender) {
   });
 
   return {
-    handled: false,
+    strategy: "browser",
     status: nativeResult.status || "error",
     error: nativeResult.error || null,
     correlationId,
+    reason: "native_delegate_failed",
     fallback: fallbackStrategy,
   };
 }
@@ -653,7 +678,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     })
     .catch((err) => {
       console.warn(`${LOG_PREFIX} Failed to process download intent`, err);
-      sendResponse({ handled: false, status: "error", error: "internal-error" });
+      sendResponse({ strategy: "browser", status: "error", error: "internal-error" });
     });
   return true;
 });
@@ -1043,18 +1068,6 @@ async function handleDownloadsApiCreated(item) {
     interceptDownloadsApi: settings.interceptDownloadsApi,
   });
 
-  const cancelStartedAt = now();
-  const cancelled = await cancelAndErase(item.id);
-  const cancelDurationMs = now() - cancelStartedAt;
-
-  logEvent("BG: downloads.onCreated cancellation", {
-    correlationId,
-    url: item.url,
-    id: item.id,
-    cancelled,
-    durationMs: cancelDurationMs,
-  });
-
   const payload = {
     url: item.url,
     finalUrl: item.finalUrl || item.url,
@@ -1084,6 +1097,18 @@ async function handleDownloadsApiCreated(item) {
   const nativeResult = await dispatchDownloadToNative("downloads-api", payload, correlationId);
 
   if (nativeResult.accepted) {
+    const cancelStartedAt = now();
+    const cancelled = await cancelAndErase(item.id);
+    const cancelDurationMs = now() - cancelStartedAt;
+
+    logEvent("BG: downloads.onCreated cancellation", {
+      correlationId,
+      url: item.url,
+      id: item.id,
+      cancelled,
+      durationMs: cancelDurationMs,
+    });
+
     logEvent("BG: app delegation succeeded", {
       correlationId,
       url: item.url,
