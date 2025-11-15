@@ -1,5 +1,10 @@
 const LOG_PREFIX = "[IDMFree]";
-const NATIVE_HOST_NAME = "com.idmfree.bridge";
+const BRIDGE_ENDPOINTS = Object.freeze([
+  "http://127.0.0.1:5454/api/downloads",
+  "http://localhost:5454/api/downloads",
+  "http://[::1]:5454/api/downloads",
+]);
+const BRIDGE_TIMEOUT_MS = 2500;
 const CONTEXT_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const MAX_CONTEXT_ENTRIES = 400;
 const FALLBACK_TTL_MS = 3 * 60 * 1000; // 3 minutes
@@ -8,6 +13,7 @@ const CLICK_HINT_TTL_MS = 60 * 1000; // 1 minute
 const DEFAULT_SETTINGS = Object.freeze({
   captureDownloads: true,
   aggressiveInterception: true,
+  strictMode: true,
   interceptClicks: true,
   interceptNetwork: true,
   interceptResponseHeaders: true,
@@ -70,45 +76,205 @@ function logEvent(event, context = {}) {
   console.debug(`${LOG_PREFIX} ${event}`, context);
 }
 
-function sendNativeBridgeMessage(message) {
-  return new Promise((resolve, reject) => {
-    try {
-      chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, message, (response) => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message || "native_messaging_failed"));
-          return;
-        }
-        resolve(response || null);
-      });
-    } catch (err) {
-      reject(err);
+function sanitizeBridgeHeaders(headers) {
+  if (!headers || typeof headers !== "object") {
+    return undefined;
+  }
+  const sanitized = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (!key || typeof key !== "string") {
+      continue;
     }
-  });
+    if (typeof value !== "string") {
+      continue;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+      continue;
+    }
+    sanitized[key] = trimmed;
+  }
+  return Object.keys(sanitized).length > 0 ? sanitized : undefined;
 }
 
-async function dispatchDownloadToNative(kind, payload, correlationId) {
-  const payloadWithCorrelation = {
-    ...payload,
-    correlationId: correlationId || payload?.correlationId || null,
+function buildBridgePayload(payload, correlationId) {
+  const headers = sanitizeBridgeHeaders(payload.headers);
+  const method = payload.method ? String(payload.method).toUpperCase() : "GET";
+  const request = {
+    url: payload.url,
+    fileName: payload.fileName || null,
+    method,
+    correlationId,
   };
-  try {
-    const response = await sendNativeBridgeMessage({
-      type: "idmfree.download",
-      kind,
-      payload: payloadWithCorrelation,
+  if (headers) {
+    request.headers = headers;
+  }
+  return request;
+}
+
+function summarizeBridgePayload(payload) {
+  if (!payload) {
+    return {};
+  }
+  return {
+    url: payload.url || null,
+    fileName: payload.fileName || null,
+    method: payload.method || null,
+    hasHeaders: Boolean(payload.headers && Object.keys(payload.headers).length > 0),
+  };
+}
+
+async function delegateDownloadToApp(kind, payload, correlationId, logMetadata = {}) {
+  const correlation = correlationId || payload?.correlationId || generateCorrelationId();
+  const bridgePayload = buildBridgePayload(payload, correlation);
+  const serialized = JSON.stringify(bridgePayload);
+  const attemptBaseContext = {
+    kind,
+    correlationId: correlation,
+    payload: summarizeBridgePayload(bridgePayload),
+    ...logMetadata,
+  };
+  const errors = [];
+
+  for (const endpoint of BRIDGE_ENDPOINTS) {
+    const attemptContext = { ...attemptBaseContext, endpoint };
+    logEvent("BG: bridge fetch attempt", attemptContext);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), BRIDGE_TIMEOUT_MS);
+    let response;
+    try {
+      response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          "X-Correlation-ID": correlation,
+        },
+        body: serialized,
+        signal: controller.signal,
+        cache: "no-store",
+        credentials: "omit",
+      });
+    } catch (err) {
+      clearTimeout(timeoutId);
+      const reason = err && err.name === "AbortError" ? "bridge_timeout" : "bridge_fetch_error";
+      const message = err?.message || String(err);
+      logEvent("BG: bridge fetch failed", { ...attemptContext, reason, error: message });
+      errors.push({ reason, message, endpoint });
+      continue;
+    }
+
+    clearTimeout(timeoutId);
+
+    const statusCode = response.status;
+    if (!response.ok) {
+      let errorBody = null;
+      try {
+        errorBody = await response.text();
+      } catch (err) {
+        errorBody = null;
+      }
+      const reason = `bridge_http_${statusCode}`;
+      logEvent("BG: bridge fetch non-2xx", {
+        ...attemptContext,
+        statusCode,
+        reason,
+        error: errorBody,
+      });
+      errors.push({ reason, message: errorBody || response.statusText, statusCode, endpoint });
+      continue;
+    }
+
+    let data = null;
+    try {
+      data = await response.json();
+    } catch (err) {
+      const reason = "bridge_invalid_json";
+      const message = err?.message || String(err);
+      logEvent("BG: bridge fetch invalid JSON", {
+        ...attemptContext,
+        statusCode,
+        reason,
+        error: message,
+      });
+      errors.push({ reason, message, statusCode, endpoint });
+      continue;
+    }
+
+    const handled = data && data.handled === true;
+    const status = data && typeof data.status === "string" ? data.status : null;
+    const message = data && typeof data.error === "string" ? data.error : null;
+
+    logEvent("BG: bridge fetch response", {
+      ...attemptContext,
+      statusCode,
+      handled,
+      status,
     });
-    const status = response && typeof response.status === "string" ? response.status : null;
-    return {
-      accepted: status === "accepted",
-      status: status || null,
-      response,
-    };
-  } catch (err) {
+
+    if (handled) {
+      return {
+        accepted: true,
+        handled: true,
+        status: status || "accepted",
+        correlationId: correlation,
+        httpStatus: statusCode,
+        response: data,
+        reason: "accepted",
+      };
+    }
+
+    const failureReason = status === "fallback" ? "app_declined" : "app_error";
     return {
       accepted: false,
-      status: "error",
-      error: err?.message || String(err),
+      handled: Boolean(data?.handled),
+      status: status || null,
+      correlationId: correlation,
+      httpStatus: statusCode,
+      error: message || null,
+      message: message || null,
+      reason: failureReason,
+      response: data,
     };
+  }
+
+  const primaryError = errors[0] || { reason: "bridge_unreachable", message: "Failed to reach IDMFree bridge." };
+  return {
+    accepted: false,
+    handled: false,
+    status: "error",
+    correlationId,
+    httpStatus: null,
+    error: primaryError.message || null,
+    message: primaryError.message || null,
+    reason: primaryError.reason || "bridge_unreachable",
+    errors,
+  };
+}
+
+async function notifyStrictBlock(details) {
+  const { tabId, frameId, url, reason, message, correlationId } = details || {};
+  if (tabId == null || tabId < 0 || !chrome.tabs?.sendMessage) {
+    return;
+  }
+  const notification = {
+    type: "idmfree:download-blocked",
+    url: url || null,
+    reason: reason || null,
+    message:
+      message ||
+      "Strict IDM mode prevented Chrome from downloading this file. Please ensure the IDMFree app is running and try again.",
+    correlationId: correlationId || null,
+  };
+  const options = {};
+  if (typeof frameId === "number" && frameId >= 0) {
+    options.frameId = frameId;
+  }
+  try {
+    await chrome.tabs.sendMessage(tabId, notification, options);
+  } catch (err) {
+    console.debug(`${LOG_PREFIX} Failed to dispatch strict block notification`, err);
   }
 }
 
@@ -623,17 +789,33 @@ async function processDownloadIntent(payload, sender) {
     frameId,
   });
 
-  const nativeResult = await dispatchDownloadToNative("click-intent", intent, correlationId);
+  const bridgeHeaders = {};
+  if (intent.referrer) {
+    bridgeHeaders.Referer = intent.referrer;
+  }
+  const bridgePayload = {
+    url: intent.url,
+    fileName: intent.suggestedFileName || intent.hints?.downloadAttribute || null,
+    method: "GET",
+  };
+  if (Object.keys(bridgeHeaders).length > 0) {
+    bridgePayload.headers = bridgeHeaders;
+  }
 
-  if (nativeResult.accepted) {
+  const bridgeResult = await delegateDownloadToApp("click-intent", bridgePayload, correlationId, {
+    tabId,
+    frameId,
+  });
+
+  if (bridgeResult.accepted) {
     logEvent("BG: app delegation succeeded", {
       correlationId,
       url: intent.url,
       tabId,
       frameId,
-      status: nativeResult.status || "accepted",
+      status: bridgeResult.status || "accepted",
     });
-    return { strategy: "external", status: nativeResult.status || "accepted", correlationId };
+    return { strategy: "external", status: bridgeResult.status || "accepted", correlationId };
   }
 
   logEvent("BG: app delegation FAILED", {
@@ -641,13 +823,35 @@ async function processDownloadIntent(payload, sender) {
     url: intent.url,
     tabId,
     frameId,
-    status: nativeResult.status || "error",
-    error: nativeResult.error || null,
+    status: bridgeResult.status || "error",
+    error: bridgeResult.error || null,
+    reason: bridgeResult.reason || null,
   });
 
-  const shouldRemember = shouldRememberFallbackHostForResult(nativeResult);
+  const shouldRemember = shouldRememberFallbackHostForResult(bridgeResult);
   if (shouldRemember) {
     rememberFallbackHost(intent.url);
+  }
+
+  const failureReason = bridgeResult.reason || "bridge_delegate_failed";
+  const failureStatus = bridgeResult.status || "error";
+  const failureMessage = bridgeResult.message || bridgeResult.error || null;
+
+  if (settings.strictMode) {
+    logEvent("BG: strict block decision", {
+      correlationId,
+      url: intent.url,
+      reason: failureReason,
+      status: failureStatus,
+      rememberHost: shouldRemember,
+    });
+    return {
+      strategy: "blocked",
+      status: failureStatus,
+      correlationId,
+      reason: failureReason,
+      message: failureMessage,
+    };
   }
 
   const fallbackStrategy = "browser_download";
@@ -660,10 +864,11 @@ async function processDownloadIntent(payload, sender) {
 
   return {
     strategy: "browser",
-    status: nativeResult.status || "error",
-    error: nativeResult.error || null,
+    status: failureStatus,
+    error: bridgeResult.error || null,
     correlationId,
-    reason: "native_delegate_failed",
+    reason: failureReason,
+    message: failureMessage,
     fallback: fallbackStrategy,
   };
 }
@@ -678,6 +883,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     })
     .catch((err) => {
       console.warn(`${LOG_PREFIX} Failed to process download intent`, err);
+      if (settings.strictMode) {
+        sendResponse({
+          strategy: "blocked",
+          status: "error",
+          reason: "internal-error",
+          message: "Strict IDM mode blocked this download because the extension encountered an internal error.",
+        });
+        return;
+      }
       sendResponse({ strategy: "browser", status: "error", error: "internal-error" });
     });
   return true;
@@ -793,6 +1007,7 @@ function rememberRecentRequest(context) {
     requestHeaders: context.requestHeaders,
     timestamp: now(),
     correlationId: context.correlationId || context.fromClick?.correlationId || null,
+    initiator: context.initiator || null,
   });
   pruneMap(recentRequestsByUrl, CONTEXT_TTL_MS);
 }
@@ -844,7 +1059,7 @@ async function delegateToManager(context) {
     typeof context.fromClick?.downloadAttribute === "string"
       ? context.fromClick.downloadAttribute.trim()
       : null;
-  const payload = {
+  const bridgePayload = {
     url: context.url,
     method: context.method,
     fileName:
@@ -852,19 +1067,6 @@ async function delegateToManager(context) {
         ? clickDownloadName
         : context.fromResponseFileName || guessFileNameFromUrl(context.url)) || null,
     headers,
-    correlationId,
-    metadata: {
-      interceptLayer: context.interceptLayer,
-      interceptReason: context.interceptReason,
-      tabId: context.tabId,
-      frameId: context.frameId,
-      resourceType: context.type,
-      initiator: context.initiator,
-      clickDownloadAttribute: context.fromClick?.downloadAttribute ?? null,
-      clickHasDownloadAttribute: Boolean(context.fromClick?.hasDownloadAttribute),
-      clickLabel: context.fromClick?.buttonLabel || null,
-      correlationId,
-    },
   };
   logEvent("BG: delegating to app via bridge", {
     correlationId,
@@ -874,14 +1076,19 @@ async function delegateToManager(context) {
     source: "network",
   });
 
-  const nativeResult = await dispatchDownloadToNative("network-intercept", payload, correlationId);
+  const bridgeResult = await delegateDownloadToApp("network-intercept", bridgePayload, correlationId, {
+    layer: context.interceptLayer,
+    reason: context.interceptReason,
+    tabId: context.tabId,
+    frameId: context.frameId,
+  });
 
-  if (nativeResult.accepted) {
+  if (bridgeResult.accepted) {
     logEvent("BG: app delegation succeeded", {
       correlationId,
       url: context.url,
       layer: context.interceptLayer,
-      status: nativeResult.status || "accepted",
+      status: bridgeResult.status || "accepted",
       source: "network",
     });
     cleanupRequestContext(context.id);
@@ -892,14 +1099,41 @@ async function delegateToManager(context) {
     correlationId,
     url: context.url,
     layer: context.interceptLayer,
-    status: nativeResult.status || "error",
-    error: nativeResult.error || null,
+    status: bridgeResult.status || "error",
+    error: bridgeResult.error || null,
+    reason: bridgeResult.reason || null,
     source: "network",
   });
 
-  const shouldRemember = shouldRememberFallbackHostForResult(nativeResult);
+  const shouldRemember = shouldRememberFallbackHostForResult(bridgeResult);
   if (shouldRemember) {
     rememberFallbackHost(context.url);
+  }
+
+  const failureReason = bridgeResult.reason || "bridge_delegate_failed";
+  const failureMessage = bridgeResult.message || bridgeResult.error || null;
+  const failureStatus = bridgeResult.status || "error";
+
+  if (settings.strictMode) {
+    logEvent("BG: strict block decision", {
+      correlationId,
+      url: context.url,
+      layer: context.interceptLayer,
+      reason: failureReason,
+      status: failureStatus,
+      rememberHost: shouldRemember,
+      source: "network",
+    });
+    await notifyStrictBlock({
+      tabId: context.tabId,
+      frameId: context.frameId,
+      url: context.url,
+      reason: failureReason,
+      message: failureMessage,
+      correlationId,
+    });
+    cleanupRequestContext(context.id);
+    return;
   }
 
   logEvent("BG: fallback decision", {
@@ -1068,24 +1302,23 @@ async function handleDownloadsApiCreated(item) {
     interceptDownloadsApi: settings.interceptDownloadsApi,
   });
 
-  const payload = {
+  const refererHeader = item.referrer || cached?.initiator || null;
+  const headerBag = cached && cached.requestHeaders ? buildHeadersObject(cached.requestHeaders) : undefined;
+  const bridgeHeaders = headerBag ? { ...headerBag } : {};
+  if (refererHeader) {
+    bridgeHeaders.Referer = refererHeader;
+  }
+
+  const bridgePayload = {
     url: item.url,
-    finalUrl: item.finalUrl || item.url,
     fileName:
       normalizeFileName(item.filename) ||
       guessFileNameFromUrl(item.finalUrl || item.url) ||
       null,
-    mime: item.mime || null,
-    referrer: item.referrer || null,
     method: cached ? cached.method : "GET",
-    tabId: item.tabId ?? -1,
-    danger: item.danger || null,
-    totalBytes: Number.isFinite(item.totalBytes) ? item.totalBytes : null,
-    bytesReceived: Number.isFinite(item.bytesReceived) ? item.bytesReceived : null,
-    correlationId,
   };
-  if (cached && cached.requestHeaders) {
-    payload.headers = buildHeadersObject(cached.requestHeaders);
+  if (Object.keys(bridgeHeaders).length > 0) {
+    bridgePayload.headers = bridgeHeaders;
   }
 
   logEvent("BG: delegating to app via bridge", {
@@ -1094,25 +1327,46 @@ async function handleDownloadsApiCreated(item) {
     source: "downloads-api",
   });
 
-  const nativeResult = await dispatchDownloadToNative("downloads-api", payload, correlationId);
-
-  if (nativeResult.accepted) {
+  let strictCancellationLogged = false;
+  if (settings.strictMode) {
     const cancelStartedAt = now();
     const cancelled = await cancelAndErase(item.id);
     const cancelDurationMs = now() - cancelStartedAt;
-
     logEvent("BG: downloads.onCreated cancellation", {
       correlationId,
       url: item.url,
       id: item.id,
       cancelled,
       durationMs: cancelDurationMs,
+      strict: true,
     });
+    strictCancellationLogged = true;
+  }
+
+  const bridgeResult = await delegateDownloadToApp("downloads-api", bridgePayload, correlationId, {
+    downloadId: item.id,
+    tabId: item.tabId ?? -1,
+  });
+
+  if (bridgeResult.accepted) {
+    if (!settings.strictMode) {
+      const cancelStartedAt = now();
+      const cancelled = await cancelAndErase(item.id);
+      const cancelDurationMs = now() - cancelStartedAt;
+
+      logEvent("BG: downloads.onCreated cancellation", {
+        correlationId,
+        url: item.url,
+        id: item.id,
+        cancelled,
+        durationMs: cancelDurationMs,
+      });
+    }
 
     logEvent("BG: app delegation succeeded", {
       correlationId,
       url: item.url,
-      status: nativeResult.status || "accepted",
+      status: bridgeResult.status || "accepted",
       source: "downloads-api",
     });
     return;
@@ -1122,13 +1376,53 @@ async function handleDownloadsApiCreated(item) {
     correlationId,
     url: item.url,
     source: "downloads-api",
-    status: nativeResult.status || "error",
-    error: nativeResult.error || null,
+    status: bridgeResult.status || "error",
+    error: bridgeResult.error || null,
+    reason: bridgeResult.reason || null,
   });
 
-  const shouldRemember = shouldRememberFallbackHostForResult(nativeResult);
+  const shouldRemember = shouldRememberFallbackHostForResult(bridgeResult);
   if (shouldRemember) {
     rememberFallbackHost(item.url);
+  }
+
+  const failureReason = bridgeResult.reason || "bridge_delegate_failed";
+  const failureMessage = bridgeResult.message || bridgeResult.error || null;
+  const failureStatus = bridgeResult.status || "error";
+
+  if (settings.strictMode) {
+    if (!strictCancellationLogged) {
+      const cancelStartedAt = now();
+      const cancelled = await cancelAndErase(item.id);
+      const cancelDurationMs = now() - cancelStartedAt;
+      logEvent("BG: downloads.onCreated cancellation", {
+        correlationId,
+        url: item.url,
+        id: item.id,
+        cancelled,
+        durationMs: cancelDurationMs,
+        strict: true,
+      });
+    }
+
+    logEvent("BG: strict block decision", {
+      correlationId,
+      url: item.url,
+      source: "downloads-api",
+      reason: failureReason,
+      status: failureStatus,
+      rememberHost: shouldRemember,
+    });
+
+    await notifyStrictBlock({
+      tabId: item.tabId ?? -1,
+      frameId: null,
+      url: item.url,
+      reason: failureReason,
+      message: failureMessage,
+      correlationId,
+    });
+    return;
   }
 
   logEvent("BG: fallback decision", {

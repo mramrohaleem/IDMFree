@@ -33,6 +33,8 @@ const CUSTOM_DOWNLOAD_HINT_ATTRIBUTES = [
 
 const INTENT_RESPONSE_TIMEOUT_MS = 1000;
 const FALLBACK_DELAY_MS = 20;
+const STRICT_NOTICE_DURATION_MS = 8000;
+const STRICT_NOTICE_CONTAINER_ID = "idmfree-strict-notice";
 
 const DEBUG_LOGGING_ENABLED = true;
 
@@ -44,6 +46,84 @@ function logDebug(event, details = {}) {
     console.debug(`[IDMFree][CS] ${event}`, details);
   } catch (err) {
     // no-op
+  }
+}
+
+function ensureNoticeContainer() {
+  let container = document.getElementById(STRICT_NOTICE_CONTAINER_ID);
+  if (container) {
+    return container;
+  }
+  container = document.createElement("div");
+  container.id = STRICT_NOTICE_CONTAINER_ID;
+  container.style.position = "fixed";
+  container.style.top = "16px";
+  container.style.right = "16px";
+  container.style.zIndex = "2147483647";
+  container.style.display = "flex";
+  container.style.flexDirection = "column";
+  container.style.gap = "8px";
+  container.style.maxWidth = "360px";
+  container.style.fontFamily = "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+  const parent = document.body || document.documentElement;
+  if (parent) {
+    parent.appendChild(container);
+  }
+  return container;
+}
+
+function createStrictNoticeElement({ title, message }) {
+  const wrapper = document.createElement("div");
+  wrapper.style.background = "rgba(24, 24, 27, 0.95)";
+  wrapper.style.color = "#ffffff";
+  wrapper.style.padding = "12px 16px";
+  wrapper.style.borderRadius = "8px";
+  wrapper.style.boxShadow = "0 8px 24px rgba(0, 0, 0, 0.35)";
+  wrapper.style.backdropFilter = "blur(4px)";
+  wrapper.style.border = "1px solid rgba(255, 255, 255, 0.2)";
+
+  const heading = document.createElement("div");
+  heading.textContent = title;
+  heading.style.fontSize = "14px";
+  heading.style.fontWeight = "600";
+  heading.style.marginBottom = "6px";
+
+  const description = document.createElement("div");
+  description.textContent = message;
+  description.style.fontSize = "13px";
+  description.style.lineHeight = "1.4";
+
+  wrapper.appendChild(heading);
+  wrapper.appendChild(description);
+  return wrapper;
+}
+
+function showBlockingNotice({ correlationId, url, reason, message }) {
+  try {
+    const container = ensureNoticeContainer();
+    const notice = createStrictNoticeElement({
+      title: "Download blocked by IDMFree",
+      message:
+        message ||
+        "Strict IDM mode prevented Chrome from downloading this file. Please ensure the IDMFree app is running and try again.",
+    });
+
+    notice.dataset.correlationId = correlationId || "";
+    notice.dataset.url = url || "";
+    notice.dataset.reason = reason || "";
+
+    container.appendChild(notice);
+
+    setTimeout(() => {
+      notice.classList.add("idmfree-strict-notice-fade");
+      notice.style.transition = "opacity 200ms ease";
+      notice.style.opacity = "0";
+      setTimeout(() => {
+        notice.remove();
+      }, 240);
+    }, STRICT_NOTICE_DURATION_MS);
+  } catch (err) {
+    console.warn("[IDMFree][CS] Failed to display strict-mode notice", err);
   }
 }
 
@@ -280,36 +360,56 @@ function handlePointerEvent(event) {
   };
 
   let settled = false;
-  const finalize = (strategy, details = {}) => {
+  const finalize = (decision) => {
     if (settled) {
       return;
     }
     settled = true;
     clearTimeout(timeoutId);
+    const strategy = decision?.strategy || "browser";
+    const reason = decision?.reason || null;
+    const status = decision?.status || null;
+    const message = decision?.message || null;
+
     if (strategy === "external") {
       logDebug("CS: strategy=external, suppressing browser", {
         correlationId,
         url: candidate.url,
-        reason: details.reason || null,
+        reason,
       });
       return;
     }
-    const reason = details.reason || "strategy-browser";
+    if (strategy === "blocked") {
+      logDebug("CS: strategy=blocked, preventing browser download", {
+        correlationId,
+        url: candidate.url,
+        reason,
+        status,
+      });
+      showBlockingNotice({
+        correlationId,
+        url: candidate.url,
+        reason,
+        message,
+      });
+      return;
+    }
     logDebug("CS: strategy=browser, allowing native download", {
       correlationId,
       url: candidate.url,
       reason,
+      status,
     });
     fallbackToBrowser(candidate);
   };
 
   const timeoutId = setTimeout(() => {
-    logDebug("CS: background timeout, falling back to browser", {
+    logDebug("CS: background timeout, blocking download", {
       correlationId,
       url: candidate.url,
       timeoutMs: INTENT_RESPONSE_TIMEOUT_MS,
     });
-    finalize("browser", { reason: "timeout" });
+    finalize({ strategy: "blocked", reason: "timeout" });
   }, INTENT_RESPONSE_TIMEOUT_MS);
 
   logDebug("CS: sending download intent to background", { correlationId, url: candidate.url });
@@ -322,11 +422,11 @@ function handlePointerEvent(event) {
           correlationId,
           url: candidate.url,
         });
-        finalize("browser", { reason: "no-response" });
+        finalize({ strategy: "blocked", reason: "no-response" });
         return;
       }
 
-      const { strategy, reason, status } = response;
+      const { strategy, reason, status, message } = response;
       logDebug("CS: download intent response received", {
         correlationId,
         strategy: strategy || null,
@@ -334,19 +434,14 @@ function handlePointerEvent(event) {
         reason: reason || null,
       });
 
-      if (strategy === "external") {
-        finalize("external", { reason: reason || null });
-        return;
-      }
-
-      finalize("browser", { reason: reason || "strategy-browser", status: status || null });
+      finalize({ strategy: strategy || "browser", reason, status, message });
     })
     .catch((err) => {
       logDebug("CS: download intent send failed", {
         correlationId,
         error: err?.message || String(err),
       });
-      finalize("browser", { reason: "send-error", error: err?.message || String(err) });
+      finalize({ strategy: "blocked", reason: "send-error", message: err?.message || String(err) });
     });
 }
 
@@ -359,6 +454,21 @@ logDebug("CS: registered download-intent listeners", {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || message.type !== "idmfree:resume-download" || !message.url) {
+    if (message && message.type === "idmfree:download-blocked") {
+      logDebug("CS: strict-mode block notification received", {
+        url: message.url || null,
+        reason: message.reason || null,
+        correlationId: message.correlationId || null,
+      });
+      showBlockingNotice({
+        correlationId: message.correlationId || null,
+        url: message.url || null,
+        reason: message.reason || null,
+        message:
+          message.message ||
+          "Strict IDM mode prevented Chrome from downloading this file. Please ensure the IDMFree app is running and try again.",
+      });
+    }
     return;
   }
   logDebug("CS: resume-download request received", {

@@ -225,7 +225,14 @@ public sealed class BrowserBridgeServer : IDisposable
         var request = context.Request;
         var method = request.HttpMethod ?? "UNKNOWN";
         var path = request.Url?.AbsolutePath ?? "/";
+        var query = request.Url?.Query ?? string.Empty;
         var remoteEndpoint = request.RemoteEndPoint?.ToString();
+
+        var headerCorrelationId = request.Headers["X-Correlation-ID"];
+        if (!string.IsNullOrWhiteSpace(headerCorrelationId))
+        {
+            correlationId = NormalizeCorrelationId(headerCorrelationId);
+        }
 
         _logger.Info(
             "Browser bridge HTTP request received.",
@@ -234,8 +241,10 @@ public sealed class BrowserBridgeServer : IDisposable
             {
                 Method = method,
                 Path = path,
+                Query = query,
                 RemoteEndpoint = remoteEndpoint,
-                request.ContentLength64
+                request.ContentLength64,
+                CorrelationId = correlationId
             });
 
         try

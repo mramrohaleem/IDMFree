@@ -12,7 +12,10 @@
     "nativeMessaging"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "<all_urls>",
+    "http://localhost:5454/*",
+    "http://127.0.0.1:5454/*",
+    "http://[::1]:5454/*"
   ],
   "background": {
     "service_worker": "background.js"
