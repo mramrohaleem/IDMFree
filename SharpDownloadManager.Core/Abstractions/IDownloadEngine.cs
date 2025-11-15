@@ -19,6 +19,7 @@ public interface IDownloadEngine
         DownloadMode mode = DownloadMode.Normal,
         IReadOnlyDictionary<string, string>? requestHeaders = null,
         string? requestMethod = null,
+        string? correlationId = null,
         CancellationToken cancellationToken = default);
 
     Task ResumeAsync(Guid downloadId, CancellationToken cancellationToken = default);

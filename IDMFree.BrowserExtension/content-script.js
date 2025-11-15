@@ -34,6 +34,31 @@ const CUSTOM_DOWNLOAD_HINT_ATTRIBUTES = [
 const INTENT_RESPONSE_TIMEOUT_MS = 1500;
 const FALLBACK_DELAY_MS = 20;
 
+const DEBUG_LOGGING_ENABLED = true;
+
+function logDebug(event, details = {}) {
+  if (!DEBUG_LOGGING_ENABLED) {
+    return;
+  }
+  try {
+    console.debug(`[IDMFree][CS] ${event}`, details);
+  } catch (err) {
+    // no-op
+  }
+}
+
+function generateCorrelationId() {
+  try {
+    const buffer = new Uint32Array(2);
+    crypto.getRandomValues(buffer);
+    return Array.from(buffer, (value) => value.toString(16).padStart(8, "0"))
+      .join("")
+      .slice(0, 12);
+  } catch (err) {
+    return Math.random().toString(36).slice(2, 10);
+  }
+}
+
 function normalizeExtension(ext) {
   if (!ext) {
     return null;
@@ -195,6 +220,10 @@ function fallbackToBrowser(candidate) {
   if (!candidate || !candidate.url) {
     return;
   }
+  logDebug("CS: executing browser fallback", {
+    url: candidate.url,
+    openInNewTab: Boolean(candidate.openInNewTab),
+  });
   if (candidate.openInNewTab) {
     setTimeout(() => {
       window.open(candidate.url, candidate.target || "_blank");
@@ -213,6 +242,16 @@ function handlePointerEvent(event) {
     return;
   }
 
+  const correlationId = generateCorrelationId();
+
+  logDebug("CS: intercepted download click", {
+    correlationId,
+    url: candidate.url,
+    eventType: event.type,
+    button: event.button,
+    hasDownloadAttribute: candidate.hasDownloadAttribute,
+  });
+
   event.preventDefault();
   event.stopImmediatePropagation();
   event.stopPropagation();
@@ -223,6 +262,7 @@ function handlePointerEvent(event) {
     pageUrl: window.location.href,
     pageTitle: document.title || null,
     suggestedFileName: candidate.suggestedFileName || null,
+    correlationId,
     hints: {
       downloadAttribute: candidate.downloadAttribute,
       hasDownloadAttribute: candidate.hasDownloadAttribute,
@@ -247,18 +287,30 @@ function handlePointerEvent(event) {
     settled = true;
     clearTimeout(timeoutId);
     if (!handled) {
+      logDebug("CS: initiating browser fallback", { correlationId, url: candidate.url });
       fallbackToBrowser(candidate);
     }
   };
 
   const timeoutId = setTimeout(() => finalize(false), INTENT_RESPONSE_TIMEOUT_MS);
 
+  logDebug("CS: sending download intent to background", { correlationId, url: candidate.url });
+
   chrome.runtime
     .sendMessage({ type: "idmfree:download-intent", payload })
     .then((response) => {
+      logDebug("CS: download intent response received", {
+        correlationId,
+        handled: Boolean(response && response.handled),
+        status: response?.status || null,
+      });
       finalize(Boolean(response && response.handled));
     })
-    .catch(() => {
+    .catch((err) => {
+      logDebug("CS: download intent send failed", {
+        correlationId,
+        error: err?.message || String(err),
+      });
       finalize(false);
     });
 }
@@ -266,10 +318,17 @@ function handlePointerEvent(event) {
 document.addEventListener("click", handlePointerEvent, true);
 document.addEventListener("auxclick", handlePointerEvent, true);
 
+logDebug("CS: registered download-intent listeners", {
+  events: ["click", "auxclick"],
+});
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || message.type !== "idmfree:resume-download" || !message.url) {
     return;
   }
+  logDebug("CS: resume-download request received", {
+    url: message.url,
+  });
   fallbackToBrowser({
     url: message.url,
     downloadAttribute: message.downloadAttribute ?? null,

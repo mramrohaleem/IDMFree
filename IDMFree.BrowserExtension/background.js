@@ -54,6 +54,18 @@ function now() {
   return Date.now();
 }
 
+function generateCorrelationId() {
+  try {
+    const buffer = new Uint32Array(2);
+    crypto.getRandomValues(buffer);
+    return Array.from(buffer, (value) => value.toString(16).padStart(8, "0"))
+      .join("")
+      .slice(0, 12);
+  } catch (err) {
+    return Math.random().toString(36).slice(2, 10);
+  }
+}
+
 function logEvent(event, context = {}) {
   console.debug(`${LOG_PREFIX} ${event}`, context);
 }
@@ -74,12 +86,16 @@ function sendNativeBridgeMessage(message) {
   });
 }
 
-async function dispatchDownloadToNative(kind, payload) {
+async function dispatchDownloadToNative(kind, payload, correlationId) {
+  const payloadWithCorrelation = {
+    ...payload,
+    correlationId: correlationId || payload?.correlationId || null,
+  };
   try {
     const response = await sendNativeBridgeMessage({
       type: "idmfree.download",
       kind,
-      payload,
+      payload: payloadWithCorrelation,
     });
     const status = response && typeof response.status === "string" ? response.status : null;
     return {
@@ -257,6 +273,13 @@ function shouldBypassBridge(url) {
     console.debug(`${LOG_PREFIX} Failed to evaluate fallback host`, err);
     return false;
   }
+}
+
+function shouldRememberFallbackHostForResult(result) {
+  if (!result || result.accepted) {
+    return false;
+  }
+  return result.status === "fallback";
 }
 
 function isExcludedDomain(url) {
@@ -513,7 +536,7 @@ async function processDownloadIntent(payload, sender) {
   });
 
   if (!decision.intercept) {
-    logEvent("download_intent_declined", {
+    logEvent("BG: download-intent declined", {
       url: payload.url,
       reason: decision.reason || "policy-declined",
     });
@@ -522,6 +545,7 @@ async function processDownloadIntent(payload, sender) {
 
   const tabId = sender.tab?.id ?? -1;
   const frameId = sender.frameId ?? 0;
+  const correlationId = payload.correlationId || generateCorrelationId();
   const intent = {
     url: payload.url,
     referrer: payload.referrer || sender.url || null,
@@ -530,6 +554,7 @@ async function processDownloadIntent(payload, sender) {
     tabId,
     frameId,
     suggestedFileName: payload.suggestedFileName || null,
+    correlationId,
     hints: {
       downloadAttribute: payload.hints?.downloadAttribute ?? null,
       hasDownloadAttribute: Boolean(payload.hints?.hasDownloadAttribute),
@@ -549,41 +574,72 @@ async function processDownloadIntent(payload, sender) {
     };
   }
 
-  logEvent("download_flow_click_intent", {
+  rememberClickHint(tabId, intent.url, {
+    correlationId,
+    reason: decision.reason,
+    downloadAttribute: intent.hints.downloadAttribute,
+    hasDownloadAttribute: intent.hints.hasDownloadAttribute,
+    extensionHint: intent.hints.extensionHint,
+    customDownloadHint: intent.hints.customDownloadHint,
+    buttonLabel: intent.hints.buttonLabel,
+  });
+
+  logEvent("BG: received download-intent", {
+    correlationId,
     url: intent.url,
     tabId,
     frameId,
     reason: decision.reason,
   });
 
-  const nativeResult = await dispatchDownloadToNative("click-intent", intent);
+  logEvent("BG: delegating to app via bridge", {
+    correlationId,
+    url: intent.url,
+    tabId,
+    frameId,
+  });
+
+  const nativeResult = await dispatchDownloadToNative("click-intent", intent, correlationId);
 
   if (nativeResult.accepted) {
-    logEvent("download_flow_click_forwarded", {
+    logEvent("BG: app delegation succeeded", {
+      correlationId,
       url: intent.url,
       tabId,
       frameId,
       status: nativeResult.status || "accepted",
-      finalOwner: "idm",
     });
-    return { handled: true, status: nativeResult.status || "accepted" };
+    return { handled: true, status: nativeResult.status || "accepted", correlationId };
   }
 
-  rememberFallbackHost(intent.url);
-
-  logEvent("download_flow_click_fallback", {
+  logEvent("BG: app delegation FAILED", {
+    correlationId,
     url: intent.url,
     tabId,
     frameId,
     status: nativeResult.status || "error",
     error: nativeResult.error || null,
-    finalOwner: "browser",
+  });
+
+  const shouldRemember = shouldRememberFallbackHostForResult(nativeResult);
+  if (shouldRemember) {
+    rememberFallbackHost(intent.url);
+  }
+
+  const fallbackStrategy = "browser_download";
+  logEvent("BG: fallback decision", {
+    correlationId,
+    url: intent.url,
+    strategy: fallbackStrategy,
+    rememberHost: shouldRemember,
   });
 
   return {
     handled: false,
     status: nativeResult.status || "error",
     error: nativeResult.error || null,
+    correlationId,
+    fallback: fallbackStrategy,
   };
 }
 
@@ -623,10 +679,24 @@ function ensureRequestContext(details) {
       interceptLayer: null,
       cancelled: false,
       delegated: false,
+      correlationId: null,
     };
     requestContexts.set(details.requestId, context);
   }
   return context;
+}
+
+function ensureContextCorrelationId(context) {
+  if (!context) {
+    return generateCorrelationId();
+  }
+  if (context.correlationId) {
+    return context.correlationId;
+  }
+  const fromClickId = context.fromClick?.correlationId;
+  const correlationId = fromClickId || generateCorrelationId();
+  context.correlationId = correlationId;
+  return correlationId;
 }
 
 function shouldInterceptAtRequestStage(context) {
@@ -697,6 +767,7 @@ function rememberRecentRequest(context) {
     method: context.method,
     requestHeaders: context.requestHeaders,
     timestamp: now(),
+    correlationId: context.correlationId || context.fromClick?.correlationId || null,
   });
   pruneMap(recentRequestsByUrl, CONTEXT_TTL_MS);
 }
@@ -706,8 +777,8 @@ function cleanupRequestContext(requestId) {
 }
 
 async function fallbackToBrowser(context) {
-  rememberFallbackHost(context.url);
-  logEvent("download_fell_back_to_browser", {
+  logEvent("BG: fallback executed", {
+    correlationId: context.correlationId || context.fromClick?.correlationId || null,
     url: context.url,
     layer: context.interceptLayer,
     reason: context.interceptReason,
@@ -742,6 +813,7 @@ async function delegateToManager(context) {
     return;
   }
   context.delegated = true;
+  const correlationId = ensureContextCorrelationId(context);
   const headers = buildHeadersObject(context.requestHeaders);
   const clickDownloadName =
     typeof context.fromClick?.downloadAttribute === "string"
@@ -755,6 +827,7 @@ async function delegateToManager(context) {
         ? clickDownloadName
         : context.fromResponseFileName || guessFileNameFromUrl(context.url)) || null,
     headers,
+    correlationId,
     metadata: {
       interceptLayer: context.interceptLayer,
       interceptReason: context.interceptReason,
@@ -765,37 +838,52 @@ async function delegateToManager(context) {
       clickDownloadAttribute: context.fromClick?.downloadAttribute ?? null,
       clickHasDownloadAttribute: Boolean(context.fromClick?.hasDownloadAttribute),
       clickLabel: context.fromClick?.buttonLabel || null,
+      correlationId,
     },
   };
-  logEvent("download_forwarded_to_native_manager", {
+  logEvent("BG: delegating to app via bridge", {
+    correlationId,
     url: context.url,
     layer: context.interceptLayer,
     reason: context.interceptReason,
+    source: "network",
   });
 
-  const nativeResult = await dispatchDownloadToNative("network-intercept", payload);
+  const nativeResult = await dispatchDownloadToNative("network-intercept", payload, correlationId);
 
   if (nativeResult.accepted) {
-    logEvent("download_flow_network_forwarded", {
+    logEvent("BG: app delegation succeeded", {
+      correlationId,
       url: context.url,
       layer: context.interceptLayer,
-      reason: context.interceptReason,
       status: nativeResult.status || "accepted",
-      finalOwner: "idm",
+      source: "network",
     });
     cleanupRequestContext(context.id);
     return;
   }
 
-  rememberFallbackHost(context.url);
-
-  logEvent("download_flow_network_fallback", {
+  logEvent("BG: app delegation FAILED", {
+    correlationId,
     url: context.url,
     layer: context.interceptLayer,
-    reason: context.interceptReason,
     status: nativeResult.status || "error",
     error: nativeResult.error || null,
-    finalOwner: "browser",
+    source: "network",
+  });
+
+  const shouldRemember = shouldRememberFallbackHostForResult(nativeResult);
+  if (shouldRemember) {
+    rememberFallbackHost(context.url);
+  }
+
+  logEvent("BG: fallback decision", {
+    correlationId,
+    url: context.url,
+    layer: context.interceptLayer,
+    strategy: "browser_download",
+    rememberHost: shouldRemember,
+    source: "network",
   });
 
   await fallbackToBrowser(context);
@@ -808,8 +896,10 @@ function cancelAndDelegate(context, layer) {
   }
   context.cancelled = true;
   context.interceptLayer = layer;
+  const correlationId = ensureContextCorrelationId(context);
   rememberRecentRequest(context);
-  logEvent("download_intercepted_at_network_layer", {
+  logEvent("BG: network interception", {
+    correlationId,
     url: context.url,
     layer,
     reason: context.interceptReason,
@@ -942,23 +1032,29 @@ async function handleDownloadsApiCreated(item) {
     return;
   }
 
-  logEvent("download_flow_downloads_api_created", {
+  const cached = recentRequestsByUrl.get(item.url) || null;
+  const correlationId = cached?.correlationId || generateCorrelationId();
+
+  logEvent("BG: downloads.onCreated triggered", {
+    correlationId,
     url: item.url,
     id: item.id,
+    captureEnabled: settings.captureDownloads,
+    interceptDownloadsApi: settings.interceptDownloadsApi,
   });
 
   const cancelStartedAt = now();
   const cancelled = await cancelAndErase(item.id);
   const cancelDurationMs = now() - cancelStartedAt;
 
-  logEvent("download_flow_downloads_api_cancelled", {
+  logEvent("BG: downloads.onCreated cancellation", {
+    correlationId,
     url: item.url,
     id: item.id,
     cancelled,
     durationMs: cancelDurationMs,
   });
 
-  const cached = recentRequestsByUrl.get(item.url) || null;
   const payload = {
     url: item.url,
     finalUrl: item.finalUrl || item.url,
@@ -973,29 +1069,49 @@ async function handleDownloadsApiCreated(item) {
     danger: item.danger || null,
     totalBytes: Number.isFinite(item.totalBytes) ? item.totalBytes : null,
     bytesReceived: Number.isFinite(item.bytesReceived) ? item.bytesReceived : null,
+    correlationId,
   };
   if (cached && cached.requestHeaders) {
     payload.headers = buildHeadersObject(cached.requestHeaders);
   }
 
-  const nativeResult = await dispatchDownloadToNative("downloads-api", payload);
+  logEvent("BG: delegating to app via bridge", {
+    correlationId,
+    url: item.url,
+    source: "downloads-api",
+  });
+
+  const nativeResult = await dispatchDownloadToNative("downloads-api", payload, correlationId);
 
   if (nativeResult.accepted) {
-    logEvent("download_flow_downloads_api_forwarded", {
+    logEvent("BG: app delegation succeeded", {
+      correlationId,
       url: item.url,
       status: nativeResult.status || "accepted",
-      finalOwner: "idm",
+      source: "downloads-api",
     });
     return;
   }
 
-  rememberFallbackHost(item.url);
-
-  logEvent("download_flow_downloads_api_fallback", {
+  logEvent("BG: app delegation FAILED", {
+    correlationId,
     url: item.url,
+    source: "downloads-api",
     status: nativeResult.status || "error",
     error: nativeResult.error || null,
-    finalOwner: "browser",
+  });
+
+  const shouldRemember = shouldRememberFallbackHostForResult(nativeResult);
+  if (shouldRemember) {
+    rememberFallbackHost(item.url);
+  }
+
+  logEvent("BG: fallback decision", {
+    correlationId,
+    url: item.url,
+    source: "downloads-api",
+    strategy: "browser_download",
+    rememberHost: shouldRemember,
   });
 }
 
