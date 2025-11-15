@@ -6,7 +6,9 @@
   "permissions": [
     "downloads",
     "webRequest",
-    "webRequestBlocking"
+    "webRequestBlocking",
+    "storage",
+    "contextMenus"
   ],
   "host_permissions": [
     "<all_urls>",
@@ -15,6 +17,16 @@
   "background": {
     "service_worker": "background.js"
   },
+  "action": {
+    "default_title": "IDMFree Bridge"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content-script.js"],
+      "run_at": "document_start"
+    }
+  ],
   "icons": {
     "128": "icon128.png"
   }
