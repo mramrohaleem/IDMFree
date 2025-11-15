@@ -19,8 +19,14 @@ namespace SharpDownloadManager.Infrastructure.Network;
 
 public sealed class NetworkClient : INetworkClient
 {
+    private static readonly HttpClientHandler SharedHandler = CreateHandler();
+    private static readonly HttpClient SharedClient = CreateClient(SharedHandler);
+    private static readonly object SharedCookieLock = new();
+
     private readonly ILogger _logger;
-    private static readonly HttpClient _client = CreateClient();
+    private readonly HttpClient _client;
+    private readonly CookieContainer? _cookieContainer;
+    private readonly object _cookieSyncRoot;
     private const string RetryAfterSecondsKey = "RetryAfterSeconds";
 
     private sealed class ProbeSnapshot
@@ -58,36 +64,69 @@ public sealed class NetworkClient : INetworkClient
         public DateTimeOffset? LastModified { get; init; }
     }
 
-    private static HttpClient CreateClient()
+    private static HttpClientHandler CreateHandler()
     {
-        var handler = new HttpClientHandler
+        return new HttpClientHandler
         {
             AllowAutoRedirect = true,
             AutomaticDecompression = DecompressionMethods.GZip |
                                      DecompressionMethods.Deflate |
-                                     DecompressionMethods.Brotli
+                                     DecompressionMethods.Brotli,
+            UseCookies = true,
+            CookieContainer = new CookieContainer()
         };
+    }
 
-        var client = new HttpClient(handler, disposeHandler: true)
+    private static HttpClient CreateClient(HttpMessageHandler handler)
+    {
+        var client = new HttpClient(handler, disposeHandler: false)
         {
             Timeout = TimeSpan.FromMinutes(30)
         };
 
-        // Browser-like defaults
+        ConfigureDefaultRequestHeaders(client);
+
+        return client;
+    }
+
+    private static void ConfigureDefaultRequestHeaders(HttpClient client)
+    {
+        client.DefaultRequestHeaders.UserAgent.Clear();
         client.DefaultRequestHeaders.UserAgent.ParseAdd(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
             "AppleWebKit/537.36 (KHTML, like Gecko) " +
             "Chrome/120.0.0.0 Safari/537.36");
 
+        client.DefaultRequestHeaders.Accept.Clear();
         client.DefaultRequestHeaders.Accept.ParseAdd("*/*");
+        client.DefaultRequestHeaders.AcceptLanguage.Clear();
         client.DefaultRequestHeaders.AcceptLanguage.ParseAdd("en-US,en;q=0.9");
-
-        return client;
     }
 
-    public NetworkClient(ILogger logger)
+    public NetworkClient(ILogger logger, HttpMessageHandler? messageHandler = null)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
+        if (messageHandler is null)
+        {
+            _client = SharedClient;
+            _cookieContainer = SharedHandler.CookieContainer;
+            _cookieSyncRoot = SharedCookieLock;
+        }
+        else
+        {
+            _client = CreateClient(messageHandler);
+            if (messageHandler is HttpClientHandler httpHandler)
+            {
+                _cookieContainer = httpHandler.CookieContainer;
+                _cookieSyncRoot = new object();
+            }
+            else
+            {
+                _cookieContainer = null;
+                _cookieSyncRoot = new object();
+            }
+        }
     }
 
     public async Task<HttpResourceInfo> ProbeAsync(
@@ -631,7 +670,7 @@ public sealed class NetworkClient : INetworkClient
         return null;
     }
 
-    private static void ApplyExtraHeaders(HttpRequestMessage request, IReadOnlyDictionary<string, string>? extraHeaders)
+    private void ApplyExtraHeaders(HttpRequestMessage request, IReadOnlyDictionary<string, string>? extraHeaders)
     {
         if (request is null)
         {
@@ -684,6 +723,14 @@ public sealed class NetworkClient : INetworkClient
                 continue;
             }
 
+            if (headerName.Equals("Cookie", StringComparison.OrdinalIgnoreCase))
+            {
+                if (TryApplyCookies(request.RequestUri, headerValue))
+                {
+                    continue;
+                }
+            }
+
             if (request.Headers.Contains(headerName))
             {
                 request.Headers.Remove(headerName);
@@ -691,6 +738,187 @@ public sealed class NetworkClient : INetworkClient
 
             request.Headers.TryAddWithoutValidation(headerName, headerValue);
         }
+    }
+
+    private bool TryApplyCookies(Uri? requestUri, string? cookieHeader)
+    {
+        if (_cookieContainer is null || requestUri is null || string.IsNullOrWhiteSpace(cookieHeader))
+        {
+            return false;
+        }
+
+        try
+        {
+            var parsed = ParseCookieHeader(cookieHeader).ToList();
+            if (parsed.Count == 0)
+            {
+                return false;
+            }
+
+            var hostUri = BuildCookieScopeUri(requestUri);
+            var anyApplied = false;
+
+            foreach (var (name, value) in parsed)
+            {
+                if (TryAddCookie(hostUri, name, value, requestUri.Host))
+                {
+                    anyApplied = true;
+                }
+            }
+
+            if (anyApplied && TryGetGofileCookieDomain(requestUri.Host, out var sharedHost))
+            {
+                var sharedUri = BuildCookieScopeUri(requestUri, sharedHost);
+                foreach (var (name, value) in parsed)
+                {
+                    var domain = sharedHost.StartsWith('.', StringComparison.Ordinal) ? sharedHost : "." + sharedHost;
+                    TryAddCookie(sharedUri, name, value, domain);
+                }
+            }
+
+            return anyApplied;
+        }
+        catch (CookieException ex)
+        {
+            _logger.Warn(
+                "Failed to forward cookies to HTTP handler.",
+                eventCode: "COOKIE_FORWARD_FAILED",
+                context: new
+                {
+                    Uri = requestUri.ToString(),
+                    ex.Message
+                });
+        }
+        catch (UriFormatException ex)
+        {
+            _logger.Warn(
+                "Failed to forward cookies to HTTP handler.",
+                eventCode: "COOKIE_FORWARD_FAILED",
+                context: new
+                {
+                    Uri = requestUri.ToString(),
+                    ex.Message
+                });
+        }
+
+        return false;
+    }
+
+    private bool TryAddCookie(Uri targetUri, string name, string value, string domain)
+    {
+        if (_cookieContainer is null)
+        {
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        try
+        {
+            var cookie = new Cookie(name, value)
+            {
+                Domain = domain,
+                Path = "/"
+            };
+
+            lock (_cookieSyncRoot)
+            {
+                _cookieContainer.Add(targetUri, cookie);
+            }
+
+            return true;
+        }
+        catch (CookieException ex)
+        {
+            _logger.Warn(
+                "Failed to register forwarded cookie.",
+                eventCode: "COOKIE_FORWARD_FAILED",
+                context: new
+                {
+                    Target = targetUri.ToString(),
+                    CookieName = name,
+                    ex.Message
+                });
+        }
+
+        return false;
+    }
+
+    private static IEnumerable<(string Name, string Value)> ParseCookieHeader(string cookieHeader)
+    {
+        if (string.IsNullOrWhiteSpace(cookieHeader))
+        {
+            yield break;
+        }
+
+        var segments = cookieHeader.Split(';');
+        foreach (var segment in segments)
+        {
+            var trimmed = segment.Trim();
+            if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith('$'))
+            {
+                continue;
+            }
+
+            var equalsIndex = trimmed.IndexOf('=');
+            if (equalsIndex <= 0)
+            {
+                continue;
+            }
+
+            var name = trimmed[..equalsIndex].Trim();
+            if (string.IsNullOrEmpty(name))
+            {
+                continue;
+            }
+
+            var value = trimmed[(equalsIndex + 1)..].Trim();
+            yield return (name, value);
+        }
+    }
+
+    private static bool TryGetGofileCookieDomain(string host, out string sharedHost)
+    {
+        if (string.IsNullOrWhiteSpace(host))
+        {
+            sharedHost = string.Empty;
+            return false;
+        }
+
+        if (host.Equals("gofile.io", StringComparison.OrdinalIgnoreCase))
+        {
+            sharedHost = "gofile.io";
+            return true;
+        }
+
+        if (host.EndsWith(".gofile.io", StringComparison.OrdinalIgnoreCase))
+        {
+            sharedHost = "gofile.io";
+            return true;
+        }
+
+        sharedHost = string.Empty;
+        return false;
+    }
+
+    private static Uri BuildCookieScopeUri(Uri requestUri, string? hostOverride = null)
+    {
+        if (requestUri is null)
+        {
+            throw new ArgumentNullException(nameof(requestUri));
+        }
+
+        var host = hostOverride ?? requestUri.Host;
+        var builder = new UriBuilder(requestUri.Scheme, host)
+        {
+            Port = requestUri.IsDefaultPort ? -1 : requestUri.Port,
+            Path = "/"
+        };
+
+        return builder.Uri;
     }
 
     private static DownloadResponseMetadata CreateDownloadResponseMetadata(
@@ -1020,7 +1248,7 @@ public sealed class NetworkClient : INetworkClient
         return false;
     }
 
-    private static async Task<(HttpResponseMessage Response, HttpMethod MethodUsed)> SendWithFallbackAsync(
+    private async Task<(HttpResponseMessage Response, HttpMethod MethodUsed)> SendWithFallbackAsync(
         Uri uri,
         HttpMethod primaryMethod,
         HttpMethod fallbackMethod,
