@@ -589,19 +589,19 @@ public sealed class NetworkClient : INetworkClient
                 request.Headers.AcceptLanguage.ParseAdd("en-US,en;q=0.9");
             }
 
-            if (uri.Host.EndsWith("gofile.io", StringComparison.OrdinalIgnoreCase) &&
+            var hasExplicitReferer = HasHeader(extraHeaders, "Referer");
+
+            if (!hasExplicitReferer &&
+                uri.Host.EndsWith("gofile.io", StringComparison.OrdinalIgnoreCase) &&
                 !uri.Host.Equals("gofile.io", StringComparison.OrdinalIgnoreCase))
             {
                 // Some hosts (e.g. store-eu-par-*.gofile.io) expect the main gofile.io referrer.
                 request.Headers.Referrer = new Uri("https://gofile.io/");
             }
-            else
+            else if (!hasExplicitReferer)
             {
-                if (!HasHeader(extraHeaders, "Referer"))
-                {
-                    var origin = new Uri($"{uri.Scheme}://{uri.Host}/");
-                    request.Headers.Referrer = origin;
-                }
+                var origin = new Uri($"{uri.Scheme}://{uri.Host}/");
+                request.Headers.Referrer = origin;
             }
         }
         catch
