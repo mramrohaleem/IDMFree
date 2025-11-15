@@ -39,6 +39,8 @@ public sealed class BrowserBridgeServer : IDisposable
 
         _listener = new HttpListener();
         _listener.Prefixes.Add("http://127.0.0.1:5454/");
+
+        TryAddAdditionalPrefixes();
     }
 
     public Task StartAsync(CancellationToken cancellationToken = default)
@@ -157,7 +159,52 @@ public sealed class BrowserBridgeServer : IDisposable
                 continue;
             }
 
-            await HandleContextAsync(context, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await HandleContextAsync(context, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (OperationCanceledException ex)
+            {
+                _logger.Warn(
+                    "Browser bridge request canceled before completion.",
+                    eventCode: "BROWSER_BRIDGE_REQUEST_CANCELED",
+                    context: new { ex.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.Error(
+                    "Unhandled error while processing browser bridge request.",
+                    eventCode: "BROWSER_BRIDGE_REQUEST_ERROR",
+                    exception: ex);
+            }
+        }
+    }
+
+    private void TryAddAdditionalPrefixes()
+    {
+        TryAddPrefix("http://localhost:5454/");
+        TryAddPrefix("http://[::1]:5454/");
+    }
+
+    private void TryAddPrefix(string prefix)
+    {
+        try
+        {
+            if (!_listener.Prefixes.Contains(prefix))
+            {
+                _listener.Prefixes.Add(prefix);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn(
+                "Failed to register browser bridge prefix.",
+                eventCode: "BROWSER_BRIDGE_PREFIX_FAILED",
+                context: new { prefix, ex.Message });
         }
     }
 
