@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -67,6 +68,14 @@ public sealed class BrowserBridgeServer : IDisposable
         var token = _cts.Token;
         _processingTask = Task.Run(() => ProcessLoopAsync(token), CancellationToken.None);
         _isRunning = true;
+
+        foreach (var prefix in _listener.Prefixes)
+        {
+            _logger.Info(
+                "Browser bridge listening on prefix.",
+                eventCode: "BROWSER_BRIDGE_BOUND",
+                context: new { Prefix = prefix });
+        }
 
         _logger.Info("Browser bridge started.", eventCode: "BROWSER_BRIDGE_STARTED");
         return Task.CompletedTask;
@@ -211,9 +220,26 @@ public sealed class BrowserBridgeServer : IDisposable
     private async Task HandleContextAsync(HttpListenerContext context, CancellationToken cancellationToken)
     {
         using var response = context.Response;
+        string? correlationId = null;
+
+        var request = context.Request;
+        var method = request.HttpMethod ?? "UNKNOWN";
+        var path = request.Url?.AbsolutePath ?? "/";
+        var remoteEndpoint = request.RemoteEndPoint?.ToString();
+
+        _logger.Info(
+            "Browser bridge HTTP request received.",
+            eventCode: "BROWSER_BRIDGE_REQUEST_RECEIVED",
+            context: new
+            {
+                Method = method,
+                Path = path,
+                RemoteEndpoint = remoteEndpoint,
+                request.ContentLength64
+            });
+
         try
         {
-            var request = context.Request;
             if (!string.Equals(request.HttpMethod, "POST", StringComparison.OrdinalIgnoreCase) ||
                 !string.Equals(request.Url?.AbsolutePath, "/api/downloads", StringComparison.Ordinal))
             {
@@ -222,12 +248,13 @@ public sealed class BrowserBridgeServer : IDisposable
             }
 
             BrowserDownloadRequest? payload;
+            string? rawBody = null;
             using (var reader = new StreamReader(request.InputStream, Encoding.UTF8, leaveOpen: false))
             {
-                var body = await reader.ReadToEndAsync().ConfigureAwait(false);
+                rawBody = await reader.ReadToEndAsync().ConfigureAwait(false);
                 try
                 {
-                    payload = JsonSerializer.Deserialize<BrowserDownloadRequest>(body, JsonOptions);
+                    payload = JsonSerializer.Deserialize<BrowserDownloadRequest>(rawBody, JsonOptions);
                 }
                 catch (JsonException)
                 {
@@ -238,21 +265,40 @@ public sealed class BrowserBridgeServer : IDisposable
             if (payload is null || string.IsNullOrWhiteSpace(payload.Url) ||
                 !Uri.TryCreate(payload.Url, UriKind.Absolute, out var url))
             {
+                correlationId ??= GenerateCorrelationId();
+                response.Headers["X-Correlation-ID"] = correlationId;
+
                 response.StatusCode = (int)HttpStatusCode.BadRequest;
                 await WriteJsonAsync(
                         response,
-                        new { handled = false, error = "Invalid download request." },
+                        new
+                        {
+                            handled = false,
+                            error = "Invalid download request.",
+                            correlationId
+                        },
                         cancellationToken)
                     .ConfigureAwait(false);
+
                 _logger.Warn(
                     "Browser API received invalid payload.",
-                    eventCode: "BROWSER_API_REQUEST_INVALID");
+                    eventCode: "BROWSER_API_REQUEST_INVALID",
+                    context: new { CorrelationId = correlationId, Method = method, Path = path, RemoteEndpoint = remoteEndpoint });
+
+                _logger.Info(
+                    "Browser bridge download request rejected.",
+                    eventCode: "DOWNLOAD_REJECTED_FROM_BRIDGE",
+                    context: new { CorrelationId = correlationId, Reason = "InvalidPayload", RemoteEndpoint = remoteEndpoint });
                 return;
             }
 
             if (!string.Equals(url.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
                 !string.Equals(url.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
             {
+                correlationId = NormalizeCorrelationId(payload.CorrelationId) ?? GenerateCorrelationId();
+                payload.CorrelationId = correlationId;
+                response.Headers["X-Correlation-ID"] = correlationId;
+
                 var message = url.Scheme.Equals("blob", StringComparison.OrdinalIgnoreCase)
                     ? "This link is a browser-only blob: URL. Let the browser handle the download."
                     : $"IDMFree can only handle HTTP/HTTPS links. The {url.Scheme}: scheme must be downloaded by the browser.";
@@ -265,7 +311,8 @@ public sealed class BrowserBridgeServer : IDisposable
                             handled = false,
                             status = "fallback",
                             error = message,
-                            statusCode = (int)HttpStatusCode.OK
+                            statusCode = (int)HttpStatusCode.OK,
+                            correlationId
                         },
                         cancellationToken)
                     .ConfigureAwait(false);
@@ -273,7 +320,12 @@ public sealed class BrowserBridgeServer : IDisposable
                 _logger.Info(
                     "Browser download skipped due to unsupported URL scheme.",
                     eventCode: "BROWSER_API_REQUEST_UNSUPPORTED_SCHEME",
-                    context: new { payload.Url, Scheme = url.Scheme });
+                    context: new { payload.Url, Scheme = url.Scheme, CorrelationId = correlationId });
+
+                _logger.Info(
+                    "Browser bridge download request rejected.",
+                    eventCode: "DOWNLOAD_REJECTED_FROM_BRIDGE",
+                    context: new { payload.Url, Reason = "UnsupportedScheme", CorrelationId = correlationId });
                 return;
             }
 
@@ -283,10 +335,21 @@ public sealed class BrowserBridgeServer : IDisposable
                 payload.Method = "GET";
             }
 
+            correlationId = NormalizeCorrelationId(payload.CorrelationId) ?? GenerateCorrelationId();
+            payload.CorrelationId = correlationId;
+            response.Headers["X-Correlation-ID"] = correlationId;
+
             _logger.Info(
                 "Browser API request received.",
                 eventCode: "BROWSER_API_REQUEST_RECEIVED",
-                context: new { payload.Url, payload.Method });
+                context: new
+                {
+                    payload.Url,
+                    payload.Method,
+                    CorrelationId = correlationId,
+                    RemoteEndpoint = remoteEndpoint,
+                    PayloadLength = rawBody?.Length
+                });
 
             var result = await _coordinator
                 .HandleAsync(payload, cancellationToken)
@@ -303,7 +366,8 @@ public sealed class BrowserBridgeServer : IDisposable
                             handled = result.Handled,
                             status = result.Status,
                             id = result.Task.Id,
-                            statusCode = (int)result.StatusCode
+                            statusCode = (int)result.StatusCode,
+                            correlationId
                         },
                         cancellationToken)
                     .ConfigureAwait(false);
@@ -312,7 +376,7 @@ public sealed class BrowserBridgeServer : IDisposable
                     "Browser API download queued.",
                     eventCode: "BROWSER_API_DOWNLOAD_QUEUED",
                     downloadId: result.Task.Id,
-                    context: new { payload.Url });
+                    context: new { payload.Url, CorrelationId = correlationId });
                 return;
             }
 
@@ -325,7 +389,8 @@ public sealed class BrowserBridgeServer : IDisposable
                             handled = result.Handled,
                             status = result.Status,
                             error = result.Error ?? "User declined the download.",
-                            statusCode = (int)result.StatusCode
+                            statusCode = (int)result.StatusCode,
+                            correlationId
                         },
                         cancellationToken)
                     .ConfigureAwait(false);
@@ -333,7 +398,7 @@ public sealed class BrowserBridgeServer : IDisposable
                 _logger.Info(
                     "Browser download request declined by user.",
                     eventCode: "BROWSER_API_DOWNLOAD_DECLINED",
-                    context: new { payload.Url });
+                    context: new { payload.Url, CorrelationId = correlationId });
                 return;
             }
 
@@ -344,7 +409,8 @@ public sealed class BrowserBridgeServer : IDisposable
                         handled = result.Handled,
                         status = result.Status,
                         error = result.Error ?? "Failed to process download request.",
-                        statusCode = (int)result.StatusCode
+                        statusCode = (int)result.StatusCode,
+                        correlationId
                     },
                     cancellationToken)
                 .ConfigureAwait(false);
@@ -352,21 +418,22 @@ public sealed class BrowserBridgeServer : IDisposable
             _logger.Error(
                 "Failed to process browser download request.",
                 eventCode: "BROWSER_API_DOWNLOAD_FAILED",
-                context: new { payload.Url, result.Error, Status = (int)result.StatusCode });
+                context: new { payload.Url, result.Error, Status = (int)result.StatusCode, CorrelationId = correlationId });
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             response.StatusCode = (int)HttpStatusCode.InternalServerError;
             await WriteJsonAsync(
                     response,
-                    new { handled = false, error = "Unexpected server error." },
+                    new { handled = false, error = "Unexpected server error.", correlationId },
                     cancellationToken)
                 .ConfigureAwait(false);
 
             _logger.Error(
                 "Unexpected error in browser bridge handler.",
-                eventCode: "BROWSER_BRIDGE_HANDLER_ERROR",
-                exception: ex);
+                eventCode: "BROWSER_BRIDGE_REQUEST_ERROR",
+                exception: ex,
+                context: new { CorrelationId = correlationId, Method = method, Path = path, RemoteEndpoint = remoteEndpoint });
         }
     }
 
@@ -390,5 +457,23 @@ public sealed class BrowserBridgeServer : IDisposable
 
         _disposed = true;
         StopAsync().GetAwaiter().GetResult();
+    }
+
+    private static string GenerateCorrelationId()
+    {
+        Span<byte> buffer = stackalloc byte[6];
+        RandomNumberGenerator.Fill(buffer);
+        return Convert.ToHexString(buffer).ToLowerInvariant();
+    }
+
+    private static string? NormalizeCorrelationId(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var trimmed = value.Trim();
+        return trimmed.Length > 0 ? trimmed : null;
     }
 }

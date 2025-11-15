@@ -642,6 +642,7 @@ public class MainViewModel : INotifyPropertyChanged
             DownloadMode mode = DownloadMode.Normal,
             IReadOnlyDictionary<string, string>? requestHeaders = null,
             string? requestMethod = null,
+            string? correlationId = null,
             CancellationToken cancellationToken = default)
         {
             var resolvedFileName = string.IsNullOrWhiteSpace(suggestedFileName)

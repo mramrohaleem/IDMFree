@@ -125,6 +125,7 @@ public class DownloadEngine : IDownloadEngine
         DownloadMode mode = DownloadMode.Normal,
         IReadOnlyDictionary<string, string>? requestHeaders = null,
         string? requestMethod = null,
+        string? correlationId = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(url))
@@ -190,6 +191,26 @@ public class DownloadEngine : IDownloadEngine
             TemporaryFileName = fileName + ".part",
             BytesDownloadedSoFar = 0
         };
+
+        if (!string.IsNullOrWhiteSpace(correlationId))
+        {
+            _logger.Info(
+                "Download created from browser bridge request.",
+                downloadId: id,
+                eventCode: "DOWNLOAD_CREATED_FROM_BRIDGE",
+                context: new
+                {
+                    CorrelationId = correlationId,
+                    RequestedUrl = session.RequestedUrl?.ToString(),
+                    FinalUrl = session.FinalUrl?.ToString(),
+                    FileName = session.PlannedFileName,
+                    DisplayName = session.FinalFileName,
+                    ContentType = session.ContentType,
+                    ReportedFileSize = session.ReportedFileSizeBytes,
+                    HttpMethod = normalizedMethod,
+                    ProbeStatus = session.StatusCodeProbe
+                });
+        }
 
         _logger.Info(
             "Detected download capabilities.",

@@ -44,6 +44,21 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
             throw new ArgumentNullException(nameof(request));
         }
 
+        var correlationId = string.IsNullOrWhiteSpace(request.CorrelationId)
+            ? null
+            : request.CorrelationId;
+
+        _logger.Info(
+            "Browser bridge download request received.",
+            eventCode: "BROWSER_BRIDGE_REQUEST_HANDLING",
+            context: new
+            {
+                request.Url,
+                request.Method,
+                CorrelationId = correlationId,
+                Headers = request.Headers?.Count ?? 0
+            });
+
         var operation = _dispatcher.InvokeAsync(
             () => ShowDialog(request),
             DispatcherPriority.Normal,
@@ -56,7 +71,12 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
             _logger.Info(
                 "Browser download dialog dismissed by user.",
                 eventCode: "BROWSER_DOWNLOAD_DIALOG_CANCELED",
-                context: new { request.Url });
+                context: new { request.Url, CorrelationId = correlationId });
+
+            _logger.Info(
+                "Browser bridge download request rejected.",
+                eventCode: "DOWNLOAD_REJECTED_FROM_BRIDGE",
+                context: new { request.Url, Reason = "UserCanceled", CorrelationId = correlationId });
 
             return BrowserDownloadResult.Declined("User canceled the download.");
         }
@@ -81,6 +101,7 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
                     DownloadMode.Normal,
                     headers,
                     normalizedMethod,
+                    correlationId,
                     cancellationToken)
                 .ConfigureAwait(false);
 
@@ -88,7 +109,14 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
                 "Browser download dialog confirmed.",
                 eventCode: "BROWSER_DOWNLOAD_DIALOG_CONFIRMED",
                 downloadId: task.Id,
-                context: new { request.Url, prompt.TargetFolder, prompt.FileName, Method = normalizedMethod });
+                context: new
+                {
+                    request.Url,
+                    prompt.TargetFolder,
+                    prompt.FileName,
+                    Method = normalizedMethod,
+                    CorrelationId = correlationId
+                });
 
             return BrowserDownloadResult.Accepted(task);
         }
@@ -111,7 +139,18 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
             _logger.Warn(
                 "Failed to enqueue download due to HTTP error.",
                 eventCode: "BROWSER_DOWNLOAD_DIALOG_HTTP_ERROR",
-                context: new { request.Url, Status = (int)status, httpEx.Message });
+                context: new { request.Url, Status = (int)status, httpEx.Message, CorrelationId = correlationId });
+
+            _logger.Info(
+                "Browser bridge download request rejected.",
+                eventCode: "DOWNLOAD_REJECTED_FROM_BRIDGE",
+                context: new
+                {
+                    request.Url,
+                    Reason = "HttpRequestException",
+                    Status = (int)status,
+                    CorrelationId = correlationId
+                });
 
             return BrowserDownloadResult.Fallback(status, httpEx.Message);
         }
@@ -121,7 +160,17 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
                 "Failed to enqueue download from browser dialog.",
                 eventCode: "BROWSER_DOWNLOAD_DIALOG_ERROR",
                 exception: ex,
-                context: new { request.Url });
+                context: new { request.Url, CorrelationId = correlationId });
+
+            _logger.Info(
+                "Browser bridge download request rejected.",
+                eventCode: "DOWNLOAD_REJECTED_FROM_BRIDGE",
+                context: new
+                {
+                    request.Url,
+                    Reason = ex.GetType().Name,
+                    CorrelationId = correlationId
+                });
 
             if (!cancellationToken.IsCancellationRequested)
             {

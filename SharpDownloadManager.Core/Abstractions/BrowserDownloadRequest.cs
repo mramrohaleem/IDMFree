@@ -11,4 +11,6 @@ public sealed class BrowserDownloadRequest
     public Dictionary<string, string>? Headers { get; set; }
 
     public string? Method { get; set; }
+
+    public string? CorrelationId { get; set; }
 }
