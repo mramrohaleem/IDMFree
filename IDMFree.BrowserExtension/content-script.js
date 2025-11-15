@@ -23,7 +23,16 @@ const INTERCEPTABLE_EXTENSIONS = new Set([
   ".zip",
 ]);
 
-const FALLBACK_DELAY_MS = 10;
+const CUSTOM_DOWNLOAD_HINT_ATTRIBUTES = [
+  "data-download",
+  "data-file",
+  "data-file-download",
+  "data-idm-download",
+  "data-idmfree-download",
+];
+
+const INTENT_RESPONSE_TIMEOUT_MS = 1500;
+const FALLBACK_DELAY_MS = 20;
 
 function normalizeExtension(ext) {
   if (!ext) {
@@ -47,6 +56,10 @@ function getExtensionFromUrl(url) {
   }
 }
 
+function hasCustomDownloadHint(anchor) {
+  return CUSTOM_DOWNLOAD_HINT_ATTRIBUTES.some((attr) => anchor.hasAttribute(attr));
+}
+
 function findClickableAnchor(startNode) {
   let node = startNode;
   while (node && node !== document.documentElement) {
@@ -58,9 +71,39 @@ function findClickableAnchor(startNode) {
   return null;
 }
 
+function extractFileNameFromUrl(url) {
+  try {
+    const parsed = new URL(url, document.baseURI);
+    const segment = parsed.pathname.split("/").pop();
+    if (!segment) {
+      return null;
+    }
+    const cleanSegment = segment.split("?")[0];
+    return cleanSegment ? decodeURIComponent(cleanSegment) : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+function deriveSuggestedFileName({ downloadAttribute, titleAttribute, textContent, url }) {
+  if (downloadAttribute && downloadAttribute.trim()) {
+    return downloadAttribute.trim();
+  }
+  if (titleAttribute && titleAttribute.trim()) {
+    return titleAttribute.trim();
+  }
+  if (textContent && textContent.trim()) {
+    const normalized = textContent.trim().replace(/\s+/g, " ");
+    if (normalized) {
+      return normalized.slice(0, 120);
+    }
+  }
+  return extractFileNameFromUrl(url);
+}
+
 function buildCandidate(event) {
   if (event.button === 2 || (event.button === 1 && event.type === "click")) {
-    // Ignore right-click and synthetic middle button on click event.
+    // Ignore right-click and the synthetic middle button click event.
     return null;
   }
   const anchor = findClickableAnchor(event.target);
@@ -77,9 +120,28 @@ function buildCandidate(event) {
   const hasDownloadAttribute = anchor.hasAttribute("download");
   const downloadAttribute = hasDownloadAttribute ? anchor.getAttribute("download") : null;
   const extensionHint = getExtensionFromUrl(url);
+  const customDownloadHint = hasCustomDownloadHint(anchor);
   const text = (anchor.getAttribute("aria-label") || anchor.textContent || "").trim();
   const buttonLabel = text ? text.slice(0, 80) : null;
-  const highConfidence = hasDownloadAttribute || (extensionHint && INTERCEPTABLE_EXTENSIONS.has(extensionHint));
+  const looksLikeDownload =
+    hasDownloadAttribute ||
+    customDownloadHint ||
+    (extensionHint && INTERCEPTABLE_EXTENSIONS.has(extensionHint));
+  if (!looksLikeDownload) {
+    return null;
+  }
+  const suggestedFileName = deriveSuggestedFileName({
+    downloadAttribute,
+    titleAttribute: anchor.getAttribute("title"),
+    textContent: text,
+    url,
+  });
+  const targetAttribute = anchor.getAttribute("target") || null;
+  const openInNewTab =
+    event.button === 1 ||
+    event.ctrlKey ||
+    event.metaKey ||
+    (targetAttribute && targetAttribute.toLowerCase() === "_blank");
   return {
     url,
     anchor,
@@ -87,20 +149,27 @@ function buildCandidate(event) {
     hasDownloadAttribute,
     extensionHint,
     buttonLabel,
-    target: anchor.getAttribute("target") || null,
+    customDownloadHint,
+    suggestedFileName,
+    target: targetAttribute,
     rel: anchor.getAttribute("rel") || null,
-    highConfidence,
+    eventButton: event.button,
+    eventType: event.type,
+    modifiers: {
+      altKey: event.altKey,
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+      shiftKey: event.shiftKey,
+    },
+    openInNewTab,
   };
 }
 
-function triggerNativeDownload(candidate) {
+function triggerBrowserDownload(candidate) {
   try {
     const anchor = document.createElement("a");
     anchor.href = candidate.url;
-    if (
-      candidate.hasDownloadAttribute ||
-      (candidate.downloadAttribute !== undefined && candidate.downloadAttribute !== null)
-    ) {
+    if (candidate.hasDownloadAttribute) {
       const value =
         candidate.downloadAttribute !== undefined && candidate.downloadAttribute !== null
           ? candidate.downloadAttribute
@@ -116,10 +185,23 @@ function triggerNativeDownload(candidate) {
     anchor.style.display = "none";
     (document.body || document.documentElement).appendChild(anchor);
     anchor.click();
-    anchor.remove();
+    requestAnimationFrame(() => anchor.remove());
   } catch (err) {
     window.location.href = candidate.url;
   }
+}
+
+function fallbackToBrowser(candidate) {
+  if (!candidate || !candidate.url) {
+    return;
+  }
+  if (candidate.openInNewTab) {
+    setTimeout(() => {
+      window.open(candidate.url, candidate.target || "_blank");
+    }, FALLBACK_DELAY_MS);
+    return;
+  }
+  setTimeout(() => triggerBrowserDownload(candidate), FALLBACK_DELAY_MS);
 }
 
 function handlePointerEvent(event) {
@@ -130,39 +212,54 @@ function handlePointerEvent(event) {
   if (!candidate) {
     return;
   }
-  let defaultPrevented = false;
-  const preventDefault = () => {
-    if (defaultPrevented) {
-      return;
-    }
-    defaultPrevented = true;
-    event.preventDefault();
-    event.stopImmediatePropagation();
-    event.stopPropagation();
-  };
-  if (candidate.highConfidence) {
-    preventDefault();
-  }
-  chrome.runtime
-    .sendMessage({
-      type: "idmfree:candidate-download",
-      url: candidate.url,
+
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  event.stopPropagation();
+
+  const payload = {
+    url: candidate.url,
+    referrer: document.referrer || null,
+    pageUrl: window.location.href,
+    pageTitle: document.title || null,
+    suggestedFileName: candidate.suggestedFileName || null,
+    hints: {
       downloadAttribute: candidate.downloadAttribute,
       hasDownloadAttribute: candidate.hasDownloadAttribute,
       extensionHint: candidate.extensionHint,
       buttonLabel: candidate.buttonLabel,
-    })
+      customDownloadHint: candidate.customDownloadHint,
+    },
+    navigation: {
+      target: candidate.target,
+      rel: candidate.rel,
+      openInNewTab: candidate.openInNewTab,
+      eventButton: candidate.eventButton,
+      modifiers: candidate.modifiers,
+    },
+  };
+
+  let settled = false;
+  const finalize = (handled) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    clearTimeout(timeoutId);
+    if (!handled) {
+      fallbackToBrowser(candidate);
+    }
+  };
+
+  const timeoutId = setTimeout(() => finalize(false), INTENT_RESPONSE_TIMEOUT_MS);
+
+  chrome.runtime
+    .sendMessage({ type: "idmfree:download-intent", payload })
     .then((response) => {
-      if (response && response.intercept) {
-        preventDefault();
-      } else if (defaultPrevented) {
-        setTimeout(() => triggerNativeDownload(candidate), FALLBACK_DELAY_MS);
-      }
+      finalize(Boolean(response && response.handled));
     })
     .catch(() => {
-      if (defaultPrevented) {
-        setTimeout(() => triggerNativeDownload(candidate), FALLBACK_DELAY_MS);
-      }
+      finalize(false);
     });
 }
 
@@ -173,12 +270,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || message.type !== "idmfree:resume-download" || !message.url) {
     return;
   }
-  triggerNativeDownload({
+  fallbackToBrowser({
     url: message.url,
     downloadAttribute: message.downloadAttribute ?? null,
     hasDownloadAttribute: Boolean(message.hasDownloadAttribute),
-    target: null,
-    rel: null,
+    target: message.target || null,
+    rel: message.rel || null,
+    openInNewTab: Boolean(message.openInNewTab),
   });
   sendResponse?.();
 });
