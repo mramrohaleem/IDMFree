@@ -8,6 +8,8 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "SharpDownloadManager.Core",
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "SharpDownloadManager.Infrastructure", "SharpDownloadManager.Infrastructure\\SharpDownloadManager.Infrastructure.csproj", "{F4C869ED-33BE-427C-8D45-6CFA58CE3D95}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SharpDownloadManager.Infrastructure.Tests", "SharpDownloadManager.Infrastructure.Tests\\SharpDownloadManager.Infrastructure.Tests.csproj", "{4209F6B1-425D-454C-AF6B-5F9E20B62406}"
+EndProject
 Global
     GlobalSection(SolutionConfigurationPlatforms) = preSolution
         Debug|Any CPU = Debug|Any CPU
@@ -26,5 +28,9 @@ Global
         {F4C869ED-33BE-427C-8D45-6CFA58CE3D95}.Debug|Any CPU.Build.0 = Debug|Any CPU
         {F4C869ED-33BE-427C-8D45-6CFA58CE3D95}.Release|Any CPU.ActiveCfg = Release|Any CPU
         {F4C869ED-33BE-427C-8D45-6CFA58CE3D95}.Release|Any CPU.Build.0 = Release|Any CPU
+        {4209F6B1-425D-454C-AF6B-5F9E20B62406}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+        {4209F6B1-425D-454C-AF6B-5F9E20B62406}.Debug|Any CPU.Build.0 = Debug|Any CPU
+        {4209F6B1-425D-454C-AF6B-5F9E20B62406}.Release|Any CPU.ActiveCfg = Release|Any CPU
+        {4209F6B1-425D-454C-AF6B-5F9E20B62406}.Release|Any CPU.Build.0 = Release|Any CPU
     EndGlobalSection
 EndGlobal
