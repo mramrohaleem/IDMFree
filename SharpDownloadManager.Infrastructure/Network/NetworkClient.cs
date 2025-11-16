@@ -333,14 +333,8 @@ public sealed class NetworkClient : INetworkClient
                     "Gofile landing page cannot be resolved automatically.",
                     eventCode: "GOFILE_LANDING_UNRESOLVED",
                     context: new { Url = url.ToString() });
-
-                throw CreateHtmlResponseException(
-                    url,
-                    "Gofile landing page requires an interactive browser session.",
-                    requiresBrowser: true);
             }
-
-            if (!UriEquals(url, landingResolution))
+            else if (!UriEquals(url, landingResolution))
             {
                 _logger.Info(
                     "Resolved Gofile landing page to a direct link.",
@@ -350,9 +344,9 @@ public sealed class NetworkClient : INetworkClient
                         OriginalUrl = url.ToString(),
                         ResolvedUrl = landingResolution.ToString()
                     });
-            }
 
-            url = landingResolution;
+                url = landingResolution;
+            }
         }
 
         try
@@ -507,14 +501,8 @@ public sealed class NetworkClient : INetworkClient
                                     continue;
                                 }
 
-                                if (IsGofileLandingPage(responseUri))
-                                {
-                                    throw CreateHtmlResponseException(responseUri, snippet, requiresBrowser: true);
-                                }
-                            }
-                            else if (IsGofileLandingPage(responseUri))
-                            {
-                                throw CreateHtmlResponseException(responseUri, snippet, requiresBrowser: true);
+                                // If we can't resolve a direct link from this HTML response,
+                                // allow the generic HTML resolver pipeline to try.
                             }
                         }
 
