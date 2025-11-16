@@ -50,17 +50,72 @@ internal sealed class GofileResolver : IGofileResolver, IHtmlDownloadResolver
             throw new ArgumentNullException(nameof(initialUrl));
         }
 
+        _logger.Info(
+            "Gofile resolver direct resolve starting.",
+            eventCode: "GOFILE_DEBUG_RESOLVER_ENTRY",
+            context: new { InitialUrl = initialUrl.ToString() });
+
         if (!IsGofileHost(initialUrl))
         {
+            _logger.Info(
+                "Gofile resolver skipping non-Gofile URL.",
+                eventCode: "GOFILE_DEBUG_RESOLVER_NOT_GOFILE",
+                context: new { Url = initialUrl.ToString() });
             return null;
         }
 
         var referer = BuildDefaultReferer(initialUrl);
-        return await ResolveFromCandidatesAsync(
-                new[] { initialUrl },
-                referer,
-                cancellationToken)
-            .ConfigureAwait(false);
+        var candidates = new[] { initialUrl };
+
+        _logger.Info(
+            "Gofile resolver prepared candidates.",
+            eventCode: "GOFILE_DEBUG_RESOLVER_CANDIDATES",
+            context: new
+            {
+                Candidates = candidates.Select(c => new
+                {
+                    Url = c?.ToString(),
+                    IsGofile = c is not null && IsGofileHost(c)
+                }).ToArray(),
+                Referer = referer?.ToString()
+            });
+
+        try
+        {
+            return await ResolveFromCandidatesAsync(
+                    candidates,
+                    referer,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.Warn(
+                "Gofile resolver encountered HTTP error during direct resolve.",
+                eventCode: "GOFILE_DEBUG_RESOLVER_HTTP_ERROR",
+                exception: ex,
+                context: new
+                {
+                    InitialUrl = initialUrl.ToString(),
+                    ExceptionType = ex.GetType().FullName,
+                    Message = ex.Message
+                });
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn(
+                "Gofile resolver encountered unexpected error during direct resolve.",
+                eventCode: "GOFILE_DEBUG_RESOLVER_UNEXPECTED",
+                exception: ex,
+                context: new
+                {
+                    InitialUrl = initialUrl.ToString(),
+                    ExceptionType = ex.GetType().FullName,
+                    Message = ex.Message
+                });
+            throw;
+        }
     }
 
     public async Task<Uri?> TryResolveAsync(HtmlDownloadResolverContext context, CancellationToken cancellationToken)
@@ -70,10 +125,29 @@ internal sealed class GofileResolver : IGofileResolver, IHtmlDownloadResolver
             throw new ArgumentNullException(nameof(context));
         }
 
-        if (!IsGofileContext(context))
+        var isGofileContext = IsGofileContext(context);
+
+        _logger.Info(
+            "Gofile resolver evaluating HTML context.",
+            eventCode: "GOFILE_DEBUG_HTML_CONTEXT_ENTRY",
+            context: new
+            {
+                OriginalUrl = context.OriginalUrl?.ToString(),
+                ResponseUrl = context.ResponseUrl?.ToString(),
+                Referer = context.Referer?.ToString(),
+                SnippetLength = context.Snippet?.Length ?? 0,
+                IsGofileContext = isGofileContext
+            });
+
+        if (!isGofileContext)
         {
             return null;
         }
+
+        _logger.Info(
+            "Gofile resolver attempting HTML context resolution.",
+            eventCode: "GOFILE_DEBUG_HTML_CONTEXT_RESOLVE_START",
+            context: new { OriginalUrl = context.OriginalUrl?.ToString() });
 
         return await ResolveFromCandidatesAsync(
                 new[] { context.ResponseUrl, context.Referer, context.OriginalUrl },
@@ -92,7 +166,25 @@ internal sealed class GofileResolver : IGofileResolver, IHtmlDownloadResolver
             return null;
         }
 
+        _logger.Info(
+            "Gofile resolver processing candidates.",
+            eventCode: "GOFILE_DEBUG_RESOLVE_FROM_CANDIDATES_START",
+            context: new
+            {
+                Candidates = candidates.Where(c => c is not null).Select(c => c!.ToString()).ToArray(),
+                Referer = referer?.ToString()
+            });
+
         var contentId = TryExtractContentId(candidates);
+        _logger.Info(
+            "Gofile resolver candidate content ID result.",
+            eventCode: "GOFILE_DEBUG_RESOLVE_FROM_CANDIDATES_CONTENT_ID",
+            context: new
+            {
+                ContentId = contentId,
+                HasContentId = !string.IsNullOrWhiteSpace(contentId)
+            });
+
         if (string.IsNullOrWhiteSpace(contentId))
         {
             return null;
@@ -104,13 +196,37 @@ internal sealed class GofileResolver : IGofileResolver, IHtmlDownloadResolver
             return null;
         }
 
+        _logger.Info(
+            "Gofile resolver requesting account token.",
+            eventCode: "GOFILE_DEBUG_ACCOUNT_TOKEN_REQUEST",
+            context: new { TokenSource = tokenSource.ToString() });
+
         var accountToken = await _tokenAccessor(tokenSource, cancellationToken).ConfigureAwait(false);
+        _logger.Info(
+            "Gofile resolver account token result.",
+            eventCode: "GOFILE_DEBUG_ACCOUNT_TOKEN_RESULT",
+            context: new
+            {
+                HasToken = !string.IsNullOrWhiteSpace(accountToken),
+                TokenLength = accountToken?.Length,
+                TokenSuffix = accountToken is { Length: >= 4 } ? accountToken[^4..] : null
+            });
+
         if (string.IsNullOrWhiteSpace(accountToken))
         {
             return null;
         }
 
         var websiteToken = await GetWebsiteTokenAsync(cancellationToken).ConfigureAwait(false);
+        _logger.Info(
+            "Gofile resolver website token result.",
+            eventCode: "GOFILE_DEBUG_WEBSITE_TOKEN_RESULT",
+            context: new
+            {
+                HasWebsiteToken = !string.IsNullOrWhiteSpace(websiteToken),
+                TokenLength = websiteToken?.Length
+            });
+
         if (string.IsNullOrWhiteSpace(websiteToken))
         {
             return null;
@@ -122,16 +238,55 @@ internal sealed class GofileResolver : IGofileResolver, IHtmlDownloadResolver
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accountToken);
         request.Headers.Referrer = referer ?? BuildDefaultReferer(tokenSource);
 
+        _logger.Info(
+            "Gofile resolver issuing contents API request.",
+            eventCode: "GOFILE_DEBUG_CONTENTS_API_REQUEST",
+            context: new
+            {
+                Endpoint = endpoint.ToString(),
+                ContentId = contentId,
+                HasAccountToken = !string.IsNullOrWhiteSpace(accountToken),
+                HasWebsiteToken = !string.IsNullOrWhiteSpace(websiteToken)
+            });
+
         try
         {
             using var response = await _client.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            _logger.Info(
+                "Gofile resolver received contents API response.",
+                eventCode: "GOFILE_DEBUG_CONTENTS_API_RESPONSE",
+                context: new
+                {
+                    StatusCode = (int)response.StatusCode,
+                    IsSuccess = response.IsSuccessStatusCode
+                });
+
             if (!response.IsSuccessStatusCode)
             {
                 return null;
             }
 
             var payload = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-            return TryExtractLinkFromPayload(payload);
+            _logger.Info(
+                "Gofile resolver read contents API payload.",
+                eventCode: "GOFILE_DEBUG_CONTENTS_API_PAYLOAD",
+                context: new
+                {
+                    PayloadPreview = payload.Length > 300 ? payload[..300] : payload,
+                    PayloadLength = payload.Length
+                });
+
+            var link = TryExtractLinkFromPayload(payload);
+            _logger.Info(
+                "Gofile resolver payload link extraction result.",
+                eventCode: "GOFILE_DEBUG_CONTENTS_API_LINK_RESULT",
+                context: new
+                {
+                    HasLink = link is not null,
+                    Link = link?.ToString()
+                });
+
+            return link;
         }
         catch (HttpRequestException ex)
         {
@@ -157,18 +312,28 @@ internal sealed class GofileResolver : IGofileResolver, IHtmlDownloadResolver
         return null;
     }
 
-    private static string? TryExtractContentId(IReadOnlyList<Uri?> candidates)
+    private string? TryExtractContentId(IReadOnlyList<Uri?> candidates)
     {
         if (candidates is null)
         {
             return null;
         }
 
-        foreach (var candidate in candidates)
+        for (var i = 0; i < candidates.Count; i++)
         {
+            var candidate = candidates[i];
             var contentId = TryExtractContentId(candidate);
             if (!string.IsNullOrWhiteSpace(contentId))
             {
+                _logger.Info(
+                    "Gofile resolver extracted content ID from candidates.",
+                    eventCode: "GOFILE_DEBUG_CONTENT_ID_FROM_CANDIDATES",
+                    context: new
+                    {
+                        CandidateIndex = i,
+                        CandidateUrl = candidate?.ToString(),
+                        ContentId = contentId
+                    });
                 return contentId;
             }
         }
@@ -176,7 +341,7 @@ internal sealed class GofileResolver : IGofileResolver, IHtmlDownloadResolver
         return null;
     }
 
-    private static Uri? BuildDefaultReferer(Uri? candidate)
+    private Uri? BuildDefaultReferer(Uri? candidate)
     {
         if (candidate is null)
         {
@@ -214,7 +379,7 @@ internal sealed class GofileResolver : IGofileResolver, IHtmlDownloadResolver
         return uri.Host.EndsWith("gofile.io", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string? TryExtractContentId(Uri? uri)
+    private string? TryExtractContentId(Uri? uri)
     {
         if (uri is null)
         {
@@ -227,6 +392,15 @@ internal sealed class GofileResolver : IGofileResolver, IHtmlDownloadResolver
         var contentIdFromDownloadPath = TryExtractContentIdFromDownloadPath(segments);
         if (!string.IsNullOrWhiteSpace(contentIdFromDownloadPath))
         {
+            _logger.Info(
+                "Gofile resolver extracted content ID from download path.",
+                eventCode: "GOFILE_DEBUG_CONTENT_ID_FROM_URI",
+                context: new
+                {
+                    Url = uri.ToString(),
+                    ContentId = contentIdFromDownloadPath,
+                    Segments = segments
+                });
             return contentIdFromDownloadPath;
         }
 
@@ -237,6 +411,15 @@ internal sealed class GofileResolver : IGofileResolver, IHtmlDownloadResolver
                 var candidate = segments[i + 1];
                 if (IsLikelyContentId(candidate))
                 {
+                    _logger.Info(
+                        "Gofile resolver extracted content ID from /d path.",
+                        eventCode: "GOFILE_DEBUG_CONTENT_ID_FROM_URI",
+                        context: new
+                        {
+                            Url = uri.ToString(),
+                            ContentId = candidate,
+                            Segments = segments
+                        });
                     return candidate;
                 }
             }
@@ -247,6 +430,15 @@ internal sealed class GofileResolver : IGofileResolver, IHtmlDownloadResolver
             var last = segments[^1];
             if (IsLikelyContentId(last))
             {
+                _logger.Info(
+                    "Gofile resolver extracted content ID from trailing segment.",
+                    eventCode: "GOFILE_DEBUG_CONTENT_ID_FROM_URI",
+                    context: new
+                    {
+                        Url = uri.ToString(),
+                        ContentId = last,
+                        Segments = segments
+                    });
                 return last;
             }
         }
@@ -370,7 +562,21 @@ internal sealed class GofileResolver : IGofileResolver, IHtmlDownloadResolver
                 return _cachedWebsiteToken;
             }
 
+            _logger.Info(
+                "Gofile resolver requesting website token script.",
+                eventCode: "GOFILE_DEBUG_WEBSITE_TOKEN_REQUEST",
+                context: new { Endpoint = GofileWebsiteScript.ToString() });
+
             using var response = await _client.GetAsync(GofileWebsiteScript, cancellationToken).ConfigureAwait(false);
+
+            _logger.Info(
+                "Gofile resolver received website token response.",
+                eventCode: "GOFILE_DEBUG_WEBSITE_TOKEN_RESPONSE",
+                context: new
+                {
+                    StatusCode = (int)response.StatusCode,
+                    IsSuccess = response.IsSuccessStatusCode
+                });
             if (!response.IsSuccessStatusCode)
             {
                 _logger.Warn(
@@ -382,6 +588,14 @@ internal sealed class GofileResolver : IGofileResolver, IHtmlDownloadResolver
 
             var script = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
             var token = TryExtractWebsiteToken(script);
+            _logger.Info(
+                "Gofile resolver parsed website token.",
+                eventCode: "GOFILE_DEBUG_WEBSITE_TOKEN_PARSED",
+                context: new
+                {
+                    HasToken = !string.IsNullOrWhiteSpace(token),
+                    TokenLength = token?.Length
+                });
             if (string.IsNullOrWhiteSpace(token))
             {
                 _logger.Warn(
