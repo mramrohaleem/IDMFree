@@ -321,11 +321,14 @@ public sealed class NetworkClientTests
         transport.Dispose();
     }
 
-    [Fact]
-    public async Task DownloadRangeToStreamAsync_GofileResolver_UsesContentsApiLink()
+    [Theory]
+    [InlineData("https://gofile.io/d/resolverId")]
+    [InlineData("https://gofile.io/d/123e4567-e89b-12d3-a456-426614174000")]
+    [InlineData("https://gofile.io/d/identifier_with_underscores")]
+    public async Task DownloadRangeToStreamAsync_GofileResolver_UsesContentsApiLink(string refererUrl)
     {
         var logger = new TestLogger();
-        var referer = new Uri("https://gofile.io/d/resolverId");
+        var referer = new Uri(refererUrl);
         var downloadUri = new Uri("https://store-eu-par-1.gofile.io/download/original");
         var resolvedUri = new Uri("https://cdn.gofile.io/download/resolved.bin");
         var payload = Encoding.UTF8.GetBytes("resolved-binary");
