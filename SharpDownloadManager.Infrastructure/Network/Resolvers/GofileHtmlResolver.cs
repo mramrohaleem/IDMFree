@@ -12,6 +12,13 @@ namespace SharpDownloadManager.Infrastructure.Network.Resolvers;
 internal sealed class GofileHtmlResolver : IHtmlDownloadResolver
 {
     private static readonly Uri GofileContentsRoot = new("https://api.gofile.io/contents/");
+    private static readonly string[][] DownloadContentSegmentMarkers =
+    {
+        new[] { "download", "web" },
+        new[] { "download", "direct" },
+        new[] { "download", "secure" },
+        new[] { "download", "token" }
+    };
 
     private readonly HttpClient _client;
     private readonly ILogger _logger;
@@ -130,6 +137,12 @@ internal sealed class GofileHtmlResolver : IHtmlDownloadResolver
         var segments = uri.AbsolutePath
             .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
+        var contentIdFromDownloadPath = TryExtractContentIdFromDownloadPath(segments);
+        if (!string.IsNullOrWhiteSpace(contentIdFromDownloadPath))
+        {
+            return contentIdFromDownloadPath;
+        }
+
         for (var i = 0; i < segments.Length - 1; i++)
         {
             if (segments[i].Equals("d", StringComparison.OrdinalIgnoreCase))
@@ -148,6 +161,60 @@ internal sealed class GofileHtmlResolver : IHtmlDownloadResolver
             if (IsLikelyContentId(last))
             {
                 return last;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? TryExtractContentIdFromDownloadPath(string[] segments)
+    {
+        if (segments.Length < 3)
+        {
+            return null;
+        }
+
+        foreach (var markers in DownloadContentSegmentMarkers)
+        {
+            var candidate = TryExtractContentIdFromMarkers(segments, markers);
+            if (!string.IsNullOrWhiteSpace(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? TryExtractContentIdFromMarkers(string[] segments, string[] markers)
+    {
+        if (markers.Length == 0)
+        {
+            return null;
+        }
+
+        for (var i = 0; i <= segments.Length - markers.Length - 1; i++)
+        {
+            var isMatch = true;
+            for (var j = 0; j < markers.Length; j++)
+            {
+                if (!segments[i + j].Equals(markers[j], StringComparison.OrdinalIgnoreCase))
+                {
+                    isMatch = false;
+                    break;
+                }
+            }
+
+            if (!isMatch)
+            {
+                continue;
+            }
+
+            var candidateIndex = i + markers.Length;
+            var candidate = segments[candidateIndex];
+            if (IsLikelyContentId(candidate))
+            {
+                return candidate;
             }
         }
 
