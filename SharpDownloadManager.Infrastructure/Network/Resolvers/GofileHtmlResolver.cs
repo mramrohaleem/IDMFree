@@ -166,7 +166,7 @@ internal sealed class GofileHtmlResolver : IHtmlDownloadResolver
             return false;
         }
 
-        return candidate.All(static c => char.IsLetterOrDigit(c));
+        return candidate.All(static c => char.IsLetterOrDigit(c) || c is '-' or '_');
     }
 
     private Uri? TryExtractLinkFromPayload(string payload)
