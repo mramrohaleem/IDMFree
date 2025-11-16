@@ -77,6 +77,107 @@ function logEvent(event, context = {}) {
   console.debug(`${LOG_PREFIX} ${event}`, context);
 }
 
+const textEncoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
+
+function arrayBufferToBase64(buffer) {
+  if (!buffer || buffer.byteLength === 0) {
+    return null;
+  }
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode.apply(null, chunk);
+  }
+  return btoa(binary);
+}
+
+function serializeRequestBody(details) {
+  if (!details || !details.requestBody) {
+    return null;
+  }
+  const body = details.requestBody;
+  if (Array.isArray(body.raw) && body.raw.length > 0) {
+    const buffers = [];
+    for (const part of body.raw) {
+      if (part && part.bytes instanceof ArrayBuffer) {
+        buffers.push(part.bytes);
+      }
+    }
+    if (buffers.length === 0) {
+      return null;
+    }
+    let totalLength = 0;
+    for (const buffer of buffers) {
+      totalLength += buffer.byteLength;
+    }
+    const merged = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const buffer of buffers) {
+      const chunk = new Uint8Array(buffer);
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const base64 = arrayBufferToBase64(merged.buffer);
+    if (!base64) {
+      return null;
+    }
+    return {
+      encoding: "base64",
+      data: base64,
+      length: totalLength,
+      source: "raw",
+      contentType: null,
+    };
+  }
+  if (body.formData && typeof body.formData === "object") {
+    const params = new URLSearchParams();
+    for (const [key, values] of Object.entries(body.formData)) {
+      if (!Array.isArray(values)) {
+        continue;
+      }
+      for (const value of values) {
+        params.append(key, value);
+      }
+    }
+    const serialized = params.toString();
+    if (!serialized) {
+      return null;
+    }
+    if (!textEncoder) {
+      return null;
+    }
+    const encoded = textEncoder.encode(serialized);
+    const base64 = arrayBufferToBase64(encoded.buffer);
+    if (!base64) {
+      return null;
+    }
+    return {
+      encoding: "base64",
+      data: base64,
+      length: encoded.byteLength,
+      source: "formData",
+      contentType: "application/x-www-form-urlencoded;charset=UTF-8",
+    };
+  }
+  return null;
+}
+
+function attachRequestBodyToContext(context, details) {
+  if (!context || !details || !details.requestBody) {
+    return;
+  }
+  const serialized = serializeRequestBody(details);
+  if (!serialized) {
+    return;
+  }
+  context.requestBody = serialized;
+  if (!context.requestBodyContentType && serialized.contentType) {
+    context.requestBodyContentType = serialized.contentType;
+  }
+}
+
 function sanitizeBridgeHeaders(headers) {
   if (!headers || typeof headers !== "object") {
     return undefined;
@@ -110,6 +211,12 @@ function buildBridgePayload(payload, correlationId) {
   if (headers) {
     request.headers = headers;
   }
+  if (payload.body && typeof payload.body === "string" && payload.body.length > 0) {
+    request.body = payload.body;
+    if (payload.bodyContentType) {
+      request.bodyContentType = payload.bodyContentType;
+    }
+  }
   return request;
 }
 
@@ -122,6 +229,7 @@ function summarizeBridgePayload(payload) {
     fileName: payload.fileName || null,
     method: payload.method || null,
     hasHeaders: Boolean(payload.headers && Object.keys(payload.headers).length > 0),
+    hasBody: Boolean(payload.body),
   };
 }
 
@@ -913,6 +1021,8 @@ function ensureRequestContext(details) {
       initiator: details.initiator || details.documentUrl || null,
       requestHeaders: [],
       responseHeaders: [],
+      requestBody: null,
+      requestBodyContentType: null,
       fromClick: readClickHint(details.tabId ?? -1, details.url),
       shouldIntercept: false,
       interceptReason: null,
@@ -923,6 +1033,7 @@ function ensureRequestContext(details) {
     };
     requestContexts.set(details.requestId, context);
   }
+  attachRequestBodyToContext(context, details);
   return context;
 }
 
@@ -1057,6 +1168,12 @@ function rememberRecentRequest(context) {
     url: context.url,
     method: context.method,
     requestHeaders: context.requestHeaders || [],
+    requestBody: context.requestBody ? { ...context.requestBody } : existing?.requestBody || null,
+    requestBodyContentType:
+      context.requestBodyContentType ||
+      context.requestBody?.contentType ||
+      existing?.requestBodyContentType ||
+      null,
     timestamp: now(),
     correlationId,
     initiator: context.initiator || null,
@@ -1166,6 +1283,11 @@ async function delegateToManager(context) {
         : context.fromResponseFileName || guessFileNameFromUrl(context.url)) || null,
     headers,
   };
+  if (context.requestBody?.data) {
+    bridgePayload.body = context.requestBody.data;
+    bridgePayload.bodyContentType =
+      context.requestBody.contentType || context.requestBodyContentType || null;
+  }
   logEvent("BG: delegating to app via bridge", {
     correlationId,
     url: context.url,
@@ -1286,6 +1408,18 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
     const context = ensureRequestContext(details);
     context.requestHeaders = details.requestHeaders || [];
+    const contentTypeHeader = context.requestHeaders.find(
+      (h) => h.name && h.name.toLowerCase() === "content-type"
+    );
+    if (contentTypeHeader && contentTypeHeader.value) {
+      const value = contentTypeHeader.value.trim();
+      if (value) {
+        context.requestBodyContentType = value;
+        if (context.requestBody && !context.requestBody.contentType) {
+          context.requestBody.contentType = value;
+        }
+      }
+    }
     rememberRecentRequest(context);
     if (context.cancelled) {
       return { cancel: true };
@@ -1431,6 +1565,11 @@ async function handleDownloadsApiCreated(item) {
       null,
     method: cached ? cached.method : "GET",
   };
+  if (cached?.requestBody?.data) {
+    bridgePayload.body = cached.requestBody.data;
+    bridgePayload.bodyContentType =
+      cached.requestBody.contentType || cached.requestBodyContentType || null;
+  }
   if (Object.keys(bridgeHeaders).length > 0) {
     bridgePayload.headers = bridgeHeaders;
   }

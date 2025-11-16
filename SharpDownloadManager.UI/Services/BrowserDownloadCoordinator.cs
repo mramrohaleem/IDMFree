@@ -102,6 +102,8 @@ public sealed class BrowserDownloadCoordinator : IBrowserDownloadCoordinator
                     headers,
                     normalizedMethod,
                     correlationId,
+                    request.Body,
+                    request.BodyContentType,
                     cancellationToken)
                 .ConfigureAwait(false);
 

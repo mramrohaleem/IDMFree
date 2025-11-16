@@ -126,6 +126,8 @@ public class DownloadEngine : IDownloadEngine
         IReadOnlyDictionary<string, string>? requestHeaders = null,
         string? requestMethod = null,
         string? correlationId = null,
+        byte[]? requestBody = null,
+        string? requestBodyContentType = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(url))
@@ -145,6 +147,10 @@ public class DownloadEngine : IDownloadEngine
         }
 
         var normalizedMethod = ResolveHttpMethod(requestMethod);
+        var normalizedBody = requestBody is { Length: > 0 } ? requestBody.ToArray() : null;
+        var normalizedBodyContentType = string.IsNullOrWhiteSpace(requestBodyContentType)
+            ? null
+            : requestBodyContentType.Trim();
         var id = Guid.NewGuid();
 
         var resourceInfo = await _networkClient
@@ -250,6 +256,8 @@ public class DownloadEngine : IDownloadEngine
             ETag = resourceInfo.ETag,
             LastModified = resourceInfo.LastModified,
             RequestHeaders = normalizedHeaders,
+            RequestBody = normalizedBody,
+            RequestBodyContentType = normalizedBodyContentType,
             ActualFileSize = null,
             RequestMethod = normalizedMethod.Method
         };
@@ -1016,6 +1024,10 @@ public class DownloadEngine : IDownloadEngine
                 });
 
                 var allowFallback = !from.HasValue && !to.HasValue;
+                var attachBody =
+                    allowFallback &&
+                    chunk.DownloadedBytes == 0 &&
+                    task.RequestBody is { Length: > 0 };
 
                 var responseMetadata = await _networkClient.DownloadRangeToStreamAsync(
                         taskUri,
@@ -1026,7 +1038,9 @@ public class DownloadEngine : IDownloadEngine
                         ct,
                         allowFallback,
                         task.RequestHeaders,
-                        requestHttpMethod)
+                        requestHttpMethod,
+                        attachBody ? task.RequestBody : null,
+                        attachBody ? task.RequestBodyContentType : null)
                     .ConfigureAwait(false);
 
                 TryUpdateTaskMetadataFromResponse(task, responseMetadata);

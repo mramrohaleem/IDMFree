@@ -66,6 +66,10 @@ public class DownloadTask
 
     public IReadOnlyDictionary<string, string>? RequestHeaders { get; set; }
 
+    public byte[]? RequestBody { get; set; }
+
+    public string? RequestBodyContentType { get; set; }
+
     public bool HasKnownContentLength => ContentLength.HasValue && ContentLength.Value > 0;
 
     public bool ResumeSupported => ResumeCapability == DownloadResumeCapability.Supported;

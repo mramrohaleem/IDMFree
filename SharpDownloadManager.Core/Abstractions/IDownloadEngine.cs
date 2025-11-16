@@ -20,6 +20,8 @@ public interface IDownloadEngine
         IReadOnlyDictionary<string, string>? requestHeaders = null,
         string? requestMethod = null,
         string? correlationId = null,
+        byte[]? requestBody = null,
+        string? requestBodyContentType = null,
         CancellationToken cancellationToken = default);
 
     Task ResumeAsync(Guid downloadId, CancellationToken cancellationToken = default);
