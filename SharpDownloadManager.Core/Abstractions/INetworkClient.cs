@@ -24,6 +24,7 @@ public interface INetworkClient
     /// Downloads a byte range [from..to] (inclusive) from the given URL into the destination stream.
     /// If from/to are null, downloads from the start or to the end as appropriate.
     /// Reports incremental bytes read via progress (if provided).
+    /// Optionally forwards the caller's HTTP verb and request body when the server expects it.
     /// Throws on HTTP errors (4xx/5xx) or network failures.
     /// </summary>
     Task<DownloadResponseMetadata> DownloadRangeToStreamAsync(
@@ -35,5 +36,7 @@ public interface INetworkClient
         CancellationToken cancellationToken = default,
         bool allowHtmlFallback = true,
         IReadOnlyDictionary<string, string>? extraHeaders = null,
-        HttpMethod? requestMethod = null);
+        HttpMethod? requestMethod = null,
+        byte[]? requestBody = null,
+        string? requestBodyContentType = null);
 }
