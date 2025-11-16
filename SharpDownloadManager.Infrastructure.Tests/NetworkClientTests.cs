@@ -321,6 +321,147 @@ public sealed class NetworkClientTests
         transport.Dispose();
     }
 
+    [Fact]
+    public async Task DownloadRangeToStreamAsync_GofileResolver_UsesContentsApiLink()
+    {
+        var logger = new TestLogger();
+        var referer = new Uri("https://gofile.io/d/resolverId");
+        var downloadUri = new Uri("https://store-eu-par-1.gofile.io/download/original");
+        var resolvedUri = new Uri("https://cdn.gofile.io/download/resolved.bin");
+        var payload = Encoding.UTF8.GetBytes("resolved-binary");
+        var servedHtml = false;
+        var tokenRequestCount = 0;
+
+        var handler = new RecordingHandler(request =>
+        {
+            if (request.RequestUri is null)
+            {
+                throw new InvalidOperationException("Request URI must not be null.");
+            }
+
+            if (request.RequestUri.Host.Equals("api.gofile.io", StringComparison.OrdinalIgnoreCase))
+            {
+                if (request.RequestUri.AbsolutePath.Contains("/accounts", StringComparison.OrdinalIgnoreCase))
+                {
+                    tokenRequestCount++;
+                    var tokenPayload = $"{{\"data\":{{\"token\":\"guest-token-{tokenRequestCount}\"}}}}";
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent(tokenPayload, Encoding.UTF8, "application/json")
+                    };
+                }
+
+                if (request.RequestUri.AbsolutePath.Contains("/contents/", StringComparison.OrdinalIgnoreCase))
+                {
+                    var payloadJson = $"{{\"data\":{{\"link\":\"{resolvedUri}\"}}}}";
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent(payloadJson, Encoding.UTF8, "application/json")
+                    };
+                }
+            }
+
+            if (request.RequestUri == downloadUri)
+            {
+                if (!servedHtml)
+                {
+                    servedHtml = true;
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent("<html><body>Link expired</body></html>", Encoding.UTF8, "text/html")
+                    };
+                }
+            }
+
+            if (request.RequestUri == resolvedUri)
+            {
+                var okResponse = new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new ByteArrayContent(payload)
+                };
+                okResponse.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+                return okResponse;
+            }
+
+            throw new InvalidOperationException($"Unexpected request: {request.RequestUri}");
+        });
+
+        await using var destination = new MemoryStream();
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Referer"] = referer.ToString()
+        };
+        var client = new NetworkClient(logger, handler);
+
+        var metadata = await client.DownloadRangeToStreamAsync(
+                downloadUri,
+                null,
+                null,
+                destination,
+                cancellationToken: default,
+                extraHeaders: headers)
+            .ConfigureAwait(false);
+
+        Assert.Equal("application/octet-stream", metadata.ContentType);
+        Assert.Equal(payload.Length, destination.Length);
+        Assert.Contains(handler.Requests, request =>
+            request.Uri.Host.Equals("api.gofile.io", StringComparison.OrdinalIgnoreCase) &&
+            request.Uri.AbsolutePath.Contains("/contents/", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(handler.Requests, request => request.Uri == resolvedUri);
+    }
+
+    [Fact]
+    public async Task DownloadRangeToStreamAsync_CustomHtmlResolver_PipelineInvoked()
+    {
+        var logger = new TestLogger();
+        var downloadUri = new Uri("https://html-resolver.test/file");
+        var resolvedUri = new Uri("https://resolved.test/file.bin");
+        var payload = Encoding.UTF8.GetBytes("custom-resolver");
+
+        var handler = new RecordingHandler(request =>
+        {
+            if (request.RequestUri == downloadUri)
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("<html><body>no direct link</body></html>", Encoding.UTF8, "text/html")
+                };
+            }
+
+            if (request.RequestUri == resolvedUri)
+            {
+                var okResponse = new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new ByteArrayContent(payload)
+                };
+                okResponse.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+                return okResponse;
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+
+        var resolver = new StubHtmlResolver(context =>
+            context.HtmlSnippet.Contains("no direct link", StringComparison.OrdinalIgnoreCase)
+                ? resolvedUri
+                : null);
+
+        await using var destination = new MemoryStream();
+        var client = new NetworkClient(logger, handler, new[] { resolver });
+
+        var metadata = await client.DownloadRangeToStreamAsync(
+                downloadUri,
+                null,
+                null,
+                destination)
+            .ConfigureAwait(false);
+
+        Assert.True(resolver.Invoked);
+        Assert.Equal("application/octet-stream", metadata.ContentType);
+        Assert.Equal(payload.Length, destination.Length);
+        Assert.Contains(handler.Requests, request => request.Uri == resolvedUri);
+    }
+
     private sealed class RecordingHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, HttpResponseMessage> _responder;
@@ -356,6 +497,24 @@ public sealed class NetworkClientTests
                 request.Method.Method,
                 body,
                 request.Content?.Headers.ContentType?.ToString());
+        }
+    }
+
+    private sealed class StubHtmlResolver : IHtmlDownloadResolver
+    {
+        private readonly Func<HtmlDownloadResolverContext, Uri?> _factory;
+
+        public StubHtmlResolver(Func<HtmlDownloadResolverContext, Uri?> factory)
+        {
+            _factory = factory;
+        }
+
+        public bool Invoked { get; private set; }
+
+        public Task<Uri?> TryResolveAsync(HtmlDownloadResolverContext context, CancellationToken cancellationToken)
+        {
+            Invoked = true;
+            return Task.FromResult(_factory(context));
         }
     }
 
