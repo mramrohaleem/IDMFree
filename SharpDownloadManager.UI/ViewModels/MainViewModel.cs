@@ -690,7 +690,12 @@ public class MainViewModel : INotifyPropertyChanged
         {
         }
 
-        public void Warn(string message, Guid? downloadId = null, string? eventCode = null, object? context = null)
+        public void Warn(
+            string message,
+            Guid? downloadId = null,
+            string? eventCode = null,
+            Exception? exception = null,
+            object? context = null)
         {
         }
 
