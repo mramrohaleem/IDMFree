@@ -65,6 +65,8 @@ CREATE TABLE IF NOT EXISTS Downloads (
     LastErrorMessage TEXT NULL,
     RequestHeaders TEXT NULL,
     RequestMethod TEXT NOT NULL DEFAULT 'GET',
+    RequestBody BLOB NULL,
+    RequestBodyContentType TEXT NULL,
     TotalActiveSeconds REAL NOT NULL DEFAULT 0,
     LastResumedAt TEXT NULL,
     HttpStatusCategory INTEGER NOT NULL DEFAULT 0,
@@ -314,6 +316,8 @@ CREATE TABLE IF NOT EXISTS Downloads (
     LastErrorMessage TEXT NULL,
     RequestHeaders TEXT NULL,
     RequestMethod TEXT NOT NULL DEFAULT 'GET',
+    RequestBody BLOB NULL,
+    RequestBodyContentType TEXT NULL,
     TotalActiveSeconds REAL NOT NULL DEFAULT 0,
     LastResumedAt TEXT NULL,
     HttpStatusCategory INTEGER NOT NULL DEFAULT 0,
@@ -380,6 +384,22 @@ CREATE TABLE IF NOT EXISTS Chunks (
             await EnsureColumnExistsAsync(
                     connection,
                     "Downloads",
+                    "RequestBody",
+                    "BLOB NULL",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
+                    "RequestBodyContentType",
+                    "TEXT NULL",
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await EnsureColumnExistsAsync(
+                    connection,
+                    "Downloads",
                     "SessionMetadata",
                     "TEXT NULL",
                     cancellationToken)
@@ -415,6 +435,7 @@ INSERT INTO Downloads (
     TotalDownloadedBytes, BytesWritten, ActualFileSize, ConnectionsCount,
     LastErrorCode, LastErrorMessage,
     RequestHeaders, RequestMethod,
+    RequestBody, RequestBodyContentType,
     TotalActiveSeconds, LastResumedAt, HttpStatusCategory,
     TooManyRequestsRetryCount, RetryBackoffSeconds, NextRetryUtc, MaxParallelConnections, SessionMetadata
 ) VALUES (
@@ -448,6 +469,8 @@ ON CONFLICT(Id) DO UPDATE SET
     LastErrorMessage = excluded.LastErrorMessage,
     RequestHeaders = excluded.RequestHeaders,
     RequestMethod = excluded.RequestMethod,
+    RequestBody = excluded.RequestBody,
+    RequestBodyContentType = excluded.RequestBodyContentType,
     TotalActiveSeconds = excluded.TotalActiveSeconds,
     LastResumedAt = excluded.LastResumedAt,
     HttpStatusCategory = excluded.HttpStatusCategory,
@@ -492,6 +515,15 @@ ON CONFLICT(Id) DO UPDATE SET
                     ? "GET"
                     : task.RequestMethod.ToUpperInvariant();
                 cmd.Parameters.AddWithValue("$RequestMethod", methodValue);
+                if (task.RequestBody is { Length: > 0 })
+                {
+                    cmd.Parameters.AddWithValue("$RequestBody", task.RequestBody);
+                }
+                else
+                {
+                    cmd.Parameters.AddWithValue("$RequestBody", DBNull.Value);
+                }
+                cmd.Parameters.AddWithValue("$RequestBodyContentType", (object?)task.RequestBodyContentType ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$TotalActiveSeconds", task.TotalActiveTime.TotalSeconds);
                 cmd.Parameters.AddWithValue("$LastResumedAt", task.LastResumedAt?.ToString("o") ?? (object)DBNull.Value);
                 cmd.Parameters.AddWithValue("$HttpStatusCategory", (int)task.HttpStatusCategory);
@@ -693,6 +725,19 @@ INSERT INTO Chunks (
                     else
                     {
                         task.RequestMethod = "GET";
+                    }
+
+                    if (!reader.IsDBNull(reader.GetOrdinal("RequestBody")))
+                    {
+                        task.RequestBody = (byte[])reader.GetValue(reader.GetOrdinal("RequestBody"));
+                    }
+
+                    if (!reader.IsDBNull(reader.GetOrdinal("RequestBodyContentType")))
+                    {
+                        var bodyType = reader.GetString(reader.GetOrdinal("RequestBodyContentType"));
+                        task.RequestBodyContentType = string.IsNullOrWhiteSpace(bodyType)
+                            ? null
+                            : bodyType;
                     }
 
                     string? sessionJson = null;

@@ -269,7 +269,9 @@ public sealed class NetworkClient : INetworkClient
         CancellationToken cancellationToken = default,
         bool allowHtmlFallback = true,
         IReadOnlyDictionary<string, string>? extraHeaders = null,
-        HttpMethod? requestMethod = null)
+        HttpMethod? requestMethod = null,
+        byte[]? requestBody = null,
+        string? requestBodyContentType = null)
     {
         if (url is null) throw new ArgumentNullException(nameof(url));
         if (target is null) throw new ArgumentNullException(nameof(target));
@@ -282,189 +284,230 @@ public sealed class NetworkClient : INetworkClient
             context: ctx);
 
         var normalizedMethod = NormalizeHttpMethod(requestMethod);
-        // Only GET can deliver a response body reliably. If the browser used
-        // a different verb (e.g. POST), we still leverage the forwarded
-        // headers/cookies but fall back to GET for the actual transfer.
-        if (normalizedMethod != HttpMethod.Get)
-        {
-            normalizedMethod = HttpMethod.Get;
-        }
-
-        using var request = new HttpRequestMessage(normalizedMethod, url);
-        ApplyCommonHeaders(request, url, extraHeaders);
-        ApplyExtraHeaders(request, extraHeaders);
-
-        if (from.HasValue)
-        {
-            request.Headers.Range = to.HasValue
-                ? new RangeHeaderValue(from, to)
-                : new RangeHeaderValue(from, null);
-        }
+        var shouldUseOriginalMethod = !from.HasValue && !to.HasValue;
+        var attemptMethod = shouldUseOriginalMethod ? normalizedMethod : HttpMethod.Get;
+        var methodFallbackUsed = !shouldUseOriginalMethod || normalizedMethod == HttpMethod.Get;
+        var resolvedBodyContentType = ResolveBodyContentType(extraHeaders, requestBodyContentType);
 
         try
         {
-            using var response = await _client
-                .SendAsync(
-                    request,
-                    HttpCompletionOption.ResponseHeadersRead,
-                    cancellationToken)
-                .ConfigureAwait(false);
-
-            if (response.StatusCode == HttpStatusCode.TooManyRequests)
-            {
-                var retryAfter = TryGetRetryAfter(response);
-                var friendly429 = retryAfter.HasValue && retryAfter.Value > TimeSpan.Zero
-                    ? $"Server returned 429 Too Many Requests. Retrying in approximately {retryAfter.Value.TotalSeconds:0} seconds."
-                    : "Server returned 429 Too Many Requests. The server asked us to slow down.";
-
-                var throttled = new HttpRequestException(
-                    friendly429,
-                    null,
-                    HttpStatusCode.TooManyRequests);
-
-                if (retryAfter.HasValue && retryAfter.Value > TimeSpan.Zero)
-                {
-                    throttled.Data[RetryAfterSecondsKey] = retryAfter.Value.TotalSeconds;
-                }
-
-                throw throttled;
-            }
-
-            response.EnsureSuccessStatusCode();
-
-            var metadata = CreateDownloadResponseMetadata(response, from.HasValue || to.HasValue);
-
-            var mediaType = response.Content.Headers.ContentType?.MediaType;
-            using var responseStream = await response.Content
-                .ReadAsStreamAsync(cancellationToken)
-                .ConfigureAwait(false);
-
-            var buffer = new byte[81_920];
-            long totalBytesRead = 0;
-
-            var firstRead = await responseStream
-                .ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)
-                .ConfigureAwait(false);
-
-            var isHtmlResponse =
-                mediaType is not null &&
-                mediaType.StartsWith("text/html", StringComparison.OrdinalIgnoreCase) &&
-                !url.AbsolutePath.EndsWith(".htm", StringComparison.OrdinalIgnoreCase) &&
-                !url.AbsolutePath.EndsWith(".html", StringComparison.OrdinalIgnoreCase);
-
-            if (firstRead > 0 && isHtmlResponse)
-            {
-                var snippetLength = Math.Min(firstRead, 4096);
-                var snippet = Encoding.UTF8.GetString(buffer, 0, snippetLength);
-
-                var isFullDownload = !from.HasValue && !to.HasValue;
-
-                if (allowHtmlFallback && isFullDownload &&
-                    TryExtractDownloadUrlFromHtml(snippet, url, out var fallbackUrl) &&
-                    fallbackUrl is not null)
-                {
-                    _logger.Info(
-                        "HTML fallback extracted a file URL from page.",
-                        eventCode: "DOWNLOAD_HTML_FALLBACK",
-                        context: new
-                        {
-                            OriginalUrl = url.ToString(),
-                            FallbackUrl = fallbackUrl.ToString()
-                        });
-
-                    responseStream.Dispose();
-                    response.Dispose();
-
-                    var fallbackMetadata = await DownloadRangeToStreamAsync(
-                            fallbackUrl,
-                            null,
-                            null,
-                            target,
-                            progress,
-                            cancellationToken,
-                            allowHtmlFallback: false,
-                            extraHeaders: extraHeaders,
-                            requestMethod: requestMethod)
-                        .ConfigureAwait(false);
-
-                    return fallbackMetadata;
-                }
-
-                var safeSnippet = snippet.Length > 1000 ? snippet[..1000] : snippet;
-
-                _logger.Error(
-                    "Server returned HTML instead of file.",
-                    eventCode: "DOWNLOAD_HTML_RESPONSE",
-                    context: new
-                    {
-                        Url = url.ToString(),
-                        Snippet = safeSnippet
-                    });
-
-                var message =
-                    "Server returned an HTML page instead of the requested file. " +
-                    "This usually means the link requires login, a browser session, " +
-                    "or an extra confirmation step." + Environment.NewLine +
-                    "HTML snippet:" + Environment.NewLine +
-                    safeSnippet;
-
-                var ex = new HttpRequestException(message);
-                ex.Data["CustomErrorCode"] = DownloadErrorCode.HtmlResponse;
-                throw ex;
-            }
-
-            if (firstRead > 0)
-            {
-                await target
-                    .WriteAsync(buffer.AsMemory(0, firstRead), cancellationToken)
-                    .ConfigureAwait(false);
-
-                progress?.Report(firstRead);
-                totalBytesRead += firstRead;
-            }
-
             while (true)
             {
-                var read = await responseStream
-                    .ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)
-                    .ConfigureAwait(false);
+                using var request = new HttpRequestMessage(attemptMethod, url);
+                ApplyCommonHeaders(request, url, extraHeaders);
+                ApplyExtraHeaders(request, extraHeaders);
 
-                if (read <= 0)
+                if (from.HasValue)
                 {
-                    break;
+                    request.Headers.Range = to.HasValue
+                        ? new RangeHeaderValue(from, to)
+                        : new RangeHeaderValue(from, null);
                 }
 
-                await target
-                    .WriteAsync(buffer.AsMemory(0, read), cancellationToken)
-                    .ConfigureAwait(false);
+                var shouldAttachBody = shouldUseOriginalMethod &&
+                                       !methodFallbackUsed &&
+                                       requestBody is { Length: > 0 } &&
+                                       attemptMethod != HttpMethod.Get;
 
-                progress?.Report(read);
-                totalBytesRead += read;
-            }
-
-            _logger.Info(
-                "Completed range download",
-                eventCode: "DOWNLOAD_RANGE_SUCCESS",
-                context: ctx);
-
-            if (!from.HasValue && !to.HasValue && totalBytesRead > 0)
-            {
-                if (!metadata.ResourceLength.HasValue || metadata.ResourceLength.Value <= 0)
+                if (shouldAttachBody)
                 {
-                    var responseLength = metadata.ResponseContentLength;
-                    var resolvedResponseLength = responseLength.HasValue && responseLength.Value > 0
-                        ? responseLength.Value
-                        : totalBytesRead;
+                    request.Content = new ByteArrayContent(requestBody!);
+                    TryApplyBodyContentType(request.Content, resolvedBodyContentType);
+                }
 
-                    metadata = metadata with
+                HttpResponseMessage? response = null;
+
+                try
+                {
+                    response = await _client
+                        .SendAsync(
+                            request,
+                            HttpCompletionOption.ResponseHeadersRead,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+
+                    if (shouldUseOriginalMethod &&
+                        !methodFallbackUsed &&
+                        ShouldRetryWithGet(response.StatusCode))
                     {
-                        ResourceLength = totalBytesRead,
-                        ResponseContentLength = resolvedResponseLength
-                    };
+                        _logger.Warn(
+                            "Server rejected forwarded verb; retrying with GET.",
+                            eventCode: "DOWNLOAD_RANGE_METHOD_FALLBACK",
+                            context: new
+                            {
+                                Url = url.ToString(),
+                                OriginalMethod = normalizedMethod.Method,
+                                Status = (int)response.StatusCode
+                            });
+
+                        methodFallbackUsed = true;
+                        attemptMethod = HttpMethod.Get;
+                        continue;
+                    }
+
+                    if (response.StatusCode == HttpStatusCode.TooManyRequests)
+                    {
+                        var retryAfter = TryGetRetryAfter(response);
+                        var friendly429 = retryAfter.HasValue && retryAfter.Value > TimeSpan.Zero
+                            ? $"Server returned 429 Too Many Requests. Retrying in approximately {retryAfter.Value.TotalSeconds:0} seconds."
+                            : "Server returned 429 Too Many Requests. The server asked us to slow down.";
+
+                        var throttled = new HttpRequestException(
+                            friendly429,
+                            null,
+                            HttpStatusCode.TooManyRequests);
+
+                        if (retryAfter.HasValue && retryAfter.Value > TimeSpan.Zero)
+                        {
+                            throttled.Data[RetryAfterSecondsKey] = retryAfter.Value.TotalSeconds;
+                        }
+
+                        throw throttled;
+                    }
+
+                    response.EnsureSuccessStatusCode();
+
+                    var metadata = CreateDownloadResponseMetadata(response, from.HasValue || to.HasValue);
+
+                    var mediaType = response.Content.Headers.ContentType?.MediaType;
+                    using var responseStream = await response.Content
+                        .ReadAsStreamAsync(cancellationToken)
+                        .ConfigureAwait(false);
+
+                    var buffer = new byte[81_920];
+                    long totalBytesRead = 0;
+
+                    var firstRead = await responseStream
+                        .ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)
+                        .ConfigureAwait(false);
+
+                    var isHtmlResponse =
+                        mediaType is not null &&
+                        mediaType.StartsWith("text/html", StringComparison.OrdinalIgnoreCase) &&
+                        !url.AbsolutePath.EndsWith(".htm", StringComparison.OrdinalIgnoreCase) &&
+                        !url.AbsolutePath.EndsWith(".html", StringComparison.OrdinalIgnoreCase);
+
+                    if (firstRead > 0 && isHtmlResponse)
+                    {
+                        var snippetLength = Math.Min(firstRead, 4096);
+                        var snippet = Encoding.UTF8.GetString(buffer, 0, snippetLength);
+
+                        var isFullDownload = !from.HasValue && !to.HasValue;
+
+                        if (allowHtmlFallback && isFullDownload &&
+                            TryExtractDownloadUrlFromHtml(snippet, url, out var fallbackUrl) &&
+                            fallbackUrl is not null)
+                        {
+                            _logger.Info(
+                                "HTML fallback extracted a file URL from page.",
+                                eventCode: "DOWNLOAD_HTML_FALLBACK",
+                                context: new
+                                {
+                                    OriginalUrl = url.ToString(),
+                                    FallbackUrl = fallbackUrl.ToString()
+                                });
+
+                            responseStream.Dispose();
+                            response.Dispose();
+
+                            var fallbackMetadata = await DownloadRangeToStreamAsync(
+                                    fallbackUrl,
+                                    null,
+                                    null,
+                                    target,
+                                    progress,
+                                    cancellationToken,
+                                    allowHtmlFallback: false,
+                                    extraHeaders: extraHeaders,
+                                    requestMethod: requestMethod,
+                                    requestBody: null,
+                                    requestBodyContentType: null)
+                                .ConfigureAwait(false);
+
+                            return fallbackMetadata;
+                        }
+
+                        var safeSnippet = snippet.Length > 1000 ? snippet[..1000] : snippet;
+
+                        _logger.Error(
+                            "Server returned HTML instead of file.",
+                            eventCode: "DOWNLOAD_HTML_RESPONSE",
+                            context: new
+                            {
+                                Url = url.ToString(),
+                                Snippet = safeSnippet
+                            });
+
+                        var message =
+                            "Server returned an HTML page instead of the requested file. " +
+                            "This usually means the link requires login, a browser session, " +
+                            "or an extra confirmation step." + Environment.NewLine +
+                            "HTML snippet:" + Environment.NewLine +
+                            safeSnippet;
+
+                        var ex = new HttpRequestException(message);
+                        ex.Data["CustomErrorCode"] = DownloadErrorCode.HtmlResponse;
+                        throw ex;
+                    }
+
+                    if (firstRead > 0)
+                    {
+                        await target
+                            .WriteAsync(buffer.AsMemory(0, firstRead), cancellationToken)
+                            .ConfigureAwait(false);
+
+                        progress?.Report(firstRead);
+                        totalBytesRead += firstRead;
+                    }
+
+                    while (true)
+                    {
+                        var read = await responseStream
+                            .ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)
+                            .ConfigureAwait(false);
+
+                        if (read <= 0)
+                        {
+                            break;
+                        }
+
+                        await target
+                            .WriteAsync(buffer.AsMemory(0, read), cancellationToken)
+                            .ConfigureAwait(false);
+
+                        progress?.Report(read);
+                        totalBytesRead += read;
+                    }
+
+                    _logger.Info(
+                        "Completed range download",
+                        eventCode: "DOWNLOAD_RANGE_SUCCESS",
+                        context: ctx);
+
+                    if (!from.HasValue && !to.HasValue && totalBytesRead > 0)
+                    {
+                        if (!metadata.ResourceLength.HasValue || metadata.ResourceLength.Value <= 0)
+                        {
+                            var responseLength = metadata.ResponseContentLength;
+                            var resolvedResponseLength = responseLength.HasValue && responseLength.Value > 0
+                                ? responseLength.Value
+                                : totalBytesRead;
+
+                            metadata = metadata with
+                            {
+                                ResourceLength = totalBytesRead,
+                                ResponseContentLength = resolvedResponseLength
+                            };
+                        }
+                    }
+
+                    return metadata;
+                }
+                finally
+                {
+                    response?.Dispose();
                 }
             }
-
-            return metadata;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -643,6 +686,57 @@ public sealed class NetworkClient : INetworkClient
         }
     }
 
+    private static string? ResolveBodyContentType(
+        IReadOnlyDictionary<string, string>? headers,
+        string? explicitContentType)
+    {
+        if (!string.IsNullOrWhiteSpace(explicitContentType))
+        {
+            return explicitContentType.Trim();
+        }
+
+        if (headers is null)
+        {
+            return null;
+        }
+
+        foreach (var kvp in headers)
+        {
+            if (kvp.Key is null)
+            {
+                continue;
+            }
+
+            if (kvp.Key.Equals("Content-Type", StringComparison.OrdinalIgnoreCase))
+            {
+                return string.IsNullOrWhiteSpace(kvp.Value)
+                    ? null
+                    : kvp.Value.Trim();
+            }
+        }
+
+        return null;
+    }
+
+    private static void TryApplyBodyContentType(HttpContent content, string? contentType)
+    {
+        if (content is null || string.IsNullOrWhiteSpace(contentType))
+        {
+            return;
+        }
+
+        if (MediaTypeHeaderValue.TryParse(contentType, out var mediaType))
+        {
+            content.Headers.ContentType = mediaType;
+        }
+    }
+
+    private static bool ShouldRetryWithGet(HttpStatusCode statusCode)
+    {
+        return statusCode == HttpStatusCode.MethodNotAllowed ||
+               statusCode == HttpStatusCode.NotImplemented;
+    }
+
     private static TimeSpan? TryGetRetryAfter(HttpResponseMessage response)
     {
         if (response is null)
@@ -686,6 +780,7 @@ public sealed class NetworkClient : INetworkClient
         {
             return headerName.Equals("Host", StringComparison.OrdinalIgnoreCase) ||
                    headerName.Equals("Content-Length", StringComparison.OrdinalIgnoreCase) ||
+                   headerName.Equals("Content-Type", StringComparison.OrdinalIgnoreCase) ||
                    headerName.Equals("Range", StringComparison.OrdinalIgnoreCase) ||
                    headerName.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
                    headerName.Equals("Proxy-Connection", StringComparison.OrdinalIgnoreCase) ||
