@@ -314,6 +314,20 @@ public sealed class NetworkClient : INetworkClient
             eventCode: "DOWNLOAD_RANGE_START",
             context: ctx);
 
+        _logger.Info(
+            "Gofile debug: initializing range download.",
+            eventCode: "GOFILE_DEBUG_RANGE_START",
+            context: new
+            {
+                ctx.Url,
+                ctx.From,
+                ctx.To,
+                AllowHtmlFallback = allowHtmlFallback,
+                RequestMethod = requestMethod?.Method,
+                ExtraHeaderKeys = extraHeaders?.Keys?.ToArray(),
+                HasRequestBody = requestBody is { Length: > 0 }
+            });
+
         var normalizedMethod = NormalizeHttpMethod(requestMethod);
         var shouldUseOriginalMethod = !from.HasValue && !to.HasValue;
         var attemptMethod = shouldUseOriginalMethod ? normalizedMethod : HttpMethod.Get;
@@ -324,6 +338,11 @@ public sealed class NetworkClient : INetworkClient
 
         if (IsGofileLandingPage(url))
         {
+            _logger.Info(
+                "Detected Gofile landing page.",
+                eventCode: "GOFILE_DEBUG_LANDING_DETECTED",
+                context: new { Url = url.ToString() });
+
             var landingResolution = await TryResolveGofileDownloadUrlAsync(url, cancellationToken)
                 .ConfigureAwait(false);
 
@@ -331,21 +350,39 @@ public sealed class NetworkClient : INetworkClient
             {
                 _logger.Warn(
                     "Gofile landing page cannot be resolved automatically.",
+                    eventCode: "GOFILE_DEBUG_LANDING_RESOLVE_NULL",
+                    context: new { OriginalUrl = url.ToString() });
+
+                _logger.Warn(
+                    "Gofile landing page cannot be resolved automatically.",
                     eventCode: "GOFILE_LANDING_UNRESOLVED",
                     context: new { Url = url.ToString() });
             }
-            else if (!UriEquals(url, landingResolution))
+            else
             {
                 _logger.Info(
                     "Resolved Gofile landing page to a direct link.",
-                    eventCode: "GOFILE_LANDING_RESOLVED",
+                    eventCode: "GOFILE_DEBUG_LANDING_RESOLVED",
                     context: new
                     {
                         OriginalUrl = url.ToString(),
-                        ResolvedUrl = landingResolution.ToString()
+                        ResolvedUrl = landingResolution.ToString(),
+                        SameAsOriginal = UriEquals(url, landingResolution)
                     });
 
-                url = landingResolution;
+                if (!UriEquals(url, landingResolution))
+                {
+                    _logger.Info(
+                        "Resolved Gofile landing page to a direct link.",
+                        eventCode: "GOFILE_LANDING_RESOLVED",
+                        context: new
+                        {
+                            OriginalUrl = url.ToString(),
+                            ResolvedUrl = landingResolution.ToString()
+                        });
+
+                    url = landingResolution;
+                }
             }
         }
 
@@ -353,6 +390,20 @@ public sealed class NetworkClient : INetworkClient
         {
             while (true)
             {
+                _logger.Info(
+                    "Gofile debug: entering range download loop iteration.",
+                    eventCode: "GOFILE_DEBUG_RANGE_LOOP",
+                    context: new
+                    {
+                        CurrentUrl = url.ToString(),
+                        AttemptMethod = attemptMethod.Method,
+                        ShouldUseOriginalMethod = shouldUseOriginalMethod,
+                        MethodFallbackUsed = methodFallbackUsed,
+                        AllowHtmlFallback = allowHtmlFallback,
+                        GofileHtmlRetryUsed = gofileHtmlRetryUsed,
+                        GofileResolverRetryUsed = gofileResolverRetryUsed
+                    });
+
                 await EnsureGofileGuestTokenAsync(url, cancellationToken).ConfigureAwait(false);
 
                 using var request = new HttpRequestMessage(attemptMethod, url);
@@ -452,6 +503,8 @@ public sealed class NetworkClient : INetworkClient
                     if (firstRead > 0 && isHtmlResponse)
                     {
                         var responseUri = response.RequestMessage?.RequestUri ?? url;
+                        var isGofileResponseHost = IsGofileHost(responseUri);
+                        var isGofileLanding = IsGofileLandingPage(responseUri);
 
                         if (!gofileHtmlRetryUsed && IsGofileHost(responseUri))
                         {
@@ -475,13 +528,61 @@ public sealed class NetworkClient : INetworkClient
 
                         var isFullDownload = !from.HasValue && !to.HasValue;
 
+                        _logger.Info(
+                            "Gofile debug: received HTML response snippet.",
+                            eventCode: "GOFILE_DEBUG_HTML_RESPONSE",
+                            context: new
+                            {
+                                ResponseUri = responseUri.ToString(),
+                                IsGofileHost = isGofileResponseHost,
+                                IsGofileLanding = isGofileLanding,
+                                SnippetLength = snippet.Length,
+                                ContentType = response.Content.Headers.ContentType?.ToString()
+                            });
+
                         if (IsGofileHost(responseUri))
                         {
                             if (!gofileResolverRetryUsed)
                             {
+                                _logger.Info(
+                                    "Gofile debug: attempting HTML resolver direct resolution.",
+                                    eventCode: "GOFILE_DEBUG_HTML_RESOLVER_ATTEMPT",
+                                    context: new
+                                    {
+                                        Url = url.ToString(),
+                                        ResponseUri = responseUri.ToString(),
+                                        GofileResolverRetryUsed = gofileResolverRetryUsed
+                                    });
+
                                 gofileResolverRetryUsed = true;
+
                                 var resolvedFromHtml = await TryResolveGofileDownloadUrlAsync(responseUri, cancellationToken)
                                     .ConfigureAwait(false);
+
+                                if (resolvedFromHtml is null)
+                                {
+                                    _logger.Warn(
+                                        "Gofile debug: HTML resolver returned null.",
+                                        eventCode: "GOFILE_DEBUG_HTML_RESOLVER_NULL",
+                                        context: new
+                                        {
+                                            Url = url.ToString(),
+                                            ResponseUri = responseUri.ToString()
+                                        });
+                                }
+                                else
+                                {
+                                    _logger.Info(
+                                        "Gofile HTML response resolved via direct link.",
+                                        eventCode: "GOFILE_DEBUG_HTML_RESOLVER_RESOLVED",
+                                        context: new
+                                        {
+                                            OriginalUrl = url.ToString(),
+                                            ResponseUri = responseUri.ToString(),
+                                            ResolvedUrl = resolvedFromHtml.ToString(),
+                                            SameAsOriginal = UriEquals(url, resolvedFromHtml)
+                                        });
+                                }
 
                                 if (resolvedFromHtml is not null && !UriEquals(resolvedFromHtml, url))
                                 {
@@ -515,6 +616,17 @@ public sealed class NetworkClient : INetworkClient
                                 extraHeaders,
                                 request.Headers.Referrer);
 
+                            _logger.Info(
+                                "Gofile debug: invoking generic HTML resolvers.",
+                                eventCode: "GOFILE_DEBUG_GENERIC_HTML_RESOLVERS_START",
+                                context: new
+                                {
+                                    OriginalUrl = url.ToString(),
+                                    ResponseUri = responseUri.ToString(),
+                                    SnippetLength = snippet.Length,
+                                    HtmlResolversCount = _htmlResolvers.Count
+                                });
+
                             var (resolvedUrl, resolverName) = await TryResolveWithHtmlResolversAsync(
                                     resolverContext,
                                     cancellationToken)
@@ -522,6 +634,16 @@ public sealed class NetworkClient : INetworkClient
 
                             if (resolvedUrl is not null)
                             {
+                                _logger.Info(
+                                    "Gofile debug: generic HTML resolver succeeded.",
+                                    eventCode: "GOFILE_DEBUG_GENERIC_HTML_RESOLVER_SUCCESS",
+                                    context: new
+                                    {
+                                        OriginalUrl = url.ToString(),
+                                        ResolvedUrl = resolvedUrl.ToString(),
+                                        Resolver = resolverName
+                                    });
+
                                 _logger.Info(
                                     "HTML resolver provided a file URL.",
                                     eventCode: "DOWNLOAD_HTML_RESOLVER_SUCCESS",
@@ -550,6 +672,17 @@ public sealed class NetworkClient : INetworkClient
                                     .ConfigureAwait(false);
 
                                 return resolvedMetadata;
+                            }
+                            else
+                            {
+                                _logger.Info(
+                                    "Gofile debug: generic HTML resolver returned null.",
+                                    eventCode: "GOFILE_DEBUG_GENERIC_HTML_RESOLVER_NULL",
+                                    context: new
+                                    {
+                                        OriginalUrl = url.ToString(),
+                                        ResponseUri = responseUri.ToString()
+                                    });
                             }
                         }
 
@@ -779,12 +912,22 @@ public sealed class NetworkClient : INetworkClient
         return (null, null);
     }
 
-    private static HttpRequestException CreateHtmlResponseException(
+    private HttpRequestException CreateHtmlResponseException(
         Uri url,
         string snippet,
         bool requiresBrowser)
     {
         var safeSnippet = snippet ?? string.Empty;
+
+        _logger.Info(
+            "Gofile debug: constructing HTML response exception.",
+            eventCode: "GOFILE_DEBUG_HTML_EXCEPTION",
+            context: new
+            {
+                Url = url.ToString(),
+                RequiresBrowser = requiresBrowser,
+                SnippetPreview = safeSnippet.Length > 200 ? safeSnippet[..200] : safeSnippet
+            });
         var message = requiresBrowser
             ? "The server returned an HTML page that requires an interactive browser session. " +
               "Open this link in your browser to continue." + Environment.NewLine +
@@ -1183,8 +1326,17 @@ public sealed class NetworkClient : INetworkClient
 
     private async Task<string?> GetGofileGuestTokenValueAsync(Uri uri, CancellationToken cancellationToken)
     {
+        _logger.Info(
+            "Gofile debug: retrieving guest token value.",
+            eventCode: "GOFILE_DEBUG_GET_GUEST_TOKEN_START",
+            context: new { Uri = uri?.ToString() });
+
         if (uri is null)
         {
+            _logger.Info(
+                "Gofile debug: no URI provided for guest token lookup.",
+                eventCode: "GOFILE_DEBUG_GET_GUEST_TOKEN_RESULT",
+                context: new { HasToken = false, TokenLength = (int?)null, TokenSuffix = (string?)null });
             return null;
         }
 
@@ -1192,24 +1344,86 @@ public sealed class NetworkClient : INetworkClient
 
         if (!TryGetGofileCookieDomain(uri.Host, out var sharedHost) || string.IsNullOrEmpty(sharedHost))
         {
+            _logger.Info(
+                "Gofile debug: unable to resolve guest token host from URI.",
+                eventCode: "GOFILE_DEBUG_GET_GUEST_TOKEN_RESULT",
+                context: new { HasToken = false, TokenLength = (int?)null, TokenSuffix = (string?)null });
             return null;
         }
 
-        return TryGetCachedGofileToken(sharedHost, out var token)
-            ? token
+        var token = TryGetCachedGofileToken(sharedHost, out var cachedToken)
+            ? cachedToken
             : null;
+
+        _logger.Info(
+            "Gofile debug: guest token lookup complete.",
+            eventCode: "GOFILE_DEBUG_GET_GUEST_TOKEN_RESULT",
+            context: new
+            {
+                HasToken = token is not null,
+                TokenLength = token?.Length,
+                TokenSuffix = token is { Length: >= 4 } ? token[^4..] : null
+            });
+
+        return token;
     }
 
     private async Task<Uri?> TryResolveGofileDownloadUrlAsync(Uri uri, CancellationToken cancellationToken)
     {
-        if (_gofileResolver is null || uri is null || !IsGofileHost(uri))
+        _logger.Info(
+            "Gofile debug: starting direct download resolution.",
+            eventCode: "GOFILE_DEBUG_DIRECT_RESOLVE_START",
+            context: new
+            {
+                Url = uri?.ToString(),
+                IsGofileHost = uri is not null && IsGofileHost(uri)
+            });
+
+        if (_gofileResolver is null || uri is null)
         {
+            return null;
+        }
+
+        if (!IsGofileHost(uri))
+        {
+            _logger.Info(
+                "Gofile debug: URI is not a Gofile host; skipping direct resolve.",
+                eventCode: "GOFILE_DEBUG_DIRECT_RESOLVE_NOT_GOFILE",
+                context: new { Url = uri.ToString() });
             return null;
         }
 
         try
         {
-            return await _gofileResolver.ResolveDirectDownloadUrlAsync(uri, cancellationToken).ConfigureAwait(false);
+            _logger.Info(
+                "Gofile debug: invoking direct resolver.",
+                eventCode: "GOFILE_DEBUG_DIRECT_RESOLVE_CALL",
+                context: new { Url = uri.ToString() });
+
+            var resolved = await _gofileResolver.ResolveDirectDownloadUrlAsync(uri, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (resolved is null)
+            {
+                _logger.Info(
+                    "Gofile debug: direct resolver returned null.",
+                    eventCode: "GOFILE_DEBUG_DIRECT_RESOLVE_NULL",
+                    context: new { Url = uri.ToString() });
+            }
+            else
+            {
+                _logger.Info(
+                    "Gofile debug: direct resolver succeeded.",
+                    eventCode: "GOFILE_DEBUG_DIRECT_RESOLVE_SUCCESS",
+                    context: new
+                    {
+                        OriginalUrl = uri.ToString(),
+                        ResolvedUrl = resolved.ToString(),
+                        SameAsOriginal = UriEquals(uri, resolved)
+                    });
+            }
+
+            return resolved;
         }
         catch (OperationCanceledException)
         {
@@ -1221,7 +1435,11 @@ public sealed class NetworkClient : INetworkClient
                 "Gofile resolver failed to resolve direct link.",
                 eventCode: "GOFILE_DIRECT_RESOLVER_ERROR",
                 exception: ex,
-                context: new { Url = uri.ToString() });
+                context: new
+                {
+                    Url = uri.ToString(),
+                    ExceptionType = ex.GetType().FullName
+                });
             return null;
         }
     }
@@ -1238,6 +1456,10 @@ public sealed class NetworkClient : INetworkClient
 
         if (!TryGetGofileCookieDomain(uri.Host, out var sharedHost) || string.IsNullOrEmpty(sharedHost))
         {
+            _logger.Info(
+                "Gofile debug: unable to resolve cookie domain; skipping guest token ensure.",
+                eventCode: "GOFILE_DEBUG_COOKIE_DOMAIN_SKIP",
+                context: new { Host = uri.Host });
             return;
         }
 
@@ -1245,6 +1467,10 @@ public sealed class NetworkClient : INetworkClient
 
         if (!forceRefresh && TryGetCookieValue(scopeUri, "accountToken", out _))
         {
+            _logger.Info(
+                "Gofile debug: guest token cookie already present (pre-semaphore).",
+                eventCode: "GOFILE_DEBUG_GUEST_TOKEN_ALREADY_PRESENT",
+                context: new { Scope = scopeUri.ToString(), ForceRefresh = forceRefresh });
             return;
         }
 
@@ -1253,6 +1479,10 @@ public sealed class NetworkClient : INetworkClient
         {
             if (!forceRefresh && TryGetCookieValue(scopeUri, "accountToken", out _))
             {
+                _logger.Info(
+                    "Gofile debug: guest token cookie already present (post-semaphore).",
+                    eventCode: "GOFILE_DEBUG_GUEST_TOKEN_ALREADY_PRESENT",
+                    context: new { Scope = scopeUri.ToString(), ForceRefresh = forceRefresh });
                 return;
             }
 
@@ -1269,6 +1499,15 @@ public sealed class NetworkClient : INetworkClient
                 return;
             }
 
+            _logger.Info(
+                "Gofile debug: requesting new guest token from accounts endpoint.",
+                eventCode: "GOFILE_DEBUG_ACCOUNTS_REQUEST_START",
+                context: new
+                {
+                    SharedHost = sharedHost,
+                    Endpoint = GofileAccountsEndpoint.ToString()
+                });
+
             var mintedToken = await RequestGofileGuestTokenAsync(cancellationToken).ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(mintedToken))
             {
@@ -1277,12 +1516,23 @@ public sealed class NetworkClient : INetworkClient
 
             if (TryAddCookie(scopeUri, "accountToken", mintedToken, BuildCookieDomain(sharedHost)))
             {
+                var issuedAt = DateTimeOffset.UtcNow;
                 lock (SharedGofileTokenCache)
                 {
                     SharedGofileTokenCache[sharedHost] = new GofileGuestTokenState(
                         mintedToken,
-                        DateTimeOffset.UtcNow);
+                        issuedAt);
                 }
+
+                _logger.Info(
+                    "Gofile debug: cached guest token from accounts response.",
+                    eventCode: "GOFILE_DEBUG_ACCOUNTS_TOKEN_PARSED",
+                    context: new
+                    {
+                        TokenLength = mintedToken.Length,
+                        TokenSuffix = mintedToken.Length >= 4 ? mintedToken[^4..] : null,
+                        IssuedAt = issuedAt
+                    });
             }
         }
         finally
@@ -1303,6 +1553,15 @@ public sealed class NetworkClient : INetworkClient
             using var response = await _client
                 .SendAsync(request, cancellationToken)
                 .ConfigureAwait(false);
+
+            _logger.Info(
+                "Gofile debug: accounts endpoint responded.",
+                eventCode: "GOFILE_DEBUG_ACCOUNTS_RESPONSE",
+                context: new
+                {
+                    StatusCode = (int)response.StatusCode,
+                    IsSuccess = response.IsSuccessStatusCode
+                });
 
             response.EnsureSuccessStatusCode();
 
