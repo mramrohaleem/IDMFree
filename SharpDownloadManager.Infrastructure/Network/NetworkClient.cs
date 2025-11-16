@@ -34,6 +34,7 @@ public sealed class NetworkClient : INetworkClient
     private readonly CookieContainer? _cookieContainer;
     private readonly object _cookieSyncRoot;
     private readonly IReadOnlyList<IHtmlDownloadResolver> _htmlResolvers;
+    private readonly IGofileResolver _gofileResolver;
     private const string RetryAfterSecondsKey = "RetryAfterSeconds";
 
     private sealed record GofileGuestTokenState(string Token, DateTimeOffset IssuedAt);
@@ -112,15 +113,11 @@ public sealed class NetworkClient : INetworkClient
         client.DefaultRequestHeaders.AcceptLanguage.ParseAdd("en-US,en;q=0.9");
     }
 
-    private IEnumerable<IHtmlDownloadResolver> CreateDefaultHtmlResolvers()
-    {
-        yield return new GofileHtmlResolver(_client, _logger, GetGofileGuestTokenValueAsync);
-    }
-
     public NetworkClient(
         ILogger logger,
         HttpMessageHandler? messageHandler = null,
-        IEnumerable<IHtmlDownloadResolver>? htmlResolvers = null)
+        IEnumerable<IHtmlDownloadResolver>? htmlResolvers = null,
+        IGofileResolver? gofileResolver = null)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
@@ -145,7 +142,20 @@ public sealed class NetworkClient : INetworkClient
             }
         }
 
-        _htmlResolvers = (htmlResolvers ?? CreateDefaultHtmlResolvers())
+        _gofileResolver = gofileResolver ?? new GofileResolver(_client, _logger, GetGofileGuestTokenValueAsync);
+
+        var resolverList = new List<IHtmlDownloadResolver>();
+        if (_gofileResolver is IHtmlDownloadResolver gofileHtmlResolver)
+        {
+            resolverList.Add(gofileHtmlResolver);
+        }
+
+        if (htmlResolvers is not null)
+        {
+            resolverList.AddRange(htmlResolvers);
+        }
+
+        _htmlResolvers = resolverList
             .Where(static resolver => resolver is not null)
             .ToArray();
     }
@@ -310,6 +320,40 @@ public sealed class NetworkClient : INetworkClient
         var methodFallbackUsed = !shouldUseOriginalMethod || normalizedMethod == HttpMethod.Get;
         var resolvedBodyContentType = ResolveBodyContentType(extraHeaders, requestBodyContentType);
         var gofileHtmlRetryUsed = false;
+        var gofileResolverRetryUsed = false;
+
+        if (IsGofileLandingPage(url))
+        {
+            var landingResolution = await TryResolveGofileDownloadUrlAsync(url, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (landingResolution is null)
+            {
+                _logger.Warn(
+                    "Gofile landing page cannot be resolved automatically.",
+                    eventCode: "GOFILE_LANDING_UNRESOLVED",
+                    context: new { Url = url.ToString() });
+
+                throw CreateHtmlResponseException(
+                    url,
+                    "Gofile landing page requires an interactive browser session.",
+                    requiresBrowser: true);
+            }
+
+            if (!UriEquals(url, landingResolution))
+            {
+                _logger.Info(
+                    "Resolved Gofile landing page to a direct link.",
+                    eventCode: "GOFILE_LANDING_RESOLVED",
+                    context: new
+                    {
+                        OriginalUrl = url.ToString(),
+                        ResolvedUrl = landingResolution.ToString()
+                    });
+            }
+
+            url = landingResolution;
+        }
 
         try
         {
@@ -437,6 +481,43 @@ public sealed class NetworkClient : INetworkClient
 
                         var isFullDownload = !from.HasValue && !to.HasValue;
 
+                        if (IsGofileHost(responseUri))
+                        {
+                            if (!gofileResolverRetryUsed)
+                            {
+                                gofileResolverRetryUsed = true;
+                                var resolvedFromHtml = await TryResolveGofileDownloadUrlAsync(responseUri, cancellationToken)
+                                    .ConfigureAwait(false);
+
+                                if (resolvedFromHtml is not null && !UriEquals(resolvedFromHtml, url))
+                                {
+                                    _logger.Info(
+                                        "Gofile HTML response resolved via direct link.",
+                                        eventCode: "GOFILE_HTML_RESOLVED",
+                                        context: new
+                                        {
+                                            OriginalUrl = responseUri.ToString(),
+                                            ResolvedUrl = resolvedFromHtml.ToString()
+                                        });
+
+                                    responseStream.Dispose();
+                                    response.Dispose();
+                                    response = null;
+                                    url = resolvedFromHtml;
+                                    continue;
+                                }
+
+                                if (IsGofileLandingPage(responseUri))
+                                {
+                                    throw CreateHtmlResponseException(responseUri, snippet, requiresBrowser: true);
+                                }
+                            }
+                            else if (IsGofileLandingPage(responseUri))
+                            {
+                                throw CreateHtmlResponseException(responseUri, snippet, requiresBrowser: true);
+                            }
+                        }
+
                         if (allowHtmlFallback && isFullDownload)
                         {
                             var resolverContext = new HtmlDownloadResolverContext(
@@ -528,16 +609,7 @@ public sealed class NetworkClient : INetworkClient
                                 Snippet = safeSnippet
                             });
 
-                        var message =
-                            "Server returned an HTML page instead of the requested file. " +
-                            "This usually means the link requires login, a browser session, " +
-                            "or an extra confirmation step." + Environment.NewLine +
-                            "HTML snippet:" + Environment.NewLine +
-                            safeSnippet;
-
-                        var ex = new HttpRequestException(message);
-                        ex.Data["CustomErrorCode"] = DownloadErrorCode.HtmlResponse;
-                        throw ex;
+                        throw CreateHtmlResponseException(url, safeSnippet, requiresBrowser: false);
                     }
 
                     if (firstRead > 0)
@@ -717,6 +789,27 @@ public sealed class NetworkClient : INetworkClient
         }
 
         return (null, null);
+    }
+
+    private static HttpRequestException CreateHtmlResponseException(
+        Uri url,
+        string snippet,
+        bool requiresBrowser)
+    {
+        var safeSnippet = snippet ?? string.Empty;
+        var message = requiresBrowser
+            ? "The server returned an HTML page that requires an interactive browser session. " +
+              "Open this link in your browser to continue." + Environment.NewLine +
+              "HTML snippet:" + Environment.NewLine + safeSnippet
+            : "Server returned an HTML page instead of the requested file. " +
+              "This usually means the link requires login, JavaScript, or an extra confirmation step." +
+              Environment.NewLine + "HTML snippet:" + Environment.NewLine + safeSnippet;
+
+        var ex = new HttpRequestException(message);
+        ex.Data["CustomErrorCode"] = requiresBrowser
+            ? DownloadErrorCode.RequiresBrowser
+            : DownloadErrorCode.HtmlResponse;
+        return ex;
     }
 
     private static void ApplyCommonHeaders(
@@ -1119,6 +1212,32 @@ public sealed class NetworkClient : INetworkClient
             : null;
     }
 
+    private async Task<Uri?> TryResolveGofileDownloadUrlAsync(Uri uri, CancellationToken cancellationToken)
+    {
+        if (_gofileResolver is null || uri is null || !IsGofileHost(uri))
+        {
+            return null;
+        }
+
+        try
+        {
+            return await _gofileResolver.ResolveDirectDownloadUrlAsync(uri, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn(
+                "Gofile resolver failed to resolve direct link.",
+                eventCode: "GOFILE_DIRECT_RESOLVER_ERROR",
+                exception: ex,
+                context: new { Url = uri.ToString() });
+            return null;
+        }
+    }
+
     private async Task EnsureGofileGuestTokenAsync(
         Uri uri,
         CancellationToken cancellationToken,
@@ -1373,6 +1492,35 @@ public sealed class NetworkClient : INetworkClient
                TryGetGofileCookieDomain(uri.Host, out _);
     }
 
+    private static bool IsGofileLandingPage(Uri? uri)
+    {
+        if (!IsGofileHost(uri) || uri is null)
+        {
+            return false;
+        }
+
+        var segments = uri.AbsolutePath
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        return segments.Length >= 2 &&
+               segments[0].Equals("d", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool UriEquals(Uri? left, Uri? right)
+    {
+        if (left is null || right is null)
+        {
+            return false;
+        }
+
+        return Uri.Compare(
+                   left,
+                   right,
+                   UriComponents.HttpRequestUrl,
+                   UriFormat.SafeUnescaped,
+                   StringComparison.OrdinalIgnoreCase) == 0;
+    }
+
     private static Uri BuildCookieScopeUri(Uri requestUri, string? hostOverride = null)
     {
         if (requestUri is null)
@@ -1458,7 +1606,8 @@ public sealed class NetworkClient : INetworkClient
             acceptRangesHeader,
             response.Headers.TransferEncodingChunked == true,
             reportedSize,
-            sizeSource);
+            sizeSource,
+            response.RequestMessage?.RequestUri);
     }
 
     // HTML helper regexes for fallback download URL extraction

@@ -11,14 +11,14 @@ using SharpDownloadManager.Infrastructure.Network.Resolvers;
 
 namespace SharpDownloadManager.Infrastructure.Tests;
 
-public sealed class GofileHtmlResolverTests
+public sealed class GofileResolverTests
 {
     [Fact]
     public async Task TryResolveAsync_AttachesAuthorizationAndParsesLink()
     {
         var handler = new TestHandler();
         using var httpClient = new HttpClient(handler);
-        var resolver = new GofileHtmlResolver(
+        var resolver = new GofileResolver(
             httpClient,
             new TestLogger(),
             (_, _) => Task.FromResult<string?>("account-token"));

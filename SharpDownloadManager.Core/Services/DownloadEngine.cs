@@ -586,6 +586,7 @@ public class DownloadEngine : IDownloadEngine
             });
 
         var taskUri = session?.FinalUrl ?? new Uri(task.Url);
+        var taskUriLock = new object();
         var requestHttpMethod = ResolveHttpMethod(task.RequestMethod);
         var currentStage = "prepare";
 
@@ -1029,8 +1030,14 @@ public class DownloadEngine : IDownloadEngine
                     chunk.DownloadedBytes == 0 &&
                     task.RequestBody is { Length: > 0 };
 
+                Uri currentTaskUri;
+                lock (taskUriLock)
+                {
+                    currentTaskUri = taskUri;
+                }
+
                 var responseMetadata = await _networkClient.DownloadRangeToStreamAsync(
-                        taskUri,
+                        currentTaskUri,
                         from,
                         to,
                         fileStream,
@@ -1044,6 +1051,14 @@ public class DownloadEngine : IDownloadEngine
                     .ConfigureAwait(false);
 
                 TryUpdateTaskMetadataFromResponse(task, responseMetadata);
+
+                if (responseMetadata.FinalResponseUrl is Uri updatedUri)
+                {
+                    lock (taskUriLock)
+                    {
+                        taskUri = updatedUri;
+                    }
+                }
 
                 chunk.Status = ChunkStatus.Completed;
                 chunk.LastErrorCode = null;
@@ -1967,6 +1982,11 @@ public class DownloadEngine : IDownloadEngine
             }
 
             session.IsChunkedTransfer = metadata.IsChunkedTransfer;
+
+            if (metadata.FinalResponseUrl is not null)
+            {
+                session.FinalUrl = metadata.FinalResponseUrl;
+            }
 
             if (metadata.ReportedFileSize.HasValue && metadata.ReportedFileSize.Value > 0)
             {

@@ -46,6 +46,7 @@ public enum DownloadErrorCode
     StateStoreCorrupted,
     Unknown,
     HtmlResponse,
+    RequiresBrowser,
     ValidationMismatch,
     ZeroBytes
 }

@@ -335,11 +335,20 @@ public sealed class NetworkClientTests
         var servedHtml = false;
         var tokenRequestCount = 0;
 
+        var scriptUri = new Uri("https://gofile.io/dist/js/global.js");
         var handler = new RecordingHandler(request =>
         {
             if (request.RequestUri is null)
             {
                 throw new InvalidOperationException("Request URI must not be null.");
+            }
+
+            if (request.RequestUri == scriptUri)
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("appdata.wt=\"site-token\";", Encoding.UTF8, "application/javascript")
+                };
             }
 
             if (request.RequestUri.Host.Equals("api.gofile.io", StringComparison.OrdinalIgnoreCase))
@@ -425,11 +434,20 @@ public sealed class NetworkClientTests
         var servedHtml = false;
         var tokenRequestCount = 0;
 
+        var scriptUri = new Uri("https://gofile.io/dist/js/global.js");
         var handler = new RecordingHandler(request =>
         {
             if (request.RequestUri is null)
             {
                 throw new InvalidOperationException("Request URI must not be null.");
+            }
+
+            if (request.RequestUri == scriptUri)
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("appdata.wt=\"site-token\";", Encoding.UTF8, "application/javascript")
+                };
             }
 
             if (request.RequestUri.Host.Equals("api.gofile.io", StringComparison.OrdinalIgnoreCase))
@@ -495,6 +513,87 @@ public sealed class NetworkClientTests
             request.Uri.Host.Equals("api.gofile.io", StringComparison.OrdinalIgnoreCase) &&
             request.Uri.AbsolutePath.Contains("/contents/", StringComparison.OrdinalIgnoreCase));
         Assert.Contains(handler.Requests, request => request.Uri == resolvedUri);
+    }
+
+    [Fact]
+    public async Task DownloadRangeToStreamAsync_GofileLandingPage_ResolvesBeforeRequest()
+    {
+        var logger = new TestLogger();
+        var landingUri = new Uri("https://gofile.io/d/preflight-test");
+        var resolvedUri = new Uri("https://store-eu-par-1.gofile.io/download/web/preflight-test/file.bin");
+        var scriptUri = new Uri("https://gofile.io/dist/js/global.js");
+        var payload = Encoding.UTF8.GetBytes("direct-response");
+        var tokenRequestCount = 0;
+
+        var handler = new RecordingHandler(request =>
+        {
+            if (request.RequestUri is null)
+            {
+                throw new InvalidOperationException("Request URI must not be null.");
+            }
+
+            if (request.RequestUri == landingUri)
+            {
+                throw new InvalidOperationException("Landing page should not be requested directly.");
+            }
+
+            if (request.RequestUri == scriptUri)
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("appdata.wt=\"site-token\";", Encoding.UTF8, "application/javascript")
+                };
+            }
+
+            if (request.RequestUri.Host.Equals("api.gofile.io", StringComparison.OrdinalIgnoreCase))
+            {
+                if (request.RequestUri.AbsolutePath.Contains("/accounts", StringComparison.OrdinalIgnoreCase))
+                {
+                    tokenRequestCount++;
+                    var tokenPayload = $"{{\"data\":{{\"token\":\"guest-token-{tokenRequestCount}\"}}}}";
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent(tokenPayload, Encoding.UTF8, "application/json")
+                    };
+                }
+
+                if (request.RequestUri.AbsolutePath.Contains("/contents/", StringComparison.OrdinalIgnoreCase))
+                {
+                    var payloadJson = $"{{\"data\":{{\"link\":\"{resolvedUri}\"}}}}";
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent(payloadJson, Encoding.UTF8, "application/json")
+                    };
+                }
+            }
+
+            if (request.RequestUri == resolvedUri)
+            {
+                var response = new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new ByteArrayContent(payload)
+                };
+                response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+                return response;
+            }
+
+            throw new InvalidOperationException($"Unexpected request: {request.RequestUri}");
+        });
+
+        await using var destination = new MemoryStream();
+        var client = new NetworkClient(logger, handler);
+
+        var metadata = await client.DownloadRangeToStreamAsync(
+                landingUri,
+                null,
+                null,
+                destination)
+            .ConfigureAwait(false);
+
+        Assert.Equal("application/octet-stream", metadata.ContentType);
+        Assert.Equal(payload.Length, destination.Length);
+        Assert.Contains(handler.Requests, request => request.Uri == resolvedUri);
+        Assert.DoesNotContain(handler.Requests, request => request.Uri == landingUri);
     }
 
     [Fact]
