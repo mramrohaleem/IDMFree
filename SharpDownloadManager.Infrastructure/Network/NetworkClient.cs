@@ -15,6 +15,7 @@ using SharpDownloadManager.Core.Abstractions;
 using SharpDownloadManager.Core.Domain;
 using SharpDownloadManager.Core.Utilities;
 using SharpDownloadManager.Infrastructure.Logging;
+using SharpDownloadManager.Infrastructure.Network.Resolvers;
 
 namespace SharpDownloadManager.Infrastructure.Network;
 
@@ -32,6 +33,7 @@ public sealed class NetworkClient : INetworkClient
     private readonly HttpClient _client;
     private readonly CookieContainer? _cookieContainer;
     private readonly object _cookieSyncRoot;
+    private readonly IReadOnlyList<IHtmlDownloadResolver> _htmlResolvers;
     private const string RetryAfterSecondsKey = "RetryAfterSeconds";
 
     private sealed record GofileGuestTokenState(string Token, DateTimeOffset IssuedAt);
@@ -110,7 +112,15 @@ public sealed class NetworkClient : INetworkClient
         client.DefaultRequestHeaders.AcceptLanguage.ParseAdd("en-US,en;q=0.9");
     }
 
-    public NetworkClient(ILogger logger, HttpMessageHandler? messageHandler = null)
+    private IEnumerable<IHtmlDownloadResolver> CreateDefaultHtmlResolvers()
+    {
+        yield return new GofileHtmlResolver(_client, _logger, GetGofileGuestTokenValueAsync);
+    }
+
+    public NetworkClient(
+        ILogger logger,
+        HttpMessageHandler? messageHandler = null,
+        IEnumerable<IHtmlDownloadResolver>? htmlResolvers = null)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
@@ -134,6 +144,10 @@ public sealed class NetworkClient : INetworkClient
                 _cookieSyncRoot = new object();
             }
         }
+
+        _htmlResolvers = (htmlResolvers ?? CreateDefaultHtmlResolvers())
+            .Where(static resolver => resolver is not null)
+            .ToArray();
     }
 
     public async Task<HttpResourceInfo> ProbeAsync(
@@ -423,6 +437,53 @@ public sealed class NetworkClient : INetworkClient
 
                         var isFullDownload = !from.HasValue && !to.HasValue;
 
+                        if (allowHtmlFallback && isFullDownload)
+                        {
+                            var resolverContext = new HtmlDownloadResolverContext(
+                                url,
+                                responseUri,
+                                snippet,
+                                extraHeaders,
+                                request.Headers.Referrer);
+
+                            var (resolvedUrl, resolverName) = await TryResolveWithHtmlResolversAsync(
+                                    resolverContext,
+                                    cancellationToken)
+                                .ConfigureAwait(false);
+
+                            if (resolvedUrl is not null)
+                            {
+                                _logger.Info(
+                                    "HTML resolver provided a file URL.",
+                                    eventCode: "DOWNLOAD_HTML_RESOLVER_SUCCESS",
+                                    context: new
+                                    {
+                                        OriginalUrl = url.ToString(),
+                                        ResolvedUrl = resolvedUrl.ToString(),
+                                        Resolver = resolverName
+                                    });
+
+                                responseStream.Dispose();
+                                response.Dispose();
+
+                                var resolvedMetadata = await DownloadRangeToStreamAsync(
+                                        resolvedUrl,
+                                        null,
+                                        null,
+                                        target,
+                                        progress,
+                                        cancellationToken,
+                                        allowHtmlFallback: false,
+                                        extraHeaders: extraHeaders,
+                                        requestMethod: requestMethod,
+                                        requestBody: null,
+                                        requestBodyContentType: null)
+                                    .ConfigureAwait(false);
+
+                                return resolvedMetadata;
+                            }
+                        }
+
                         if (allowHtmlFallback && isFullDownload &&
                             TryExtractDownloadUrlFromHtml(snippet, url, out var fallbackUrl) &&
                             fallbackUrl is not null)
@@ -611,6 +672,51 @@ public sealed class NetworkClient : INetworkClient
 
             throw;
         }
+    }
+
+    private async Task<(Uri? ResolvedUrl, string? ResolverName)> TryResolveWithHtmlResolversAsync(
+        HtmlDownloadResolverContext context,
+        CancellationToken cancellationToken)
+    {
+        if (_htmlResolvers.Count == 0)
+        {
+            return (null, null);
+        }
+
+        foreach (var resolver in _htmlResolvers)
+        {
+            if (resolver is null)
+            {
+                continue;
+            }
+
+            try
+            {
+                var resolved = await resolver.TryResolveAsync(context, cancellationToken).ConfigureAwait(false);
+                if (resolved is not null)
+                {
+                    return (resolved, resolver.GetType().Name);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn(
+                    "HTML resolver failed.",
+                    eventCode: "DOWNLOAD_HTML_RESOLVER_ERROR",
+                    exception: ex,
+                    context: new
+                    {
+                        Resolver = resolver.GetType().FullName,
+                        Url = context.OriginalUrl.ToString()
+                    });
+            }
+        }
+
+        return (null, null);
     }
 
     private static void ApplyCommonHeaders(
@@ -992,6 +1098,25 @@ public sealed class NetworkClient : INetworkClient
         }
 
         return false;
+    }
+
+    private async Task<string?> GetGofileGuestTokenValueAsync(Uri uri, CancellationToken cancellationToken)
+    {
+        if (uri is null)
+        {
+            return null;
+        }
+
+        await EnsureGofileGuestTokenAsync(uri, cancellationToken).ConfigureAwait(false);
+
+        if (!TryGetGofileCookieDomain(uri.Host, out var sharedHost) || string.IsNullOrEmpty(sharedHost))
+        {
+            return null;
+        }
+
+        return TryGetCachedGofileToken(sharedHost, out var token)
+            ? token
+            : null;
     }
 
     private async Task EnsureGofileGuestTokenAsync(
