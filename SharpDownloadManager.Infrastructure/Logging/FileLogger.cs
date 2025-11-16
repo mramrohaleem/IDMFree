@@ -25,27 +25,42 @@ public sealed class FileLogger : ILogger
     public void Info(string message, Guid? downloadId = null, string? eventCode = null, object? context = null)
         => WriteLog("INFO", message, downloadId, eventCode, context: context);
 
-    public void Warn(string message, Guid? downloadId = null, string? eventCode = null, object? context = null)
-        => WriteLog("WARN", message, downloadId, eventCode, context: context);
+    public void Warn(
+        string message,
+        Guid? downloadId = null,
+        string? eventCode = null,
+        Exception? exception = null,
+        object? context = null)
+    {
+        var contextWithException = CombineContextWithException(context, exception);
+        WriteLog("WARN", message, downloadId, eventCode, context: contextWithException);
+    }
 
     public void Error(string message, Guid? downloadId = null, string? eventCode = null, Exception? exception = null, object? context = null)
-    {
-        object? combinedContext = context;
-        if (exception is not null)
-        {
-            var exceptionInfo = new
-            {
-                ExceptionType = exception.GetType().FullName,
-                exception.Message,
-                exception.StackTrace
-            };
+        => WriteLog(
+            "ERROR",
+            message,
+            downloadId,
+            eventCode,
+            context: CombineContextWithException(context, exception));
 
-            combinedContext = context is null
-                ? exceptionInfo
-                : new { Context = context, Exception = exceptionInfo };
+    private static object? CombineContextWithException(object? context, Exception? exception)
+    {
+        if (exception is null)
+        {
+            return context;
         }
 
-        WriteLog("ERROR", message, downloadId, eventCode, context: combinedContext);
+        var exceptionInfo = new
+        {
+            ExceptionType = exception.GetType().FullName,
+            exception.Message,
+            exception.StackTrace
+        };
+
+        return context is null
+            ? exceptionInfo
+            : new { Context = context, Exception = exceptionInfo };
     }
 
     private void WriteLog(string level, string message, Guid? downloadId, string? eventCode, object? context)
