@@ -585,7 +585,7 @@ public class DownloadEngine : IDownloadEngine
                 WasResumed = session?.WasResumed ?? false
             });
 
-        var taskUri = new Uri(task.Url);
+        var taskUri = session?.FinalUrl ?? new Uri(task.Url);
         var requestHttpMethod = ResolveHttpMethod(task.RequestMethod);
         var currentStage = "prepare";
 
