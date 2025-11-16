@@ -7,6 +7,7 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -22,12 +23,18 @@ public sealed class NetworkClient : INetworkClient
     private static readonly HttpClientHandler SharedHandler = CreateHandler();
     private static readonly HttpClient SharedClient = CreateClient(SharedHandler);
     private static readonly object SharedCookieLock = new();
+    private static readonly SemaphoreSlim GofileTokenSemaphore = new(1, 1);
+    private static readonly Dictionary<string, GofileGuestTokenState> SharedGofileTokenCache =
+        new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Uri GofileAccountsEndpoint = new("https://api.gofile.io/accounts");
 
     private readonly ILogger _logger;
     private readonly HttpClient _client;
     private readonly CookieContainer? _cookieContainer;
     private readonly object _cookieSyncRoot;
     private const string RetryAfterSecondsKey = "RetryAfterSeconds";
+
+    private sealed record GofileGuestTokenState(string Token, DateTimeOffset IssuedAt);
 
     private sealed class ProbeSnapshot
     {
@@ -116,9 +123,9 @@ public sealed class NetworkClient : INetworkClient
         else
         {
             _client = CreateClient(messageHandler);
-            if (messageHandler is HttpClientHandler httpHandler)
+            if (TryResolveCookieContainer(messageHandler, out var container))
             {
-                _cookieContainer = httpHandler.CookieContainer;
+                _cookieContainer = container;
                 _cookieSyncRoot = new object();
             }
             else
@@ -288,11 +295,14 @@ public sealed class NetworkClient : INetworkClient
         var attemptMethod = shouldUseOriginalMethod ? normalizedMethod : HttpMethod.Get;
         var methodFallbackUsed = !shouldUseOriginalMethod || normalizedMethod == HttpMethod.Get;
         var resolvedBodyContentType = ResolveBodyContentType(extraHeaders, requestBodyContentType);
+        var gofileHtmlRetryUsed = false;
 
         try
         {
             while (true)
             {
+                await EnsureGofileGuestTokenAsync(url, cancellationToken).ConfigureAwait(false);
+
                 using var request = new HttpRequestMessage(attemptMethod, url);
                 ApplyCommonHeaders(request, url, extraHeaders);
                 ApplyExtraHeaders(request, extraHeaders);
@@ -389,6 +399,25 @@ public sealed class NetworkClient : INetworkClient
 
                     if (firstRead > 0 && isHtmlResponse)
                     {
+                        var responseUri = response.RequestMessage?.RequestUri ?? url;
+
+                        if (!gofileHtmlRetryUsed && IsGofileHost(responseUri))
+                        {
+                            _logger.Warn(
+                                "Gofile host returned HTML; refreshing guest token.",
+                                eventCode: "GOFILE_HTML_RETRY",
+                                context: new { Url = responseUri.ToString() });
+
+                            responseStream.Dispose();
+                            response.Dispose();
+                            response = null;
+
+                            gofileHtmlRetryUsed = true;
+                            await EnsureGofileGuestTokenAsync(responseUri, cancellationToken, forceRefresh: true)
+                                .ConfigureAwait(false);
+                            continue;
+                        }
+
                         var snippetLength = Math.Min(firstRead, 4096);
                         var snippet = Encoding.UTF8.GetString(buffer, 0, snippetLength);
 
@@ -650,6 +679,27 @@ public sealed class NetworkClient : INetworkClient
         catch
         {
             // ignore invalid referrer
+        }
+    }
+
+    private static bool TryResolveCookieContainer(HttpMessageHandler handler, out CookieContainer? container)
+    {
+        container = null;
+
+        switch (handler)
+        {
+            case null:
+                return false;
+            case HttpClientHandler http when http.UseCookies:
+                container = http.CookieContainer;
+                return true;
+            case SocketsHttpHandler sockets when sockets.UseCookies:
+                container = sockets.CookieContainer;
+                return true;
+            case DelegatingHandler delegating when delegating.InnerHandler is not null:
+                return TryResolveCookieContainer(delegating.InnerHandler, out container);
+            default:
+                return false;
         }
     }
 
@@ -944,6 +994,196 @@ public sealed class NetworkClient : INetworkClient
         return false;
     }
 
+    private async Task EnsureGofileGuestTokenAsync(
+        Uri uri,
+        CancellationToken cancellationToken,
+        bool forceRefresh = false)
+    {
+        if (uri is null || _cookieContainer is null)
+        {
+            return;
+        }
+
+        if (!TryGetGofileCookieDomain(uri.Host, out var sharedHost) || string.IsNullOrEmpty(sharedHost))
+        {
+            return;
+        }
+
+        var scopeUri = BuildCookieScopeUri(uri, sharedHost);
+
+        if (!forceRefresh && TryGetCookieValue(scopeUri, "accountToken", out _))
+        {
+            return;
+        }
+
+        await GofileTokenSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (!forceRefresh && TryGetCookieValue(scopeUri, "accountToken", out _))
+            {
+                return;
+            }
+
+            if (forceRefresh)
+            {
+                lock (SharedGofileTokenCache)
+                {
+                    SharedGofileTokenCache.Remove(sharedHost);
+                }
+            }
+            else if (TryGetCachedGofileToken(sharedHost, out var cachedToken) &&
+                     TryAddCookie(scopeUri, "accountToken", cachedToken!, BuildCookieDomain(sharedHost)))
+            {
+                return;
+            }
+
+            var mintedToken = await RequestGofileGuestTokenAsync(cancellationToken).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(mintedToken))
+            {
+                return;
+            }
+
+            if (TryAddCookie(scopeUri, "accountToken", mintedToken, BuildCookieDomain(sharedHost)))
+            {
+                lock (SharedGofileTokenCache)
+                {
+                    SharedGofileTokenCache[sharedHost] = new GofileGuestTokenState(
+                        mintedToken,
+                        DateTimeOffset.UtcNow);
+                }
+            }
+        }
+        finally
+        {
+            GofileTokenSemaphore.Release();
+        }
+    }
+
+    private async Task<string?> RequestGofileGuestTokenAsync(CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, GofileAccountsEndpoint)
+        {
+            Content = new StringContent("{}", Encoding.UTF8, "application/json")
+        };
+
+        try
+        {
+            using var response = await _client
+                .SendAsync(request, cancellationToken)
+                .ConfigureAwait(false);
+
+            response.EnsureSuccessStatusCode();
+
+            var payload = await response.Content
+                .ReadAsStringAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            try
+            {
+                using var document = JsonDocument.Parse(payload);
+                if (document.RootElement.TryGetProperty("data", out var dataElement) &&
+                    dataElement.TryGetProperty("token", out var tokenElement))
+                {
+                    var token = tokenElement.GetString();
+                    if (!string.IsNullOrWhiteSpace(token))
+                    {
+                        return token;
+                    }
+                }
+            }
+            catch (JsonException ex)
+            {
+                _logger.Warn(
+                    "Failed to parse gofile guest token payload.",
+                    eventCode: "GOFILE_TOKEN_PARSE_FAILED",
+                    context: new { Message = ex.Message });
+            }
+
+            _logger.Warn(
+                "Gofile guest token response did not include a token.",
+                eventCode: "GOFILE_TOKEN_MISSING",
+                context: new { Response = payload });
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.Warn(
+                "Failed to request gofile guest token.",
+                eventCode: "GOFILE_TOKEN_REQUEST_FAILED",
+                context: new { Message = ex.Message });
+        }
+
+        return null;
+    }
+
+    private bool TryGetCookieValue(Uri targetUri, string cookieName, out string? value)
+    {
+        value = null;
+
+        if (_cookieContainer is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            lock (_cookieSyncRoot)
+            {
+                var cookies = _cookieContainer.GetCookies(targetUri);
+                foreach (Cookie cookie in cookies)
+                {
+                    if (cookie.Name.Equals(cookieName, StringComparison.OrdinalIgnoreCase) &&
+                        !string.IsNullOrEmpty(cookie.Value))
+                    {
+                        value = cookie.Value;
+                        return true;
+                    }
+                }
+            }
+        }
+        catch (CookieException ex)
+        {
+            _logger.Warn(
+                "Failed to read cookies for gofile token detection.",
+                eventCode: "GOFILE_COOKIE_READ_FAILED",
+                context: new { Uri = targetUri.ToString(), ex.Message });
+        }
+        catch (UriFormatException ex)
+        {
+            _logger.Warn(
+                "Failed to read cookies for gofile token detection.",
+                eventCode: "GOFILE_COOKIE_READ_FAILED",
+                context: new { Uri = targetUri.ToString(), ex.Message });
+        }
+
+        return false;
+    }
+
+    private static bool TryGetCachedGofileToken(string sharedHost, out string? token)
+    {
+        lock (SharedGofileTokenCache)
+        {
+            if (SharedGofileTokenCache.TryGetValue(sharedHost, out var state) &&
+                !string.IsNullOrWhiteSpace(state.Token))
+            {
+                token = state.Token;
+                return true;
+            }
+        }
+
+        token = null;
+        return false;
+    }
+
+    private static string BuildCookieDomain(string host)
+    {
+        if (string.IsNullOrEmpty(host))
+        {
+            return string.Empty;
+        }
+
+        return host.StartsWith(".", StringComparison.Ordinal) ? host : "." + host;
+    }
+
     private static IEnumerable<(string Name, string Value)> ParseCookieHeader(string cookieHeader)
     {
         if (string.IsNullOrWhiteSpace(cookieHeader))
@@ -999,6 +1239,13 @@ public sealed class NetworkClient : INetworkClient
 
         sharedHost = string.Empty;
         return false;
+    }
+
+    private static bool IsGofileHost(Uri? uri)
+    {
+        return uri is not null &&
+               !string.IsNullOrWhiteSpace(uri.Host) &&
+               TryGetGofileCookieDomain(uri.Host, out _);
     }
 
     private static Uri BuildCookieScopeUri(Uri requestUri, string? hostOverride = null)
@@ -1353,6 +1600,8 @@ public sealed class NetworkClient : INetworkClient
         CancellationToken cancellationToken,
         bool fallbackUsesRangeProbe)
     {
+        await EnsureGofileGuestTokenAsync(uri, cancellationToken).ConfigureAwait(false);
+
         using var request = new HttpRequestMessage(primaryMethod, uri);
         ApplyCommonHeaders(request, uri, extraHeaders);
         ApplyExtraHeaders(request, extraHeaders);
@@ -1372,6 +1621,8 @@ public sealed class NetworkClient : INetworkClient
             {
                 // Some servers reject HEAD but allow an alternate verb – retry with the fallback method.
                 response.Dispose();
+
+                await EnsureGofileGuestTokenAsync(uri, cancellationToken).ConfigureAwait(false);
 
                 using var fallbackRequest = new HttpRequestMessage(fallbackMethod, uri);
                 ApplyCommonHeaders(fallbackRequest, uri, extraHeaders);
@@ -1415,6 +1666,8 @@ public sealed class NetworkClient : INetworkClient
     {
         try
         {
+            await EnsureGofileGuestTokenAsync(uri, cancellationToken).ConfigureAwait(false);
+
             using var request = new HttpRequestMessage(HttpMethod.Get, uri);
             request.Headers.Range = new RangeHeaderValue(0, 0);
             ApplyCommonHeaders(request, uri, extraHeaders);

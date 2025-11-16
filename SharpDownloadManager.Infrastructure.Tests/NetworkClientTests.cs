@@ -6,6 +6,7 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
+using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 using SharpDownloadManager.Core.Abstractions;
@@ -250,6 +251,76 @@ public sealed class NetworkClientTests
         Assert.Null(handler.Requests[1].Body);
     }
 
+    [Fact]
+    public async Task DownloadRangeToStreamAsync_GofileHost_MintsGuestTokenAndCachesAcrossClients()
+    {
+        await using var server = await GofileLikeTestServer.StartAsync().ConfigureAwait(false);
+        server.RespondWithHtmlOnInvalidToken = true;
+        server.ClearAllowedTokens();
+
+        var apiState = new GofileApiStubState(new[] { true });
+        var downloadUri = new Uri($"http://store-eu-par-1.gofile.io:{server.Port}/file");
+
+        await using var firstDestination = new MemoryStream();
+        var (firstClient, firstApiHandler, firstTransport) = CreateGofileClient(server, apiState);
+        var firstMetadata = await firstClient.DownloadRangeToStreamAsync(
+                downloadUri,
+                null,
+                null,
+                firstDestination)
+            .ConfigureAwait(false);
+
+        Assert.Equal("application/octet-stream", firstMetadata.ContentType);
+        Assert.True(firstDestination.Length > 0);
+        Assert.Equal(1, apiState.RequestCount);
+
+        firstApiHandler.Dispose();
+        firstTransport.Dispose();
+
+        await using var secondDestination = new MemoryStream();
+        var (secondClient, secondApiHandler, secondTransport) = CreateGofileClient(server, apiState);
+        var secondMetadata = await secondClient.DownloadRangeToStreamAsync(
+                downloadUri,
+                null,
+                null,
+                secondDestination)
+            .ConfigureAwait(false);
+
+        Assert.Equal("application/octet-stream", secondMetadata.ContentType);
+        Assert.True(secondDestination.Length > 0);
+        Assert.Equal(1, apiState.RequestCount);
+
+        secondApiHandler.Dispose();
+        secondTransport.Dispose();
+    }
+
+    [Fact]
+    public async Task DownloadRangeToStreamAsync_GofileHost_RetriesHtmlResponseWithFreshToken()
+    {
+        await using var server = await GofileLikeTestServer.StartAsync().ConfigureAwait(false);
+        server.RespondWithHtmlOnInvalidToken = true;
+        server.ClearAllowedTokens();
+
+        var apiState = new GofileApiStubState(new[] { false, true });
+        var downloadUri = new Uri($"http://store-eu-par-1.gofile.io:{server.Port}/file");
+
+        await using var destination = new MemoryStream();
+        var (client, apiHandler, transport) = CreateGofileClient(server, apiState);
+        var metadata = await client.DownloadRangeToStreamAsync(
+                downloadUri,
+                null,
+                null,
+                destination)
+            .ConfigureAwait(false);
+
+        Assert.Equal("application/octet-stream", metadata.ContentType);
+        Assert.True(destination.Length > 0);
+        Assert.Equal(2, apiState.RequestCount);
+
+        apiHandler.Dispose();
+        transport.Dispose();
+    }
+
     private sealed class RecordingHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, HttpResponseMessage> _responder;
@@ -285,6 +356,97 @@ public sealed class NetworkClientTests
                 request.Method.Method,
                 body,
                 request.Content?.Headers.ContentType?.ToString());
+        }
+    }
+
+    private static (NetworkClient Client, FakeGofileApiHandler ApiHandler, SocketsHttpHandler TransportHandler) CreateGofileClient(
+        GofileLikeTestServer server,
+        GofileApiStubState apiState)
+    {
+        var transport = CreateLoopbackHandler(server);
+        var apiHandler = new FakeGofileApiHandler(server, apiState)
+        {
+            InnerHandler = transport
+        };
+        var logger = new TestLogger();
+        var client = new NetworkClient(logger, apiHandler);
+        return (client, apiHandler, transport);
+    }
+
+    private static SocketsHttpHandler CreateLoopbackHandler(GofileLikeTestServer server)
+    {
+        return new SocketsHttpHandler
+        {
+            AllowAutoRedirect = true,
+            AutomaticDecompression = DecompressionMethods.None,
+            UseCookies = true,
+            CookieContainer = new CookieContainer(),
+            ConnectCallback = async (context, token) =>
+            {
+                var socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
+                var endPoint = new IPEndPoint(IPAddress.Loopback, server.Port);
+                await socket.ConnectAsync(endPoint, token).ConfigureAwait(false);
+                return new NetworkStream(socket, ownsSocket: true);
+            }
+        };
+    }
+
+    private sealed class GofileApiStubState
+    {
+        private readonly Queue<bool> _acceptancePlan;
+
+        public GofileApiStubState(IEnumerable<bool>? acceptancePlan)
+        {
+            _acceptancePlan = acceptancePlan is null
+                ? new Queue<bool>()
+                : new Queue<bool>(acceptancePlan);
+        }
+
+        public int RequestCount { get; set; }
+
+        public bool ShouldAcceptNextToken()
+        {
+            if (_acceptancePlan.Count == 0)
+            {
+                return true;
+            }
+
+            return _acceptancePlan.Dequeue();
+        }
+    }
+
+    private sealed class FakeGofileApiHandler : DelegatingHandler
+    {
+        private readonly GofileLikeTestServer _server;
+        private readonly GofileApiStubState _state;
+
+        public FakeGofileApiHandler(GofileLikeTestServer server, GofileApiStubState state)
+        {
+            _server = server;
+            _state = state;
+        }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            if (request.RequestUri?.Host.Equals("api.gofile.io", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                _state.RequestCount++;
+                var token = $"guest-token-{_state.RequestCount}";
+                if (_state.ShouldAcceptNextToken())
+                {
+                    _server.AllowToken(token);
+                }
+
+                var payload = $"{{\"status\":\"ok\",\"data\":{{\"token\":\"{token}\"}}}}";
+                var response = new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(payload, Encoding.UTF8, "application/json")
+                };
+
+                return Task.FromResult(response);
+            }
+
+            return base.SendAsync(request, cancellationToken);
         }
     }
 }
