@@ -52,7 +52,8 @@ const STREAMING_EXTENSION_HINTS = new Set([".m3u8", ".mpd", ".ism", ".ts"]);
 let settings = { ...DEFAULT_SETTINGS };
 
 const requestContexts = new Map();
-const recentRequestsByUrl = new Map();
+const recentRequests = new Map();
+const recentRequestCorrelationIndex = new Map();
 const fallbackHosts = new Map();
 const clickHints = new Map();
 
@@ -997,20 +998,115 @@ function evaluateResponseForDownload(details) {
   return { shouldIntercept: false };
 }
 
-function rememberRecentRequest(context) {
-  if (!context || !context.url) {
+function getRecentRequestKeyForContext(context) {
+  if (!context) {
+    return null;
+  }
+  if (context.id != null) {
+    return `request:${context.id}`;
+  }
+  const correlationId = context.correlationId || context.fromClick?.correlationId;
+  if (correlationId) {
+    return `correlation:${correlationId}`;
+  }
+  if (context.url) {
+    return `url:${context.url}`;
+  }
+  return null;
+}
+
+function deleteRecentRequestEntry(key, entry) {
+  recentRequests.delete(key);
+  const correlationId = entry?.correlationId;
+  if (!correlationId) {
     return;
   }
-  recentRequestsByUrl.set(context.url, {
+  const mappedKey = recentRequestCorrelationIndex.get(correlationId);
+  if (mappedKey === key) {
+    recentRequestCorrelationIndex.delete(correlationId);
+  }
+}
+
+function pruneRecentRequests() {
+  const threshold = now() - CONTEXT_TTL_MS;
+  for (const [key, entry] of Array.from(recentRequests.entries())) {
+    if (!entry.timestamp || entry.timestamp < threshold) {
+      deleteRecentRequestEntry(key, entry);
+    }
+  }
+  while (recentRequests.size > MAX_CONTEXT_ENTRIES) {
+    const next = recentRequests.entries().next().value;
+    if (!next) {
+      break;
+    }
+    const [oldestKey, oldestEntry] = next;
+    deleteRecentRequestEntry(oldestKey, oldestEntry);
+  }
+}
+
+function rememberRecentRequest(context) {
+  const key = getRecentRequestKeyForContext(context);
+  if (!key) {
+    return;
+  }
+  const existing = recentRequests.get(key);
+  const correlationId =
+    context.correlationId || context.fromClick?.correlationId || existing?.correlationId || null;
+  const entry = {
+    key,
     url: context.url,
     method: context.method,
-    requestHeaders: context.requestHeaders,
+    requestHeaders: context.requestHeaders || [],
     timestamp: now(),
-    correlationId: context.correlationId || context.fromClick?.correlationId || null,
+    correlationId,
     initiator: context.initiator || null,
-    delegated: Boolean(context.delegated),
-  });
-  pruneMap(recentRequestsByUrl, CONTEXT_TTL_MS);
+    delegated: context.delegated ? true : Boolean(existing?.delegated),
+  };
+  recentRequests.set(key, entry);
+  if (correlationId) {
+    recentRequestCorrelationIndex.set(correlationId, key);
+  }
+  pruneRecentRequests();
+}
+
+function getRecentRequestByCorrelationId(correlationId) {
+  if (!correlationId) {
+    return null;
+  }
+  const key = recentRequestCorrelationIndex.get(correlationId);
+  if (!key) {
+    return null;
+  }
+  const entry = recentRequests.get(key);
+  if (!entry) {
+    recentRequestCorrelationIndex.delete(correlationId);
+    return null;
+  }
+  return entry;
+}
+
+function findRecentRequestByUrl(url) {
+  if (!url) {
+    return null;
+  }
+  let candidate = null;
+  for (const entry of recentRequests.values()) {
+    if (entry.url !== url) {
+      continue;
+    }
+    if (!candidate) {
+      candidate = entry;
+      continue;
+    }
+    if (entry.delegated && !candidate.delegated) {
+      candidate = entry;
+      continue;
+    }
+    if (entry.delegated === candidate.delegated && entry.timestamp > candidate.timestamp) {
+      candidate = entry;
+    }
+  }
+  return candidate;
 }
 
 function cleanupRequestContext(requestId) {
@@ -1293,8 +1389,14 @@ async function handleDownloadsApiCreated(item) {
     return;
   }
 
-  const cached = recentRequestsByUrl.get(item.url) || null;
-  const correlationId = cached?.correlationId || generateCorrelationId();
+  const tabId = item.tabId ?? -1;
+  const clickHint = readClickHint(tabId, item.url);
+  const hintCorrelationId = clickHint?.correlationId || null;
+  let cached = hintCorrelationId ? getRecentRequestByCorrelationId(hintCorrelationId) : null;
+  if (!cached) {
+    cached = findRecentRequestByUrl(item.url);
+  }
+  const correlationId = hintCorrelationId || cached?.correlationId || generateCorrelationId();
 
   if (cached?.delegated) {
     logEvent("BG: downloads.onCreated ignored", {
