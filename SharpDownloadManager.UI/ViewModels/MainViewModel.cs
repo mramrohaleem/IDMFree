@@ -643,6 +643,8 @@ public class MainViewModel : INotifyPropertyChanged
             IReadOnlyDictionary<string, string>? requestHeaders = null,
             string? requestMethod = null,
             string? correlationId = null,
+            byte[]? requestBody = null,
+            string? requestBodyContentType = null,
             CancellationToken cancellationToken = default)
         {
             var resolvedFileName = string.IsNullOrWhiteSpace(suggestedFileName)
@@ -663,7 +665,9 @@ public class MainViewModel : INotifyPropertyChanged
                 RequestHeaders = requestHeaders,
                 RequestMethod = string.IsNullOrWhiteSpace(requestMethod)
                     ? HttpMethod.Get.Method
-                    : requestMethod
+                    : requestMethod,
+                RequestBody = requestBody,
+                RequestBodyContentType = requestBodyContentType
             };
             _tasks.Add(task);
             return Task.FromResult(task);
