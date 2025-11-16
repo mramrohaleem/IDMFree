@@ -18,6 +18,7 @@ namespace SharpDownloadManager.UI.Services;
 /// </summary>
 public sealed class BrowserBridgeServer : IDisposable
 {
+    private static readonly TimeSpan RequestIdleTimeout = TimeSpan.FromMinutes(2);
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         PropertyNameCaseInsensitive = true,
@@ -360,74 +361,26 @@ public sealed class BrowserBridgeServer : IDisposable
                     PayloadLength = rawBody?.Length
                 });
 
-            var result = await _coordinator
-                .HandleAsync(payload, cancellationToken)
-                .ConfigureAwait(false);
+            _ = ProcessDownloadRequestAsync(payload, correlationId, remoteEndpoint, cancellationToken);
 
-            response.StatusCode = (int)result.StatusCode;
-
-            if (result.Success && result.Task is not null)
-            {
-                await WriteJsonAsync(
-                        response,
-                        new
-                        {
-                            handled = result.Handled,
-                            status = result.Status,
-                            id = result.Task.Id,
-                            statusCode = (int)result.StatusCode,
-                            correlationId
-                        },
-                        cancellationToken)
-                    .ConfigureAwait(false);
-
-                _logger.Info(
-                    "Browser API download queued.",
-                    eventCode: "BROWSER_API_DOWNLOAD_QUEUED",
-                    downloadId: result.Task.Id,
-                    context: new { payload.Url, CorrelationId = correlationId });
-                return;
-            }
-
-            if (result.UserDeclined)
-            {
-                await WriteJsonAsync(
-                        response,
-                        new
-                        {
-                            handled = result.Handled,
-                            status = result.Status,
-                            error = result.Error ?? "User declined the download.",
-                            statusCode = (int)result.StatusCode,
-                            correlationId
-                        },
-                        cancellationToken)
-                    .ConfigureAwait(false);
-
-                _logger.Info(
-                    "Browser download request declined by user.",
-                    eventCode: "BROWSER_API_DOWNLOAD_DECLINED",
-                    context: new { payload.Url, CorrelationId = correlationId });
-                return;
-            }
-
+            response.StatusCode = (int)HttpStatusCode.Accepted;
             await WriteJsonAsync(
                     response,
                     new
                     {
-                        handled = result.Handled,
-                        status = result.Status,
-                        error = result.Error ?? "Failed to process download request.",
-                        statusCode = (int)result.StatusCode,
+                        handled = true,
+                        status = "pending",
+                        statusCode = (int)HttpStatusCode.Accepted,
                         correlationId
                     },
                     cancellationToken)
                 .ConfigureAwait(false);
 
-            _logger.Error(
-                "Failed to process browser download request.",
-                eventCode: "BROWSER_API_DOWNLOAD_FAILED",
-                context: new { payload.Url, result.Error, Status = (int)result.StatusCode, CorrelationId = correlationId });
+            _logger.Info(
+                "Browser API download request acknowledged and pending user confirmation.",
+                eventCode: "BROWSER_API_REQUEST_PENDING",
+                context: new { payload.Url, CorrelationId = correlationId, RemoteEndpoint = remoteEndpoint });
+            return;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -455,6 +408,87 @@ public sealed class BrowserBridgeServer : IDisposable
         var buffer = Encoding.UTF8.GetBytes(json);
         response.ContentLength64 = buffer.Length;
         await response.OutputStream.WriteAsync(buffer.AsMemory(0, buffer.Length), cancellationToken).ConfigureAwait(false);
+    }
+
+    private Task ProcessDownloadRequestAsync(
+        BrowserDownloadRequest payload,
+        string? correlationId,
+        string? remoteEndpoint,
+        CancellationToken cancellationToken)
+    {
+        return Task.Run(async () =>
+        {
+            using var idleCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            idleCts.CancelAfter(RequestIdleTimeout);
+            var linkedToken = idleCts.Token;
+
+            try
+            {
+                var result = await _coordinator
+                    .HandleAsync(payload, linkedToken)
+                    .ConfigureAwait(false);
+
+                if (result.Success && result.Task is not null)
+                {
+                    _logger.Info(
+                        "Browser API download queued after pending acknowledgement.",
+                        eventCode: "BROWSER_API_DOWNLOAD_ENQUEUED",
+                        downloadId: result.Task.Id,
+                        context: new { payload.Url, CorrelationId = correlationId, RemoteEndpoint = remoteEndpoint });
+                    return;
+                }
+
+                if (result.UserDeclined)
+                {
+                    _logger.Info(
+                        "Browser download request declined by user after acknowledgement.",
+                        eventCode: "BROWSER_API_DOWNLOAD_DECLINED_POST_ACK",
+                        context: new { payload.Url, CorrelationId = correlationId, RemoteEndpoint = remoteEndpoint });
+                    return;
+                }
+
+                _logger.Warn(
+                    "Browser download request failed after acknowledgement.",
+                    eventCode: "BROWSER_API_DOWNLOAD_FAILED_POST_ACK",
+                    context: new
+                    {
+                        payload.Url,
+                        Status = (int)result.StatusCode,
+                        result.Error,
+                        CorrelationId = correlationId,
+                        RemoteEndpoint = remoteEndpoint
+                    });
+            }
+            catch (OperationCanceledException ex) when (idleCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                _logger.Warn(
+                    "Browser download request timed out waiting for user confirmation.",
+                    eventCode: "BROWSER_API_DOWNLOAD_IDLE_TIMEOUT",
+                    context: new
+                    {
+                        payload.Url,
+                        TimeoutMs = RequestIdleTimeout.TotalMilliseconds,
+                        CorrelationId = correlationId,
+                        RemoteEndpoint = remoteEndpoint,
+                        ex.Message
+                    });
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.Info(
+                    "Browser download request canceled due to shutdown.",
+                    eventCode: "BROWSER_API_DOWNLOAD_CANCELED",
+                    context: new { payload.Url, CorrelationId = correlationId, RemoteEndpoint = remoteEndpoint });
+            }
+            catch (Exception ex)
+            {
+                _logger.Error(
+                    "Unhandled error while processing browser download request post acknowledgement.",
+                    eventCode: "BROWSER_API_DOWNLOAD_POST_ACK_ERROR",
+                    exception: ex,
+                    context: new { payload.Url, CorrelationId = correlationId, RemoteEndpoint = remoteEndpoint });
+            }
+        }, CancellationToken.None);
     }
 
     public void Dispose()
