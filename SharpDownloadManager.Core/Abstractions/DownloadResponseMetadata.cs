@@ -15,4 +15,5 @@ public sealed record DownloadResponseMetadata(
     string? AcceptRangesHeader,
     bool IsChunkedTransfer,
     long? ReportedFileSize,
-    string FileSizeSource);
+    string FileSizeSource,
+    Uri? FinalResponseUrl);

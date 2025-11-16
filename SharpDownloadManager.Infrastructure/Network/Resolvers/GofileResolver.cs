@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -11,7 +12,7 @@ using SharpDownloadManager.Infrastructure.Logging;
 
 namespace SharpDownloadManager.Infrastructure.Network.Resolvers;
 
-internal sealed class GofileHtmlResolver : IHtmlDownloadResolver
+internal sealed class GofileResolver : IGofileResolver, IHtmlDownloadResolver
 {
     private static readonly Uri GofileContentsRoot = new("https://api.gofile.io/contents/");
     private static readonly Uri GofileWebsiteScript = new("https://gofile.io/dist/js/global.js");
@@ -32,7 +33,7 @@ internal sealed class GofileHtmlResolver : IHtmlDownloadResolver
     private readonly SemaphoreSlim _websiteTokenSemaphore = new(1, 1);
     private string? _cachedWebsiteToken;
 
-    public GofileHtmlResolver(
+    public GofileResolver(
         HttpClient client,
         ILogger logger,
         Func<Uri, CancellationToken, Task<string?>> tokenAccessor)
@@ -40,6 +41,26 @@ internal sealed class GofileHtmlResolver : IHtmlDownloadResolver
         _client = client ?? throw new ArgumentNullException(nameof(client));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _tokenAccessor = tokenAccessor ?? throw new ArgumentNullException(nameof(tokenAccessor));
+    }
+
+    public async Task<Uri?> ResolveDirectDownloadUrlAsync(Uri initialUrl, CancellationToken cancellationToken)
+    {
+        if (initialUrl is null)
+        {
+            throw new ArgumentNullException(nameof(initialUrl));
+        }
+
+        if (!IsGofileHost(initialUrl))
+        {
+            return null;
+        }
+
+        var referer = BuildDefaultReferer(initialUrl);
+        return await ResolveFromCandidatesAsync(
+                new[] { initialUrl },
+                referer,
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public async Task<Uri?> TryResolveAsync(HtmlDownloadResolverContext context, CancellationToken cancellationToken)
@@ -54,16 +75,30 @@ internal sealed class GofileHtmlResolver : IHtmlDownloadResolver
             return null;
         }
 
-        var contentId = TryExtractContentId(context.ResponseUrl) ??
-                        TryExtractContentId(context.Referer) ??
-                        TryExtractContentId(context.OriginalUrl);
+        return await ResolveFromCandidatesAsync(
+                new[] { context.ResponseUrl, context.Referer, context.OriginalUrl },
+                context.Referer,
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
 
+    private async Task<Uri?> ResolveFromCandidatesAsync(
+        IReadOnlyList<Uri?> candidates,
+        Uri? referer,
+        CancellationToken cancellationToken)
+    {
+        if (candidates is null || candidates.Count == 0)
+        {
+            return null;
+        }
+
+        var contentId = TryExtractContentId(candidates);
         if (string.IsNullOrWhiteSpace(contentId))
         {
             return null;
         }
 
-        var tokenSource = context.ResponseUrl ?? context.OriginalUrl;
+        var tokenSource = candidates.FirstOrDefault(uri => uri is not null);
         if (tokenSource is null)
         {
             return null;
@@ -85,10 +120,7 @@ internal sealed class GofileHtmlResolver : IHtmlDownloadResolver
         using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
         request.Headers.Accept.ParseAdd("application/json");
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accountToken);
-        if (context.Referer is not null)
-        {
-            request.Headers.Referrer = context.Referer;
-        }
+        request.Headers.Referrer = referer ?? BuildDefaultReferer(tokenSource);
 
         try
         {
@@ -107,7 +139,7 @@ internal sealed class GofileHtmlResolver : IHtmlDownloadResolver
                 "Gofile resolver failed to contact contents API.",
                 eventCode: "GOFILE_HTML_RESOLVER_HTTP",
                 exception: ex,
-                context: new { Url = context.OriginalUrl.ToString() });
+                context: new { Url = tokenSource.ToString() });
         }
         catch (TaskCanceledException)
         {
@@ -119,10 +151,50 @@ internal sealed class GofileHtmlResolver : IHtmlDownloadResolver
                 "Gofile resolver encountered an unexpected error.",
                 eventCode: "GOFILE_HTML_RESOLVER_UNKNOWN",
                 exception: ex,
-                context: new { Url = context.OriginalUrl.ToString() });
+                context: new { Url = tokenSource.ToString() });
         }
 
         return null;
+    }
+
+    private static string? TryExtractContentId(IReadOnlyList<Uri?> candidates)
+    {
+        if (candidates is null)
+        {
+            return null;
+        }
+
+        foreach (var candidate in candidates)
+        {
+            var contentId = TryExtractContentId(candidate);
+            if (!string.IsNullOrWhiteSpace(contentId))
+            {
+                return contentId;
+            }
+        }
+
+        return null;
+    }
+
+    private static Uri? BuildDefaultReferer(Uri? candidate)
+    {
+        if (candidate is null)
+        {
+            return null;
+        }
+
+        var contentId = TryExtractContentId(candidate);
+        if (!string.IsNullOrWhiteSpace(contentId))
+        {
+            return new Uri($"https://gofile.io/d/{contentId}");
+        }
+
+        if (candidate.Host.EndsWith("gofile.io", StringComparison.OrdinalIgnoreCase))
+        {
+            return new Uri($"https://{candidate.Host}/");
+        }
+
+        return new Uri("https://gofile.io/");
     }
 
     private static bool IsGofileContext(HtmlDownloadResolverContext context)
