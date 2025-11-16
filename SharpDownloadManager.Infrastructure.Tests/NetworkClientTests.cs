@@ -549,6 +549,53 @@ public sealed class NetworkClientTests
         Assert.Contains(handler.Requests, request => request.Uri == resolvedUri);
     }
 
+    [Fact]
+    public async Task DownloadRangeToStreamAsync_HtmlFallback_AllowsExtensionlessLinks()
+    {
+        var logger = new TestLogger();
+        var landingUri = new Uri("https://sharehost.test/page");
+        var binaryUri = new Uri("https://sharehost.test/d/123e4567e89b12d3a456426614174000");
+        var payload = Encoding.UTF8.GetBytes("extensionless-binary");
+
+        var handler = new RecordingHandler(request =>
+        {
+            if (request.RequestUri == landingUri)
+            {
+                var html = $"<html><body>Download via <a href=\"{binaryUri}\">download</a></body></html>";
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(html, Encoding.UTF8, "text/html")
+                };
+            }
+
+            if (request.RequestUri == binaryUri)
+            {
+                var okResponse = new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new ByteArrayContent(payload)
+                };
+                okResponse.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+                return okResponse;
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+
+        await using var destination = new MemoryStream();
+        var client = new NetworkClient(logger, handler);
+
+        var metadata = await client.DownloadRangeToStreamAsync(
+                landingUri,
+                null,
+                null,
+                destination)
+            .ConfigureAwait(false);
+
+        Assert.Equal("application/octet-stream", metadata.ContentType);
+        Assert.Equal(payload.Length, destination.Length);
+        Assert.Contains(handler.Requests, request => request.Uri == binaryUri);
+    }
+
     private sealed class RecordingHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, HttpResponseMessage> _responder;

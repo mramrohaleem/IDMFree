@@ -1,7 +1,9 @@
 using System;
 using System.Linq;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using SharpDownloadManager.Core.Abstractions;
@@ -12,6 +14,7 @@ namespace SharpDownloadManager.Infrastructure.Network.Resolvers;
 internal sealed class GofileHtmlResolver : IHtmlDownloadResolver
 {
     private static readonly Uri GofileContentsRoot = new("https://api.gofile.io/contents/");
+    private static readonly Uri GofileWebsiteScript = new("https://gofile.io/dist/js/global.js");
     private static readonly string[][] DownloadContentSegmentMarkers =
     {
         new[] { "download", "web" },
@@ -19,10 +22,15 @@ internal sealed class GofileHtmlResolver : IHtmlDownloadResolver
         new[] { "download", "secure" },
         new[] { "download", "token" }
     };
+    private static readonly Regex WebsiteTokenRegex = new(
+        "appdata\\.wt\\s*=\\s*[\"'](?<token>[A-Za-z0-9]+)[\"']",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private readonly HttpClient _client;
     private readonly ILogger _logger;
     private readonly Func<Uri, CancellationToken, Task<string?>> _tokenAccessor;
+    private readonly SemaphoreSlim _websiteTokenSemaphore = new(1, 1);
+    private string? _cachedWebsiteToken;
 
     public GofileHtmlResolver(
         HttpClient client,
@@ -61,15 +69,22 @@ internal sealed class GofileHtmlResolver : IHtmlDownloadResolver
             return null;
         }
 
-        var token = await _tokenAccessor(tokenSource, cancellationToken).ConfigureAwait(false);
-        if (string.IsNullOrWhiteSpace(token))
+        var accountToken = await _tokenAccessor(tokenSource, cancellationToken).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(accountToken))
         {
             return null;
         }
 
-        var endpoint = new Uri(GofileContentsRoot, contentId + "?wt=" + Uri.EscapeDataString(token));
+        var websiteToken = await GetWebsiteTokenAsync(cancellationToken).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(websiteToken))
+        {
+            return null;
+        }
+
+        var endpoint = new Uri(GofileContentsRoot, contentId + "?wt=" + Uri.EscapeDataString(websiteToken));
         using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
         request.Headers.Accept.ParseAdd("application/json");
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accountToken);
         if (context.Referer is not null)
         {
             request.Headers.Referrer = context.Referer;
@@ -266,5 +281,80 @@ internal sealed class GofileHtmlResolver : IHtmlDownloadResolver
         }
 
         return null;
+    }
+
+    private async Task<string?> GetWebsiteTokenAsync(CancellationToken cancellationToken)
+    {
+        if (!string.IsNullOrWhiteSpace(_cachedWebsiteToken))
+        {
+            return _cachedWebsiteToken;
+        }
+
+        await _websiteTokenSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(_cachedWebsiteToken))
+            {
+                return _cachedWebsiteToken;
+            }
+
+            using var response = await _client.GetAsync(GofileWebsiteScript, cancellationToken).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.Warn(
+                    "Gofile resolver failed to fetch website token script.",
+                    eventCode: "GOFILE_HTML_RESOLVER_WT_HTTP",
+                    context: new { Status = (int)response.StatusCode });
+                return null;
+            }
+
+            var script = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+            var token = TryExtractWebsiteToken(script);
+            if (string.IsNullOrWhiteSpace(token))
+            {
+                _logger.Warn(
+                    "Gofile resolver failed to parse website token script.",
+                    eventCode: "GOFILE_HTML_RESOLVER_WT_PARSE");
+                return null;
+            }
+
+            _cachedWebsiteToken = token;
+            return token;
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.Warn(
+                "Gofile resolver failed to download website token script.",
+                eventCode: "GOFILE_HTML_RESOLVER_WT_HTTP",
+                exception: ex);
+        }
+        catch (TaskCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn(
+                "Gofile resolver encountered an unexpected error while fetching website token.",
+                eventCode: "GOFILE_HTML_RESOLVER_WT_UNKNOWN",
+                exception: ex);
+        }
+        finally
+        {
+            _websiteTokenSemaphore.Release();
+        }
+
+        return null;
+    }
+
+    private static string? TryExtractWebsiteToken(string script)
+    {
+        if (string.IsNullOrWhiteSpace(script))
+        {
+            return null;
+        }
+
+        var match = WebsiteTokenRegex.Match(script);
+        return match.Success ? match.Groups["token"].Value : null;
     }
 }

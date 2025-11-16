@@ -1503,6 +1503,16 @@ public sealed class NetworkClient : INetworkClient
         ".epub"
     };
 
+    private static readonly string[] DownloadPathKeywords =
+    {
+        "download",
+        "direct",
+        "dl",
+        "getfile",
+        "get-file",
+        "file"
+    };
+
     private static bool TryExtractDownloadUrlFromHtml(
         string htmlSnippet,
         Uri originalUrl,
@@ -1698,12 +1708,22 @@ public sealed class NetworkClient : INetworkClient
         }
 
         var extension = Path.GetExtension(candidate.AbsolutePath);
-        if (string.IsNullOrEmpty(extension) || !LikelyFileExtensions.Contains(extension))
+        if (!string.IsNullOrEmpty(extension) && LikelyFileExtensions.Contains(extension))
         {
-            return false;
+            return true;
         }
 
-        if (candidate.Host.Equals(originalUrl.Host, StringComparison.OrdinalIgnoreCase))
+        if (!string.IsNullOrEmpty(extension) && LooksLikeNumericPartExtension(extension))
+        {
+            return true;
+        }
+
+        if (ContainsDownloadKeyword(candidate.AbsolutePath) || ContainsDownloadKeyword(candidate.Query))
+        {
+            return true;
+        }
+
+        if (!candidate.Host.Equals(originalUrl.Host, StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
@@ -1714,7 +1734,80 @@ public sealed class NetworkClient : INetworkClient
             return true;
         }
 
+        var lastSegment = Path.GetFileName(candidate.AbsolutePath.TrimEnd('/'));
+        if (!string.IsNullOrEmpty(lastSegment) && LooksLikeOpaqueIdentifier(lastSegment))
+        {
+            return true;
+        }
+
         return false;
+    }
+
+    private static bool ContainsDownloadKeyword(string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return false;
+        }
+
+        foreach (var keyword in DownloadPathKeywords)
+        {
+            if (value.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool LooksLikeOpaqueIdentifier(string value)
+    {
+        if (value.Length < 12)
+        {
+            return false;
+        }
+
+        var hasLetter = false;
+        var hasDigit = false;
+
+        foreach (var ch in value)
+        {
+            if (char.IsLetter(ch))
+            {
+                hasLetter = true;
+            }
+            else if (char.IsDigit(ch))
+            {
+                hasDigit = true;
+            }
+        }
+
+        return hasLetter && hasDigit;
+    }
+
+    private static bool LooksLikeNumericPartExtension(string extension)
+    {
+        if (string.IsNullOrEmpty(extension) || extension.Length < 2)
+        {
+            return false;
+        }
+
+        var span = extension.AsSpan(1);
+        if (span.Length is < 2 or > 4)
+        {
+            return false;
+        }
+
+        foreach (var ch in span)
+        {
+            if (!char.IsDigit(ch))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private async Task<(HttpResponseMessage Response, HttpMethod MethodUsed)> SendWithFallbackAsync(
