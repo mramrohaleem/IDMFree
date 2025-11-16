@@ -445,6 +445,7 @@ INSERT INTO Downloads (
     $TotalDownloadedBytes, $BytesWritten, $ActualFileSize, $ConnectionsCount,
     $LastErrorCode, $LastErrorMessage,
     $RequestHeaders, $RequestMethod,
+    $RequestBody, $RequestBodyContentType,
     $TotalActiveSeconds, $LastResumedAt, $HttpStatusCategory,
     $TooManyRequestsRetryCount, $RetryBackoffSeconds, $NextRetryUtc, $MaxParallelConnections, $SessionMetadata
 )
