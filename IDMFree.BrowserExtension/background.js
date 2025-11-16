@@ -249,6 +249,7 @@ async function delegateDownloadToApp(kind, payload, correlationId, logMetadata =
     const attemptContext = { ...attemptBaseContext, endpoint };
     logEvent("BG: bridge fetch attempt", attemptContext);
 
+    const attemptStart = Date.now();
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), BRIDGE_TIMEOUT_MS);
     let response;
@@ -269,7 +270,12 @@ async function delegateDownloadToApp(kind, payload, correlationId, logMetadata =
       clearTimeout(timeoutId);
       const reason = err && err.name === "AbortError" ? "bridge_timeout" : "bridge_fetch_error";
       const message = err?.message || String(err);
-      logEvent("BG: bridge fetch failed", { ...attemptContext, reason, error: message });
+      logEvent("BG: bridge fetch failed", {
+        ...attemptContext,
+        reason,
+        error: message,
+        elapsedMs: Date.now() - attemptStart,
+      });
       errors.push({ reason, message, endpoint });
       continue;
     }
@@ -290,6 +296,7 @@ async function delegateDownloadToApp(kind, payload, correlationId, logMetadata =
         statusCode,
         reason,
         error: errorBody,
+        elapsedMs: Date.now() - attemptStart,
       });
       errors.push({ reason, message: errorBody || response.statusText, statusCode, endpoint });
       continue;
@@ -306,6 +313,7 @@ async function delegateDownloadToApp(kind, payload, correlationId, logMetadata =
         statusCode,
         reason,
         error: message,
+        elapsedMs: Date.now() - attemptStart,
       });
       errors.push({ reason, message, statusCode, endpoint });
       continue;
@@ -314,15 +322,25 @@ async function delegateDownloadToApp(kind, payload, correlationId, logMetadata =
     const handled = data && data.handled === true;
     const status = data && typeof data.status === "string" ? data.status : null;
     const message = data && typeof data.error === "string" ? data.error : null;
+    const elapsedMs = Date.now() - attemptStart;
 
     logEvent("BG: bridge fetch response", {
       ...attemptContext,
       statusCode,
       handled,
       status,
+      elapsedMs,
     });
 
     if (handled) {
+      if (status === "pending") {
+        logEvent("BG: bridge pending acknowledgement", {
+          ...attemptContext,
+          statusCode,
+          elapsedMs,
+          correlationId,
+        });
+      }
       return {
         accepted: true,
         handled: true,
@@ -330,7 +348,8 @@ async function delegateDownloadToApp(kind, payload, correlationId, logMetadata =
         correlationId: correlation,
         httpStatus: statusCode,
         response: data,
-        reason: "accepted",
+        reason: status === "pending" ? "accepted_pending" : "accepted",
+        pending: status === "pending",
       };
     }
 
@@ -923,6 +942,7 @@ async function processDownloadIntent(payload, sender) {
       tabId,
       frameId,
       status: bridgeResult.status || "accepted",
+      pending: Boolean(bridgeResult.pending),
     });
     return { strategy: "external", status: bridgeResult.status || "accepted", correlationId };
   }
@@ -1310,6 +1330,7 @@ async function delegateToManager(context) {
       layer: context.interceptLayer,
       status: bridgeResult.status || "accepted",
       source: "network",
+      pending: Boolean(bridgeResult.pending),
     });
     cleanupRequestContext(context.id);
     return;
@@ -1621,6 +1642,7 @@ async function handleDownloadsApiCreated(item) {
       url: item.url,
       status: bridgeResult.status || "accepted",
       source: "downloads-api",
+      pending: Boolean(bridgeResult.pending),
     });
     return;
   }
